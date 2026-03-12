@@ -15,6 +15,59 @@ struct SeverityRule {
     severity: u8,
 }
 
+const INJECTION_RULE_DEFS: [(&str, &str); 5] = [
+    (
+        r"(?i)ignore\s+(?:previous|all|above|the).*\s+instructions",
+        "Prompt injection attempt detected",
+    ),
+    (r"(?i)you\s+are\s+now\s+(a|an)", "Role override attempt detected"),
+    (r"(?i)forget\s+everything", "Memory wipe attempt detected"),
+    (r"(?i)system\s*:\s*you", "System prompt injection detected"),
+    (r"(?i)\]\]\s*\[\[", "Bracket injection pattern detected"),
+];
+
+const DANGEROUS_CODE_RULE_DEFS: [(&str, &str, u8); 8] = [
+    (r"(?i)rm\s+-rf\s+/", "Dangerous recursive delete command", 10),
+    (
+        r"(?i):\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
+        "Fork bomb detected",
+        10,
+    ),
+    (r"(?i)reverse\s*shell|bind\s*shell", "Shell binding attempt", 9),
+    (
+        r"(?i)wget.*\|\s*sh|curl.*\|\s*bash",
+        "Remote code execution pattern",
+        9,
+    ),
+    (r"(?i)/etc/passwd|/etc/shadow", "System credential access attempt", 8),
+    (r"(?i)~/.ssh/|\.ssh/id_rsa", "SSH key access attempt", 8),
+    (
+        r"(?i)process\.env\[|os\.environ\[|env::|getenv\(",
+        "Environment variable access",
+        5,
+    ),
+    (r"while\s*\(\s*true\s*\)|loop\s*\{[^}]*\}", "Potential infinite loop", 4),
+];
+
+const OUTPUT_RULE_DEFS: [(&str, &str, u8); 4] = [
+    (
+        r"(?i)api[_-]?key\s*[:=]\s*['\x22][^'\x22]+['\x22]",
+        "API key in output",
+        6,
+    ),
+    (
+        r"(?i)password\s*[:=]\s*['\x22][^'\x22]+['\x22]",
+        "Password in output",
+        6,
+    ),
+    (
+        r"(?i)secret\s*[:=]\s*['\x22][^'\x22]+['\x22]",
+        "Secret in output",
+        6,
+    ),
+    (r"[A-Za-z0-9+/]{40,}={0,2}", "Possible base64 encoded secret", 6),
+];
+
 /// Result of content filtering
 #[derive(Debug, Clone)]
 pub struct ContentFilterResult {
@@ -65,104 +118,37 @@ impl ContentFilter {
         Regex::new(pattern).expect("Content filter pattern must compile")
     }
 
+    fn build_match_rules(definitions: &[(&str, &'static str)]) -> Vec<MatchRule> {
+        definitions
+            .iter()
+            .map(|(pattern, description)| MatchRule {
+                pattern: Self::compile_regex(pattern),
+                description,
+            })
+            .collect()
+    }
+
+    fn build_severity_rules(definitions: &[(&str, &'static str, u8)]) -> Vec<SeverityRule> {
+        definitions
+            .iter()
+            .map(|(pattern, description, severity)| SeverityRule {
+                pattern: Self::compile_regex(pattern),
+                description,
+                severity: *severity,
+            })
+            .collect()
+    }
+
     fn build_injection_patterns() -> Vec<MatchRule> {
-        vec![
-            MatchRule {
-                pattern: Self::compile_regex(r"(?i)ignore\s+(?:previous|all|above|the).*\s+instructions"),
-                description: "Prompt injection attempt detected",
-            },
-            MatchRule {
-                pattern: Self::compile_regex(r"(?i)you\s+are\s+now\s+(a|an)"),
-                description: "Role override attempt detected",
-            },
-            MatchRule {
-                pattern: Self::compile_regex(r"(?i)forget\s+everything"),
-                description: "Memory wipe attempt detected",
-            },
-            MatchRule {
-                pattern: Self::compile_regex(r"(?i)system\s*:\s*you"),
-                description: "System prompt injection detected",
-            },
-            MatchRule {
-                pattern: Self::compile_regex(r"(?i)\]\]\s*\[\["),
-                description: "Bracket injection pattern detected",
-            },
-        ]
+        Self::build_match_rules(&INJECTION_RULE_DEFS)
     }
 
     fn build_code_patterns() -> Vec<SeverityRule> {
-        vec![
-            // File system dangers
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)rm\s+-rf\s+/"),
-                description: "Dangerous recursive delete command",
-                severity: 10,
-            },
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i):\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
-                description: "Fork bomb detected",
-                severity: 10,
-            },
-            // Network dangers
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)reverse\s*shell|bind\s*shell"),
-                description: "Shell binding attempt",
-                severity: 9,
-            },
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)wget.*\|\s*sh|curl.*\|\s*bash"),
-                description: "Remote code execution pattern",
-                severity: 9,
-            },
-            // Credential access
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)/etc/passwd|/etc/shadow"),
-                description: "System credential access attempt",
-                severity: 8,
-            },
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)~/.ssh/|\.ssh/id_rsa"),
-                description: "SSH key access attempt",
-                severity: 8,
-            },
-            // Environment/secrets
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)process\.env\[|os\.environ\[|env::|getenv\("),
-                description: "Environment variable access",
-                severity: 5, // Lower severity, just warn
-            },
-            // Infinite loops (potential DoS)
-            SeverityRule {
-                pattern: Self::compile_regex(r"while\s*\(\s*true\s*\)|loop\s*\{[^}]*\}"),
-                description: "Potential infinite loop",
-                severity: 4, // Just warn
-            },
-        ]
+        Self::build_severity_rules(&DANGEROUS_CODE_RULE_DEFS)
     }
 
     fn build_output_patterns() -> Vec<SeverityRule> {
-        vec![
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)api[_-]?key\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
-                description: "API key in output",
-                severity: 6,
-            },
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)password\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
-                description: "Password in output",
-                severity: 6,
-            },
-            SeverityRule {
-                pattern: Self::compile_regex(r"(?i)secret\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
-                description: "Secret in output",
-                severity: 6,
-            },
-            SeverityRule {
-                pattern: Self::compile_regex(r"[A-Za-z0-9+/]{40,}={0,2}"),
-                description: "Possible base64 encoded secret",
-                severity: 6,
-            },
-        ]
+        Self::build_severity_rules(&OUTPUT_RULE_DEFS)
     }
 
     fn apply_match_rules(result: &mut ContentFilterResult, content: &str, rules: &[MatchRule], severity: u8) {
