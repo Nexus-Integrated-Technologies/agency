@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use ollama_rs::Ollama;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 use futures_util::StreamExt;
 
@@ -32,6 +32,110 @@ pub struct ReActStep {
     pub is_final: bool,
     /// The final answer (if is_final is true)
     pub answer: Option<String>,
+}
+
+struct QualityScoringProfile {
+    min_words_for_repetition_check: usize,
+    severe_repetition_ratio: f32,
+    severe_repetition_penalty: f32,
+    moderate_repetition_ratio: f32,
+    moderate_repetition_penalty: f32,
+    prompt_leak_markers: &'static [&'static str],
+    short_response_len: Option<usize>,
+    short_response_penalty: f32,
+    sparse_word_count: Option<usize>,
+    sparse_response_len: Option<usize>,
+    sparse_response_penalty: f32,
+    non_ascii_ratio_threshold: Option<f32>,
+    non_ascii_min_len: Option<usize>,
+    non_ascii_penalty: f32,
+}
+
+const REACT_QUALITY_PROFILE: QualityScoringProfile = QualityScoringProfile {
+    min_words_for_repetition_check: 10,
+    severe_repetition_ratio: 0.2,
+    severe_repetition_penalty: 0.1,
+    moderate_repetition_ratio: 0.4,
+    moderate_repetition_penalty: 0.4,
+    prompt_leak_markers: &["## User Query", "## Instruction", "<|im_start|>"],
+    short_response_len: None,
+    short_response_penalty: 1.0,
+    sparse_word_count: Some(3),
+    sparse_response_len: Some(20),
+    sparse_response_penalty: 0.1,
+    non_ascii_ratio_threshold: Some(0.5),
+    non_ascii_min_len: Some(20),
+    non_ascii_penalty: 0.5,
+};
+
+const SIMPLE_QUALITY_PROFILE: QualityScoringProfile = QualityScoringProfile {
+    min_words_for_repetition_check: 20,
+    severe_repetition_ratio: 0.3,
+    severe_repetition_penalty: 0.2,
+    moderate_repetition_ratio: 0.5,
+    moderate_repetition_penalty: 0.5,
+    prompt_leak_markers: &["## User Query", "## Instruction"],
+    short_response_len: Some(5),
+    short_response_penalty: 0.3,
+    sparse_word_count: None,
+    sparse_response_len: None,
+    sparse_response_penalty: 1.0,
+    non_ascii_ratio_threshold: None,
+    non_ascii_min_len: None,
+    non_ascii_penalty: 1.0,
+};
+
+fn score_response_quality_with_profile(response: &str, profile: &QualityScoringProfile) -> f32 {
+    let mut score = 1.0;
+    let words: Vec<&str> = response.split_whitespace().collect();
+    let total_words = words.len();
+
+    if total_words > profile.min_words_for_repetition_check {
+        let unique_words: HashSet<&str> = words.iter().copied().collect();
+        let uniqueness_ratio = unique_words.len() as f32 / total_words as f32;
+        if uniqueness_ratio < profile.severe_repetition_ratio {
+            score *= profile.severe_repetition_penalty;
+        } else if uniqueness_ratio < profile.moderate_repetition_ratio {
+            score *= profile.moderate_repetition_penalty;
+        }
+    }
+
+    if let (Some(word_limit), Some(min_len)) = (profile.sparse_word_count, profile.sparse_response_len) {
+        if total_words < word_limit && response.len() > min_len {
+            score *= profile.sparse_response_penalty;
+        }
+    }
+
+    if let (Some(threshold), Some(min_len)) = (profile.non_ascii_ratio_threshold, profile.non_ascii_min_len) {
+        if response.len() > min_len {
+            let non_ascii_count = response.chars().filter(|c| !c.is_ascii()).count() as f32;
+            let ratio = non_ascii_count / response.len() as f32;
+            if ratio > threshold {
+                score *= profile.non_ascii_penalty;
+            }
+        }
+    }
+
+    if profile.prompt_leak_markers.iter().any(|marker| response.contains(marker)) {
+        score *= 0.1;
+    }
+
+    if let Some(min_len) = profile.short_response_len {
+        if response.trim().len() < min_len {
+            score *= profile.short_response_penalty;
+        }
+    }
+
+    score
+}
+
+fn find_prompt_leak_point(response: &str) -> Option<usize> {
+    for marker in ["## User Query", "## Instruction", "<|im_start|>user"] {
+        if let Some(idx) = response.find(marker) {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 impl ReActStep {
@@ -500,38 +604,7 @@ RULES:
 
     /// FPF Quality Scoring: Detect hallucinations and repetitive patterns
     fn score_response_quality(&self, response: &str) -> f32 {
-        let mut score = 1.0;
-        
-        // Check for repetitive patterns (same phrase appearing multiple times)
-        let words: Vec<&str> = response.split_whitespace().collect();
-        let total_words = words.len();
-        if total_words > 10 {
-            let unique_words: std::collections::HashSet<&str> = words.iter().cloned().collect();
-            let uniqueness_ratio = unique_words.len() as f32 / total_words as f32;
-            if uniqueness_ratio < 0.2 {
-                score *= 0.1; // Heavy penalty for extreme repetition
-            } else if uniqueness_ratio < 0.4 {
-                score *= 0.4;
-            }
-        } else if total_words < 3 && response.len() > 20 {
-             // Long response with very few words (likely gibberish like aaaaaaaaaaaa or punctuation spam)
-             score *= 0.1;
-        }
-        
-        // Check for common gibberish markers or non-ASCII spam if it looks like noise
-        let non_ascii_count = response.chars().filter(|c| !c.is_ascii()).count();
-        if non_ascii_count > response.len() / 2 && response.len() > 20 {
-            // More than 50% non-ASCII in a medium+ response is suspicious for a technical agent 
-            // unless it's explicitly multilingual.
-            score *= 0.5;
-        }
-
-        // Check for hallucination markers (ChatML tags in output)
-        if response.contains("## User Query") || response.contains("## Instruction") || response.contains("<|im_start|>") {
-            score *= 0.1; // Model is echoing prompt structure or leak
-        }
-        
-        score
+        score_response_quality_with_profile(response, &REACT_QUALITY_PROFILE)
     }
 
     fn find_raw_json_tool_call(&self, text: &str) -> Option<ToolCall> {
@@ -1068,48 +1141,12 @@ impl SimpleAgent {
 
     /// FPF Quality Scoring: Detect hallucinations and repetitive patterns
     fn score_response_quality(&self, response: &str) -> f32 {
-        let mut score = 1.0;
-        
-        // Check for repetitive patterns (same phrase appearing multiple times)
-        let words: Vec<&str> = response.split_whitespace().collect();
-        let total_words = words.len();
-        if total_words > 20 {
-            let unique_words: std::collections::HashSet<&str> = words.iter().cloned().collect();
-            let uniqueness_ratio = unique_words.len() as f32 / total_words as f32;
-            if uniqueness_ratio < 0.3 {
-                score *= 0.2; // Heavy penalty for highly repetitive responses
-            } else if uniqueness_ratio < 0.5 {
-                score *= 0.5;
-            }
-        }
-        
-        // Check for hallucination markers (ChatML tags in output)
-        if response.contains("## User Query") || response.contains("## Instruction") {
-            score *= 0.1; // Model is echoing prompt structure
-        }
-        
-        // Check for empty or very short responses
-        if response.trim().len() < 5 {
-            score *= 0.3;
-        }
-        
-        score
+        score_response_quality_with_profile(response, &SIMPLE_QUALITY_PROFILE)
     }
     
     /// Find the first point where content starts repeating
     fn find_repetition_point(&self, response: &str) -> Option<usize> {
-        // Look for "## User Query" or "## Instruction" which indicates prompt leak
-        if let Some(idx) = response.find("## User Query") {
-            return Some(idx);
-        }
-        if let Some(idx) = response.find("## Instruction") {
-            return Some(idx);
-        }
-        // Look for repeated ChatML patterns
-        if let Some(idx) = response.find("<|im_start|>user") {
-            return Some(idx);
-        }
-        None
+        find_prompt_leak_point(response)
     }
 
     /// Streaming variant of execute_simple for real-time token output
@@ -1244,5 +1281,21 @@ mod tests {
     fn test_query_from_step_input_falls_back_for_none() {
         let query = ReActAgent::query_from_step_input(None);
         assert_eq!(query, "Continue with task");
+    }
+
+    #[test]
+    fn test_quality_profile_keeps_agent_specific_behavior() {
+        let leaked = "## User Query\nrepeat repeat repeat repeat repeat repeat repeat repeat";
+        let react_score = score_response_quality_with_profile(leaked, &REACT_QUALITY_PROFILE);
+        let simple_score = score_response_quality_with_profile(leaked, &SIMPLE_QUALITY_PROFILE);
+        assert!(react_score <= 0.1);
+        assert!(simple_score <= 0.1);
+    }
+
+    #[test]
+    fn test_find_prompt_leak_point_finds_chatml_marker() {
+        let response = "clean prefix <|im_start|>user leaked prompt";
+        let idx = find_prompt_leak_point(response);
+        assert_eq!(idx, response.find("<|im_start|>user"));
     }
 }
