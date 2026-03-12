@@ -12,6 +12,92 @@ use tracing::info;
 use crate::agent::{AgentType, LLMProvider, OllamaProvider, OpenAICompatibleProvider};
 use crate::orchestrator::ScaleProfile;
 
+const GREETINGS: &[&str] = &[
+    "hi",
+    "hello",
+    "hey",
+    "howdy",
+    "greetings",
+    "good morning",
+    "good afternoon",
+    "good evening",
+];
+const IDENTITY_KEYWORDS: &[&str] = &[
+    "who are you",
+    "what is your name",
+    "what are you",
+    "your identity",
+    "your name",
+];
+const FILESYSTEM_KEYWORDS: &[&str] = &[
+    "list",
+    "folder",
+    "directory",
+    "file",
+    "ls",
+    "dir",
+    "tree",
+    "structure",
+    "show files",
+    "show folders",
+    "what is in",
+    "contents of",
+    "read ",
+];
+const CODE_KEYWORDS: &[&str] = &[
+    "code",
+    "function",
+    "program",
+    "script",
+    "bug",
+    "error",
+    "compile",
+    "debug",
+    "implement",
+    "algorithm",
+    "class",
+    "method",
+    "variable",
+    "rust",
+    "python",
+    "javascript",
+    "typescript",
+    "java",
+    "c++",
+    "golang",
+    "write a",
+    "create a",
+    "fix the",
+    "refactor",
+];
+const PLANNING_KEYWORDS: &[&str] = &[
+    "plan",
+    "schedule",
+    "steps",
+    "how to",
+    "break down",
+    "organize",
+    "roadmap",
+    "workflow",
+    "process",
+    "strategy",
+    "goal",
+    "milestone",
+];
+const RESEARCH_KEYWORDS: &[&str] = &[
+    "search",
+    "find",
+    "look up",
+    "research",
+    "latest",
+    "current",
+    "news",
+    "information about",
+    "tell me about",
+];
+const TOOL_VERBS: &[&str] = &["use ", "run ", "execute ", "invoke ", "call "];
+const TOOL_NAMES: &[&str] = &["speaker", "search", "shell", "browser", "file", "terminal"];
+
 /// Routing decision for a query
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingDecision {
@@ -37,6 +123,20 @@ pub struct Router {
 }
 
 impl Router {
+    fn contains_any(query: &str, keywords: &[&str]) -> bool {
+        keywords.iter().any(|k| query.contains(k))
+    }
+
+    fn parse_agent_label(agent: &str) -> AgentType {
+        match agent {
+            "general_chat" | "generalchat" | "chat" => AgentType::GeneralChat,
+            "coder" | "programmer" | "developer" => AgentType::Coder,
+            "researcher" | "research" => AgentType::Researcher,
+            "planner" | "planning" => AgentType::Planner,
+            _ => AgentType::Reasoner,
+        }
+    }
+
     pub fn new(ollama: Ollama) -> Self {
         Self {
             provider: Arc::new(OllamaProvider::new(ollama)),
@@ -211,60 +311,38 @@ impl Router {
     }
 
     fn is_greeting(&self, query: &str) -> bool {
-        let greetings = ["hi", "hello", "hey", "howdy", "greetings", "good morning", "good afternoon", "good evening"];
-        greetings.iter().any(|g| query.starts_with(g) || query == *g)
+        GREETINGS
+            .iter()
+            .any(|g| query.starts_with(g) || query == *g)
     }
 
     fn is_identity_query(&self, query: &str) -> bool {
-        let keywords = ["who are you", "what is your name", "what are you", "your identity", "your name"];
         // Also handle very short identity queries
-        keywords.iter().any(|k| query.contains(k)) || query.trim().to_lowercase() == "what are you"
+        Self::contains_any(query, IDENTITY_KEYWORDS) || query.trim().to_lowercase() == "what are you"
     }
 
     fn is_filesystem_related(&self, query: &str) -> bool {
-        let keywords = [
-            "list", "folder", "directory", "file", "ls", "dir", "tree", "structure",
-            "show files", "show folders", "what is in", "contents of", "read "
-        ];
-        keywords.iter().any(|k| query.contains(k))
+        Self::contains_any(query, FILESYSTEM_KEYWORDS)
     }
 
     fn is_code_related(&self, query: &str) -> bool {
-        let keywords = [
-            "code", "function", "program", "script", "bug", "error", "compile",
-            "debug", "implement", "algorithm", "class", "method", "variable",
-            "rust", "python", "javascript", "typescript", "java", "c++", "golang",
-            "write a", "create a", "fix the", "refactor"
-        ];
-        keywords.iter().any(|k| query.contains(k))
+        Self::contains_any(query, CODE_KEYWORDS)
     }
 
     fn is_planning_related(&self, query: &str) -> bool {
-        let keywords = [
-            "plan", "schedule", "steps", "how to", "break down", "organize",
-            "roadmap", "workflow", "process", "strategy", "goal", "milestone"
-        ];
-        keywords.iter().any(|k| query.contains(k))
+        Self::contains_any(query, PLANNING_KEYWORDS)
     }
 
     fn is_research_related(&self, query: &str) -> bool {
-        let keywords = [
-            "search", "find", "look up", "research", 
-            "latest", "current", "news", "information about", "tell me about"
-        ];
-        keywords.iter().any(|k| query.contains(k))
+        Self::contains_any(query, RESEARCH_KEYWORDS)
     }
 
     /// FPF Integration: Detect explicit tool usage requests
     /// Routes to agent with tool access when user asks to "use" something
     fn mentions_tool(&self, query: &str) -> bool {
-        // Patterns: "use [tool]", "run [tool]", "execute [tool]", "[tool] tool"
-        let tool_verbs = ["use ", "run ", "execute ", "invoke ", "call "];
-        let tool_names = ["speaker", "search", "shell", "browser", "file", "terminal"];
-        
         // Check for verb + any word (e.g., "use speaker")
-        let has_tool_verb = tool_verbs.iter().any(|v| query.contains(v));
-        let mentions_tool_name = tool_names.iter().any(|t| query.contains(t));
+        let has_tool_verb = Self::contains_any(query, TOOL_VERBS);
+        let mentions_tool_name = Self::contains_any(query, TOOL_NAMES);
         
         // Either "use X" pattern or explicit tool name mention
         (has_tool_verb && query.len() > 5) || (query.contains("tool") && mentions_tool_name)
@@ -303,13 +381,7 @@ q = "{}"
                         .map(|s| s.to_lowercase())
                         .unwrap_or_else(|| "reasoner".to_string());
 
-                    let agent_type = match agent_str.as_str() {
-                        "general_chat" | "generalchat" | "chat" => AgentType::GeneralChat,
-                        "coder" | "programmer" | "developer" => AgentType::Coder,
-                        "researcher" | "research" => AgentType::Researcher,
-                        "planner" | "planning" => AgentType::Planner,
-                        _ => AgentType::Reasoner,
-                    };
+                    let agent_type = Self::parse_agent_label(agent_str.as_str());
 
                     let memory_val = v["memory"].as_str()
                         .or_else(|| v["MEMORY"].as_str())
@@ -346,13 +418,7 @@ q = "{}"
             .map(|m| m.as_str().to_lowercase())
             .unwrap_or_else(|| "reasoner".to_string());
 
-        let agent_type = match agent_str.as_str() {
-            "general_chat" | "generalchat" | "chat" => AgentType::GeneralChat,
-            "coder" | "programmer" | "developer" => AgentType::Coder,
-            "researcher" | "research" => AgentType::Researcher,
-            "planner" | "planning" => AgentType::Planner,
-            _ => AgentType::Reasoner,
-        };
+        let agent_type = Self::parse_agent_label(agent_str.as_str());
 
         let should_search_memory = memory_re
             .captures(response)
