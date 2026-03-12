@@ -109,6 +109,101 @@ impl CodebaseTool {
             .to_string_lossy()
             .to_string()
     }
+
+    async fn execute_list_files(&self) -> AgentResult<ToolOutput> {
+        let files = self
+            .collect_files()
+            .await
+            .map_err(|e| AgentError::Tool(format!("Failed to collect files: {}", e)))?;
+        let file_strings: Vec<String> = files
+            .iter()
+            .map(|path| self.to_display_path(path))
+            .collect();
+        let mut tree_summary = String::from("Codebase Files:\n");
+        for f in &file_strings {
+            tree_summary.push_str(&format!("- {}\n", f));
+        }
+
+        Ok(ToolOutput::success(json!({ "files": file_strings }), tree_summary))
+    }
+
+    async fn execute_read_file(&self, rel_path: &str) -> AgentResult<ToolOutput> {
+        // Construct the path carefully.
+        let path = self.src_dir.join(rel_path);
+
+        // Validate access boundaries before touching the filesystem.
+        if !self.is_safe_path(&path) {
+            return Ok(ToolOutput::failure("Access denied: Path outside allowed areas"));
+        }
+
+        // Report missing files after access validation to avoid leaking information.
+        if !path.exists() {
+            return Ok(ToolOutput::failure(format!("File not found: {}", rel_path)));
+        }
+
+        let content = match fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolOutput::failure(format!(
+                    "Failed to read {}: {}",
+                    rel_path, e
+                )));
+            }
+        };
+
+        Ok(ToolOutput::success(
+            json!({ "path": rel_path, "content": content }),
+            format!("Content of {}:\n\n{}", rel_path, content),
+        ))
+    }
+
+    async fn execute_search(&self, query: &str) -> AgentResult<ToolOutput> {
+        let query_lower = query.to_lowercase();
+        let files = self
+            .collect_files()
+            .await
+            .map_err(|e| AgentError::Tool(format!("Failed to collect files: {}", e)))?;
+
+        let mut matches = Vec::new();
+        for path in files {
+            let content = match fs::read_to_string(&path).await {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            let display_path = self.to_display_path(&path);
+
+            for (line_number, line) in content.lines().enumerate() {
+                if line.to_lowercase().contains(&query_lower) {
+                    matches.push(json!({
+                        "path": display_path,
+                        "line": line_number + 1,
+                        "content": line.trim(),
+                    }));
+                    if matches.len() >= Self::MAX_SEARCH_MATCHES {
+                        break;
+                    }
+                }
+            }
+            if matches.len() >= Self::MAX_SEARCH_MATCHES {
+                break;
+            }
+        }
+
+        let summary = if matches.is_empty() {
+            format!("No matches found for '{}'.", query)
+        } else {
+            format!("Found {} matches for '{}'.", matches.len(), query)
+        };
+        let total_matches = matches.len();
+        Ok(ToolOutput::success(
+            json!({
+                "query": query,
+                "matches": matches,
+                "total_matches": total_matches,
+            }),
+            summary,
+        ))
+    }
 }
 
 impl Default for CodebaseTool {
@@ -162,97 +257,18 @@ impl Tool for CodebaseTool {
         let action = params["action"].as_str().unwrap_or("list_files");
 
         match action {
-            "list_files" => {
-                let files = self
-                    .collect_files()
-                    .await
-                    .map_err(|e| AgentError::Tool(format!("Failed to collect files: {}", e)))?;
-                let file_strings: Vec<String> = files
-                    .iter()
-                    .map(|path| self.to_display_path(path))
-                    .collect();
-                let mut tree_summary = String::from("Codebase Files:\n");
-                for f in &file_strings {
-                    tree_summary.push_str(&format!("- {}\n", f));
-                }
-                
-                Ok(ToolOutput::success(json!({ "files": file_strings }), tree_summary))
-            },
+            "list_files" => self.execute_list_files().await,
             "read_file" => {
-                let rel_path = params["path"].as_str().ok_or_else(|| AgentError::Validation("Missing path".to_string()))?;
-                
-                // Construct the path carefully
-                let path = self.src_dir.join(rel_path);
-                
-                // SAFETY CHECK FIRST
-                if !self.is_safe_path(&path) {
-                    return Ok(ToolOutput::failure("Access denied: Path outside allowed areas"));
-                }
-
-                // Check existence after safety check
-                if !path.exists() {
-                    return Ok(ToolOutput::failure(format!("File not found: {}", rel_path)));
-                }
-
-                let content = match fs::read_to_string(&path).await {
-                    Ok(c) => c,
-                    Err(e) => return Ok(ToolOutput::failure(format!("Failed to read {}: {}", rel_path, e))),
-                };
-                
-                Ok(ToolOutput::success(
-                    json!({ "path": rel_path, "content": content }),
-                    format!("Content of {}:\n\n{}", rel_path, content)
-                ))
-            },
+                let rel_path = params["path"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::Validation("Missing path".to_string()))?;
+                self.execute_read_file(rel_path).await
+            }
             "search" => {
                 let query = params["query"]
                     .as_str()
                     .ok_or_else(|| AgentError::Validation("Missing query".to_string()))?;
-                let query_lower = query.to_lowercase();
-                let files = self
-                    .collect_files()
-                    .await
-                    .map_err(|e| AgentError::Tool(format!("Failed to collect files: {}", e)))?;
-
-                let mut matches = Vec::new();
-                for path in files {
-                    let content = match fs::read_to_string(&path).await {
-                        Ok(content) => content,
-                        Err(_) => continue,
-                    };
-                    let display_path = self.to_display_path(&path);
-
-                    for (line_number, line) in content.lines().enumerate() {
-                        if line.to_lowercase().contains(&query_lower) {
-                            matches.push(json!({
-                                "path": display_path,
-                                "line": line_number + 1,
-                                "content": line.trim(),
-                            }));
-                            if matches.len() >= Self::MAX_SEARCH_MATCHES {
-                                break;
-                            }
-                        }
-                    }
-                    if matches.len() >= Self::MAX_SEARCH_MATCHES {
-                        break;
-                    }
-                }
-
-                let summary = if matches.is_empty() {
-                    format!("No matches found for '{}'.", query)
-                } else {
-                    format!("Found {} matches for '{}'.", matches.len(), query)
-                };
-                let total_matches = matches.len();
-                Ok(ToolOutput::success(
-                    json!({
-                        "query": query,
-                        "matches": matches,
-                        "total_matches": total_matches,
-                    }),
-                    summary
-                ))
+                self.execute_search(query).await
             }
             _ => Ok(ToolOutput::failure("Unsupported codebase action"))
         }
