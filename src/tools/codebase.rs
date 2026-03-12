@@ -14,6 +14,7 @@ use super::{Tool, ToolOutput};
 /// Tool for exploring the agency's own codebase
 pub struct CodebaseTool {
     src_dir: PathBuf,
+    project_root: PathBuf,
 }
 
 impl CodebaseTool {
@@ -21,23 +22,45 @@ impl CodebaseTool {
         let path = src_dir.into();
         // Try to get absolute path if possible for better safety checks
         let src_dir = std::fs::canonicalize(&path).unwrap_or(path);
-        Self { src_dir }
+        let project_root = src_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| src_dir.clone());
+        Self {
+            src_dir,
+            project_root,
+        }
+    }
+
+    fn is_allowed_root_file(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| matches!(name, "Cargo.toml" | "Cargo.lock" | ".gitignore"))
+            .unwrap_or(false)
+    }
+
+    fn resolve_path_for_validation(path: &Path) -> Option<PathBuf> {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return Some(canonical);
+        }
+
+        let parent = path.parent()?;
+        let canonical_parent = std::fs::canonicalize(parent).ok()?;
+        let file_name = path.file_name()?;
+        Some(canonical_parent.join(file_name))
     }
 
     fn is_safe_path(&self, path: &Path) -> bool {
-        // Canonicalize the input path to resolve ".." and symlinks
-        let canonical = match std::fs::canonicalize(path) {
-            Ok(p) => p,
-            Err(_) => return false, // If it doesn't exist or can't be resolved, it's not safe to read
+        let canonical = match Self::resolve_path_for_validation(path) {
+            Some(path) => path,
+            None => return false,
         };
 
-        let path_str = canonical.to_string_lossy();
-        
-        canonical.starts_with(&self.src_dir) || 
-        path_str.contains("rust_agency/src") ||
-        path_str.ends_with("Cargo.toml") ||
-        path_str.ends_with("Cargo.lock") ||
-        path_str.ends_with(".gitignore")
+        if canonical.starts_with(&self.src_dir) {
+            return true;
+        }
+
+        canonical.parent() == Some(self.project_root.as_path()) && Self::is_allowed_root_file(&canonical)
     }
 
     fn should_skip_dir(path: &Path) -> bool {
@@ -56,15 +79,19 @@ impl CodebaseTool {
                 Ok(e) => e,
                 Err(e) => return Err(AgentError::Io(e)),
             };
+            let mut discovered = Vec::new();
             while let Some(entry) = entries.next_entry().await.map_err(AgentError::Io)? {
-                let path = entry.path();
+                discovered.push(entry.path());
+            }
+            discovered.sort();
+            for path in discovered {
                 if path.is_dir() {
                     if !Self::should_skip_dir(&path) {
                         dirs.push(path);
                     }
-                } else {
-                    files.push(path);
+                    continue;
                 }
+                files.push(path);
             }
         }
 
@@ -313,5 +340,53 @@ mod tests {
         assert!(total >= 1);
         let first = &res.data["matches"][0];
         assert!(first["path"].as_str().expect("Missing path").contains("lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_codebase_blocks_matching_filename_outside_project() {
+        let root = tempdir().expect("Failed to create project root");
+        let src_path = root.path().join("src");
+        fs::create_dir(&src_path).await.expect("Failed to create src dir");
+
+        let parent = root.path().parent().expect("Missing root parent");
+        let external = tempfile::tempdir_in(parent).expect("Failed to create external dir");
+        let external_cargo = external.path().join("Cargo.toml");
+        let mut file = File::create(&external_cargo).expect("Failed to create external Cargo.toml");
+        writeln!(file, "[package]").expect("Failed to write external Cargo.toml");
+
+        let tool = CodebaseTool::new(&src_path);
+        let traversal = format!(
+            "../../{}/Cargo.toml",
+            external.path().file_name().expect("Missing file name").to_string_lossy()
+        );
+        let res = tool
+            .execute(json!({
+                "action": "read_file",
+                "path": traversal
+            }))
+            .await
+            .expect("Tool execution failed");
+
+        assert!(!res.success);
+        assert!(res.summary.contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_codebase_reports_missing_file_inside_project() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let src_path = dir.path().join("src");
+        fs::create_dir(&src_path).await.expect("Failed to create src dir");
+
+        let tool = CodebaseTool::new(&src_path);
+        let res = tool
+            .execute(json!({
+                "action": "read_file",
+                "path": "missing.rs"
+            }))
+            .await
+            .expect("Tool execution failed");
+
+        assert!(!res.success);
+        assert!(res.summary.contains("File not found"));
     }
 }
