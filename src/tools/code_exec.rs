@@ -183,6 +183,12 @@ impl CodeExecTool {
             s.to_string()
         }
     }
+
+    fn required_str_param<'a>(params: &'a Value, key: &str) -> AgentResult<&'a str> {
+        params[key]
+            .as_str()
+            .ok_or_else(|| AgentError::Validation(format!("Missing required parameter: {}", key)))
+    }
 }
 
 impl Default for CodeExecTool {
@@ -237,13 +243,8 @@ impl Tool for CodeExecTool {
     }
 
     async fn execute(&self, params: Value) -> AgentResult<ToolOutput> {
-        let code = params["code"]
-            .as_str()
-            .ok_or_else(|| AgentError::Validation("Missing required parameter: code".to_string()))?;
-        
-        let language = params["language"]
-            .as_str()
-            .ok_or_else(|| AgentError::Validation("Missing required parameter: language".to_string()))?;
+        let code = Self::required_str_param(&params, "code")?;
+        let language = Self::required_str_param(&params, "language")?;
 
         info!("MANDATORY SANDBOX EXECUTION: {} code ({} chars)", language, code.len());
 
