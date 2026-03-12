@@ -37,6 +37,8 @@ pub struct ContentFilter {
     injection_patterns: Vec<(Regex, String)>,
     /// Patterns that indicate dangerous code
     dangerous_code_patterns: Vec<(Regex, String, u8)>,
+    /// Patterns that indicate output leaks
+    output_patterns: Vec<(Regex, String, u8)>,
 }
 
 impl ContentFilter {
@@ -44,29 +46,34 @@ impl ContentFilter {
         Self {
             injection_patterns: Self::build_injection_patterns(),
             dangerous_code_patterns: Self::build_code_patterns(),
+            output_patterns: Self::build_output_patterns(),
         }
+    }
+
+    fn compile_regex(pattern: &str) -> Regex {
+        Regex::new(pattern).expect("Content filter pattern must compile")
     }
 
     fn build_injection_patterns() -> Vec<(Regex, String)> {
         vec![
             (
-                Regex::new(r"(?i)ignore\s+(?:previous|all|above|the).*\s+instructions").unwrap(),
+                Self::compile_regex(r"(?i)ignore\s+(?:previous|all|above|the).*\s+instructions"),
                 "Prompt injection attempt detected".to_string(),
             ),
             (
-                Regex::new(r"(?i)you\s+are\s+now\s+(a|an)").unwrap(),
+                Self::compile_regex(r"(?i)you\s+are\s+now\s+(a|an)"),
                 "Role override attempt detected".to_string(),
             ),
             (
-                Regex::new(r"(?i)forget\s+everything").unwrap(),
+                Self::compile_regex(r"(?i)forget\s+everything"),
                 "Memory wipe attempt detected".to_string(),
             ),
             (
-                Regex::new(r"(?i)system\s*:\s*you").unwrap(),
+                Self::compile_regex(r"(?i)system\s*:\s*you"),
                 "System prompt injection detected".to_string(),
             ),
             (
-                Regex::new(r"(?i)\]\]\s*\[\[").unwrap(),
+                Self::compile_regex(r"(?i)\]\]\s*\[\["),
                 "Bracket injection pattern detected".to_string(),
             ),
         ]
@@ -76,48 +83,73 @@ impl ContentFilter {
         vec![
             // File system dangers
             (
-                Regex::new(r"(?i)rm\s+-rf\s+/").unwrap(),
+                Self::compile_regex(r"(?i)rm\s+-rf\s+/"),
                 "Dangerous recursive delete command".to_string(),
                 10,
             ),
             (
-                Regex::new(r"(?i):\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:").unwrap(),
+                Self::compile_regex(r"(?i):\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
                 "Fork bomb detected".to_string(),
                 10,
             ),
             // Network dangers
             (
-                Regex::new(r"(?i)reverse\s*shell|bind\s*shell").unwrap(),
+                Self::compile_regex(r"(?i)reverse\s*shell|bind\s*shell"),
                 "Shell binding attempt".to_string(),
                 9,
             ),
             (
-                Regex::new(r"(?i)wget.*\|\s*sh|curl.*\|\s*bash").unwrap(),
+                Self::compile_regex(r"(?i)wget.*\|\s*sh|curl.*\|\s*bash"),
                 "Remote code execution pattern".to_string(),
                 9,
             ),
             // Credential access
             (
-                Regex::new(r"(?i)/etc/passwd|/etc/shadow").unwrap(),
+                Self::compile_regex(r"(?i)/etc/passwd|/etc/shadow"),
                 "System credential access attempt".to_string(),
                 8,
             ),
             (
-                Regex::new(r"(?i)~/.ssh/|\.ssh/id_rsa").unwrap(),
+                Self::compile_regex(r"(?i)~/.ssh/|\.ssh/id_rsa"),
                 "SSH key access attempt".to_string(),
                 8,
             ),
             // Environment/secrets
             (
-                Regex::new(r"(?i)process\.env\[|os\.environ\[|env::|getenv\(").unwrap(),
+                Self::compile_regex(r"(?i)process\.env\[|os\.environ\[|env::|getenv\("),
                 "Environment variable access".to_string(),
                 5,  // Lower severity, just warn
             ),
             // Infinite loops (potential DoS)
             (
-                Regex::new(r"while\s*\(\s*true\s*\)|loop\s*\{[^}]*\}").unwrap(),
+                Self::compile_regex(r"while\s*\(\s*true\s*\)|loop\s*\{[^}]*\}"),
                 "Potential infinite loop".to_string(),
                 4,  // Just warn
+            ),
+        ]
+    }
+
+    fn build_output_patterns() -> Vec<(Regex, String, u8)> {
+        vec![
+            (
+                Self::compile_regex(r"(?i)api[_-]?key\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
+                "API key in output".to_string(),
+                6,
+            ),
+            (
+                Self::compile_regex(r"(?i)password\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
+                "Password in output".to_string(),
+                6,
+            ),
+            (
+                Self::compile_regex(r"(?i)secret\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
+                "Secret in output".to_string(),
+                6,
+            ),
+            (
+                Self::compile_regex(r"[A-Za-z0-9+/]{40,}={0,2}"),
+                "Possible base64 encoded secret".to_string(),
+                6,
             ),
         ]
     }
@@ -152,22 +184,13 @@ impl ContentFilter {
     }
 
     /// Check output for sensitive information leakage
-    #[allow(dead_code)]
     pub fn check_output(&self, output: &str) -> ContentFilterResult {
         let mut result = ContentFilterResult::safe();
 
-        // Check for potential secrets/keys in output
-        let secret_patterns: [(&str, &str); 4] = [
-            (r"(?i)api[_-]?key\s*[:=]\s*['\x22][^'\x22]+['\x22]", "API key in output"),
-            (r"(?i)password\s*[:=]\s*['\x22][^'\x22]+['\x22]", "Password in output"),
-            (r"(?i)secret\s*[:=]\s*['\x22][^'\x22]+['\x22]", "Secret in output"),
-            (r"[A-Za-z0-9+/]{40,}={0,2}", "Possible base64 encoded secret"),
-        ];
-
-        for (pattern, description) in secret_patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                if re.is_match(output) {
-                    result.add_reason(description, 6);
+        for (pattern, description, severity) in &self.output_patterns {
+            if pattern.is_match(output) {
+                if *severity >= 6 {
+                    result.add_reason(description.clone(), *severity);
                 }
             }
         }
