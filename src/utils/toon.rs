@@ -4,6 +4,7 @@
 //! to reduce token consumption compared to standard JSON.
 
 use serde_json::Value;
+use std::fmt::Write;
 
 pub struct ToonFormatter;
 
@@ -20,52 +21,69 @@ impl ToonFormatter {
             Value::Bool(b) => b.to_string(),
             Value::Number(n) => n.to_string(),
             Value::String(s) => Self::format_string(s, &indent_str),
-            Value::Array(arr) => {
-                if arr.is_empty() {
-                    return "[]".to_string();
-                }
-
-                // SOTA: Tabular Array Optimization
-                // If all elements are objects with the same keys, use TOON tabular format.
-                if let Some(tabular) = Self::try_format_tabular_array(arr, &indent_str) {
-                    return tabular;
-                }
-
-                // Standard array
-                let mut out = String::from("[
-");
-                for item in arr {
-                    out.push_str(&format!("{}  - {}\n", indent_str, Self::format_recursive(item, indent + 1)));
-                }
-                out.push_str(&format!("{}]", indent_str));
-                out
-            },
-            Value::Object(map) => {
-                if map.is_empty() {
-                    return "{}".to_string();
-                }
-                let mut out = String::new();
-                for (key, val) in map {
-                    out.push_str(&format!("{}{}: {}\n", indent_str, key, Self::format_recursive(val, indent + 1)));
-                }
-                out.trim_end().to_string()
-            }
+            Value::Array(arr) => Self::format_array(arr, indent, &indent_str),
+            Value::Object(map) => Self::format_object(map, indent + 1, &indent_str),
         }
     }
 
     fn format_string(s: &str, indent_str: &str) -> String {
         // If the string contains newlines, preserve them in a block-like style.
         if s.contains('\n') {
-            format!(
-                "|\n{}",
-                s.lines()
-                    .map(|line| format!("{}  {}", indent_str, line))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
+            let mut out = String::from("|\n");
+            for (index, line) in s.lines().enumerate() {
+                if index > 0 {
+                    out.push('\n');
+                }
+                let _ = write!(out, "{indent_str}  {line}");
+            }
+            out
         } else {
             serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
         }
+    }
+
+    fn format_array(arr: &[Value], indent: usize, indent_str: &str) -> String {
+        if arr.is_empty() {
+            return "[]".to_string();
+        }
+
+        // SOTA: Tabular Array Optimization
+        // If all elements are objects with the same keys, use TOON tabular format.
+        if let Some(tabular) = Self::try_format_tabular_array(arr, indent_str) {
+            return tabular;
+        }
+
+        let mut out = String::from("[\n");
+        for item in arr {
+            out.push_str(indent_str);
+            out.push_str("  - ");
+            out.push_str(&Self::format_recursive(item, indent + 1));
+            out.push('\n');
+        }
+        out.push_str(indent_str);
+        out.push(']');
+        out
+    }
+
+    fn format_object(
+        map: &serde_json::Map<String, Value>,
+        nested_indent: usize,
+        indent_str: &str,
+    ) -> String {
+        if map.is_empty() {
+            return "{}".to_string();
+        }
+
+        let mut out = String::new();
+        for (key, val) in map {
+            let _ = writeln!(
+                out,
+                "{indent_str}{key}: {}",
+                Self::format_recursive(val, nested_indent)
+            );
+        }
+        out.pop();
+        out
     }
 
     fn try_format_tabular_array(arr: &[Value], indent_str: &str) -> Option<String> {
@@ -85,20 +103,27 @@ impl ToonFormatter {
         }
 
         let header = format!("[#{} {}:]\n", arr.len(), keys.join(", "));
-        let body = arr
-            .iter()
-            .map(|item| {
-                let values = keys
-                    .iter()
-                    .map(|key| item.get(*key).map(Self::format_tabular_cell).unwrap_or_else(|| "null".to_string()))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                format!("{}  - {}", indent_str, values)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut body = String::new();
+        for (row_index, item) in arr.iter().enumerate() {
+            if row_index > 0 {
+                body.push('\n');
+            }
+            body.push_str(indent_str);
+            body.push_str("  - ");
+            for (col_index, key) in keys.iter().enumerate() {
+                if col_index > 0 {
+                    body.push_str(" | ");
+                }
+                body.push_str(
+                    &item
+                        .get(*key)
+                        .map(Self::format_tabular_cell)
+                        .unwrap_or_else(|| "null".to_string()),
+                );
+            }
+        }
 
-        Some(format!("{header}{body}"))
+        Some(header + &body)
     }
 
     fn format_tabular_cell(value: &Value) -> String {
