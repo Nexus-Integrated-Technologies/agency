@@ -6,7 +6,7 @@ use anyhow::Result;
 use ollama_rs::Ollama;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::info;
 
 use crate::agent::{AgentType, LLMProvider, OllamaProvider, OpenAICompatibleProvider};
@@ -123,6 +123,14 @@ pub struct Router {
 }
 
 impl Router {
+    fn json_field_ci<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        let upper_key = key.to_ascii_uppercase();
+        value
+            .get(key)
+            .and_then(|entry| entry.as_str())
+            .or_else(|| value.get(&upper_key).and_then(|entry| entry.as_str()))
+    }
+
     fn normalize_for_matching(input: &str) -> String {
         let mut normalized = String::with_capacity(input.len());
         let mut last_was_space = true;
@@ -459,22 +467,19 @@ q = "{}"
             if let Some(end) = response.rfind('}') {
                 let json_str = &response[start..=end];
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    let agent_str = v["agent"].as_str()
-                        .or_else(|| v["AGENT"].as_str())
+                    let agent_str = Self::json_field_ci(&v, "agent")
                         .map(|s| s.to_lowercase())
                         .unwrap_or_else(|| "reasoner".to_string());
 
                     let agent_type = Self::parse_agent_label(agent_str.as_str());
 
-                    let memory_val = v["memory"].as_str()
-                        .or_else(|| v["MEMORY"].as_str())
+                    let memory_val = Self::json_field_ci(&v, "memory")
                         .map(|s| s.to_lowercase())
                         .unwrap_or_else(|| "no".to_string());
                     
                     let should_search_memory = memory_val == "yes" || memory_val == "true";
 
-                    let reason = v["reason"].as_str()
-                        .or_else(|| v["REASON"].as_str())
+                    let reason = Self::json_field_ci(&v, "reason")
                         .unwrap_or("LLM routing decision")
                         .to_string();
 
@@ -491,9 +496,18 @@ q = "{}"
         }
 
         // Fallback to previous Regex parsing
-        let agent_re = Regex::new(r"(?i)AGENT:\s*(\w+)")?;
-        let memory_re = Regex::new(r"(?i)MEMORY:\s*(yes|no)")?;
-        let reason_re = Regex::new(r"(?i)REASON:\s*(.+)")?;
+        static AGENT_RE: OnceLock<Regex> = OnceLock::new();
+        static MEMORY_RE: OnceLock<Regex> = OnceLock::new();
+        static REASON_RE: OnceLock<Regex> = OnceLock::new();
+        let agent_re = AGENT_RE.get_or_init(|| {
+            Regex::new(r"(?i)AGENT:\s*(\w+)").expect("AGENT regex literal must be valid")
+        });
+        let memory_re = MEMORY_RE.get_or_init(|| {
+            Regex::new(r"(?i)MEMORY:\s*(yes|no)").expect("MEMORY regex literal must be valid")
+        });
+        let reason_re = REASON_RE.get_or_init(|| {
+            Regex::new(r"(?i)REASON:\s*(.+)").expect("REASON regex literal must be valid")
+        });
 
         let agent_str = agent_re
             .captures(response)
