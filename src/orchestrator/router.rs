@@ -155,6 +155,131 @@ impl Router {
         }
     }
 
+    fn has_url_hint(q_lower: &str) -> bool {
+        q_lower.contains("http://")
+            || q_lower.contains("https://")
+            || q_lower.contains(".com")
+            || q_lower.contains(".org")
+    }
+
+    fn estimate_complexity(query: &str, q_lower: &str) -> f32 {
+        if Self::has_url_hint(q_lower) {
+            0.9 // URLs are high-complexity external unknowns
+        } else if query.len() > 100
+            || q_lower.contains("code")
+            || q_lower.contains("analyze")
+            || q_lower.contains("refactor")
+        {
+            0.8
+        } else if query.len() > 30 || q_lower.contains("explain") {
+            0.5
+        } else {
+            0.1
+        }
+    }
+
+    fn fast_path_decision(
+        &self,
+        q_lower: &str,
+        tool_requested: bool,
+        scale: &ScaleProfile,
+    ) -> Option<RoutingDecision> {
+        // FPF Integration: Tool-Use Detection (Pre-Route Fast Path)
+        // When users explicitly request a tool, bypass GeneralChat and route to agent with tool access.
+        if tool_requested {
+            return Some(Self::quick_decision(
+                AgentType::Coder, // Coder has tool access
+                false,
+                true,
+                0.95,
+                "Query explicitly mentions tool usage (FPF Tool Detection)",
+                scale.clone(),
+            ));
+        }
+
+        // Very short, greeting, or identity messages -> GeneralChat (1b for speed)
+        // Expanded threshold to 60 chars to catch simple questions like "What is the capital of France?"
+        // unless they look like code or research queries.
+        let is_short_simple = q_lower.len() < 60
+            && !self.is_code_related(q_lower)
+            && !self.is_research_related(q_lower)
+            && !self.is_planning_related(q_lower);
+
+        if is_short_simple || self.is_greeting(q_lower) || self.is_identity_query(q_lower) {
+            return Some(Self::quick_decision(
+                AgentType::GeneralChat,
+                false,
+                false, // Greetings never require strict reasoning tags
+                0.9,
+                "Simple greeting or short message",
+                scale.clone(),
+            ));
+        }
+
+        // Filesystem / Directory heuristics (Fast-Path)
+        if self.is_filesystem_related(q_lower) {
+            return Some(Self::quick_decision(
+                AgentType::Coder,
+                false,
+                true,
+                0.95,
+                "Direct filesystem query (heuristics fast-path)",
+                scale.clone(),
+            ));
+        }
+
+        // Knowledge Graph / Relationship heuristics
+        if q_lower.contains("graph") || q_lower.contains("relationship") || q_lower.contains("visualize")
+        {
+            return Some(Self::quick_decision(
+                AgentType::Reasoner,
+                true,
+                true,
+                0.9,
+                "Knowledge graph or relationship query",
+                scale.clone(),
+            ));
+        }
+
+        // Code-related keywords -> Coder
+        if self.is_code_related(q_lower) && !self.is_complex_query(q_lower) {
+            return Some(Self::quick_decision(
+                AgentType::Coder,
+                false,
+                true,
+                0.85,
+                "Query contains code-related keywords",
+                scale.clone(),
+            ));
+        }
+
+        // Planning keywords -> Planner
+        if self.is_planning_related(q_lower) || self.is_complex_query(q_lower) {
+            return Some(Self::quick_decision(
+                AgentType::Planner,
+                true,
+                true,
+                0.8,
+                "Query involves planning or task decomposition",
+                scale.clone(),
+            ));
+        }
+
+        // Research/search keywords -> Researcher
+        if self.is_research_related(q_lower) {
+            return Some(Self::quick_decision(
+                AgentType::Researcher,
+                true,
+                true,
+                0.8,
+                "Query requires information gathering",
+                scale.clone(),
+            ));
+        }
+
+        None
+    }
+
     pub fn new(ollama: Ollama) -> Self {
         Self {
             provider: Arc::new(OllamaProvider::new(ollama)),
@@ -193,120 +318,20 @@ impl Router {
         // FPF Integration: Scaling-Law Lens (SLL) - The Scale Probe
         // 1. Calculate complexity (Scale Variables S)
         let q_lower = query.to_lowercase();
-        
-        // URL Detection: Escalates complexity to Heavy (0.9) to mandate tool-use
-        let has_url = q_lower.contains("http://") || q_lower.contains("https://") || q_lower.contains(".com") || q_lower.contains(".org");
-
-        let complexity = if has_url {
-            0.9 // URLs are high-complexity external unknowns
-        } else if query.len() > 100 || q_lower.contains("code") || q_lower.contains("analyze") || q_lower.contains("refactor") {
-            0.8
-        } else if query.len() > 30 || q_lower.contains("explain") {
-            0.5
-        } else {
-            0.1
-        };
+        let complexity = Self::estimate_complexity(query, &q_lower);
 
         // 2. Evaluate Scale Probe against actual hardware state
         let vram = vram_available_gb.unwrap_or(8.0); // Fallback to 8GB if tool is missing
         let scale = ScaleProfile::new(complexity, vram);
-        
+        let tool_requested = self.mentions_tool(&q_lower);
+
         // FPF Integration: Reasoning Requirement Probe
         // Determine if the task is complex enough to merit strict reasoning tags
-        let reasoning_required = complexity > 0.3 || self.mentions_tool(&q_lower);
+        let reasoning_required = complexity > 0.3 || tool_requested;
 
         // Quick heuristics for simple cases
-        
-        // FPF Integration: Tool-Use Detection (Pre-Route Fast Path)
-        // When users explicitly request a tool, bypass GeneralChat and route to agent with tool access.
-        if self.mentions_tool(&q_lower) {
-            return Ok(Self::quick_decision(
-                AgentType::Coder, // Coder has tool access
-                false,
-                true,
-                0.95,
-                "Query explicitly mentions tool usage (FPF Tool Detection)",
-                scale,
-            ));
-        }
-        
-        // Very short, greeting, or identity messages -> GeneralChat (1b for speed)
-        // Expanded threshold to 60 chars to catch simple questions like "What is the capital of France?"
-        // unless they look like code or research queries.
-        let is_short_simple = q_lower.len() < 60 
-            && !self.is_code_related(&q_lower) 
-            && !self.is_research_related(&q_lower)
-            && !self.is_planning_related(&q_lower);
-
-        if is_short_simple || self.is_greeting(&q_lower) || self.is_identity_query(&q_lower) {
-            return Ok(Self::quick_decision(
-                AgentType::GeneralChat,
-                false,
-                false, // Greetings never require strict reasoning tags
-                0.9,
-                "Simple greeting or short message",
-                scale,
-            ));
-        }
-
-        // Filesystem / Directory heuristics (Fast-Path)
-        if self.is_filesystem_related(&q_lower) {
-            return Ok(Self::quick_decision(
-                AgentType::Coder,
-                false,
-                true,
-                0.95,
-                "Direct filesystem query (heuristics fast-path)",
-                scale,
-            ));
-        }
-
-        // Knowledge Graph / Relationship heuristics
-        if q_lower.contains("graph") || q_lower.contains("relationship") || q_lower.contains("visualize") {
-            return Ok(Self::quick_decision(
-                AgentType::Reasoner,
-                true,
-                true,
-                0.9,
-                "Knowledge graph or relationship query",
-                scale,
-            ));
-        }
-
-        // Code-related keywords -> Coder
-        if self.is_code_related(&q_lower) && !self.is_complex_query(&q_lower) {
-            return Ok(Self::quick_decision(
-                AgentType::Coder,
-                false,
-                true,
-                0.85,
-                "Query contains code-related keywords",
-                scale,
-            ));
-        }
-
-        // Planning keywords -> Planner
-        if self.is_planning_related(&q_lower) || self.is_complex_query(&q_lower) {
-            return Ok(Self::quick_decision(
-                AgentType::Planner,
-                true,
-                true,
-                0.8,
-                "Query involves planning or task decomposition",
-                scale,
-            ));
-        }
-
-        // Research/search keywords -> Researcher
-        if self.is_research_related(&q_lower) {
-            return Ok(Self::quick_decision(
-                AgentType::Researcher,
-                true,
-                true,
-                0.8,
-                "Query requires information gathering",
-                scale,
-            ));
+        if let Some(decision) = self.fast_path_decision(&q_lower, tool_requested, &scale) {
+            return Ok(decision);
         }
 
         // Use LLM for complex routing decisions
@@ -336,7 +361,7 @@ impl Router {
 
     fn is_identity_query(&self, query: &str) -> bool {
         // Also handle very short identity queries
-        Self::contains_any(query, IDENTITY_KEYWORDS) || query.trim().to_lowercase() == "what are you"
+        Self::contains_any(query, IDENTITY_KEYWORDS) || query.trim() == "what are you"
     }
 
     fn is_filesystem_related(&self, query: &str) -> bool {
@@ -477,5 +502,20 @@ mod tests {
         let router = Router::new(Ollama::default());
         let res = router.route("write a python function", None).await.unwrap();
         assert_eq!(res.candidate_agents[0], AgentType::Coder);
+    }
+
+    #[test]
+    fn test_estimate_complexity_prefers_url_signal() {
+        let query = "can you summarize https://example.com for me";
+        let q_lower = query.to_lowercase();
+        assert_eq!(Router::estimate_complexity(query, &q_lower), 0.9);
+    }
+
+    #[tokio::test]
+    async fn test_tool_request_routes_to_coder_fast_path() {
+        let router = Router::new(Ollama::default());
+        let res = router.route("use shell to list files", None).await.unwrap();
+        assert_eq!(res.candidate_agents[0], AgentType::Coder);
+        assert!(res.reason.contains("tool usage"));
     }
 }
