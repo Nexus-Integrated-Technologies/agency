@@ -265,9 +265,7 @@ impl SovereignAgent for ReActAgent {
 
     async fn execute_step(&self, task_id: &str, input: Option<serde_json::Value>) -> anyhow::Result<UapStep> {
         let mut step = UapStep::new(task_id, "ReAct Step");
-        
-        let query = input.as_ref().and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Continue with task".to_string());
+        let query = Self::query_from_step_input(input.as_ref());
 
         // L5 Check: Ensure we aren't blocked before executing
         let audit = self.audit_alignment(&query, false).await?;
@@ -276,9 +274,6 @@ impl SovereignAgent for ReActAgent {
         }
 
         step.status = UapStepStatus::Running;
-
-        let query = input.and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Continue with task".to_string());
 
         // Execute one iteration of the ReAct loop
         let res = self.execute(&query, None).await
@@ -305,6 +300,13 @@ impl SovereignAgent for ReActAgent {
 }
 
 impl ReActAgent {
+    fn query_from_step_input(input: Option<&serde_json::Value>) -> String {
+        input
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Continue with task")
+            .to_string()
+    }
+
     /// Build the ReAct prompt
     async fn build_react_prompt(&self, query: &str, steps: &[
 ReActStep],
@@ -1207,6 +1209,7 @@ impl SimpleAgent {
 mod tests {
     use super::*;
     use crate::orchestrator::profile::AgencyProfile;
+    use serde_json::json;
 
     #[test]
     fn test_extract_tag() {
@@ -1221,5 +1224,25 @@ mod tests {
         
         let action = agent.extract_tag(response, "[ACTION]");
         assert_eq!(action.expect("Failed to extract action"), "{\"name\": \"get_weather\", \"parameters\": {\"location\": \"Seattle\"}}");
+    }
+
+    #[test]
+    fn test_query_from_step_input_uses_string_value() {
+        let input = json!("Refactor auth module");
+        let query = ReActAgent::query_from_step_input(Some(&input));
+        assert_eq!(query, "Refactor auth module");
+    }
+
+    #[test]
+    fn test_query_from_step_input_falls_back_for_non_string() {
+        let input = json!({ "task": "Refactor auth module" });
+        let query = ReActAgent::query_from_step_input(Some(&input));
+        assert_eq!(query, "Continue with task");
+    }
+
+    #[test]
+    fn test_query_from_step_input_falls_back_for_none() {
+        let query = ReActAgent::query_from_step_input(None);
+        assert_eq!(query, "Continue with task");
     }
 }
