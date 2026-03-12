@@ -3,7 +3,7 @@ use axum::{
     routing::{post, get},
     Json, Router,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::Embedding;
 use std::path::PathBuf;
@@ -35,9 +35,9 @@ impl ModelPool {
         }
     }
 
-    async fn checkout(&self) -> T3Candle {
+    async fn checkout(&self) -> Result<T3Candle> {
         let mut rx = self.receiver.lock().await;
-        rx.recv().await.expect("Model pool exhausted")
+        rx.recv().await.context("Model pool exhausted")
     }
 
     fn checkin(&self, model: T3Candle) {
@@ -139,30 +139,48 @@ impl AudioEngine {
             let tokenizer = self.tokenizer.clone();
 
             tokio::spawn(async move {
-                let mut model = pool.checkout().await;
+                let mut model = match pool.checkout().await {
+                    Ok(model) => model,
+                    Err(e) => {
+                        error!("AudioEngine: Failed to checkout model for chunk {}: {}", idx, e);
+                        let _ = audio_tx.send((idx, Vec::new()));
+                        return;
+                    }
+                };
                 let start_time = std::time::Instant::now();
                 
                 let result = tokio::task::spawn_blocking(move || {
-                    let tokens = T3Candle::generate_tokens_internal_static(
-                        &mut model, &tokenizer, &sentence, &speech_emb, 
-                        &device, start_token, stop_token
-                    )?;
-                    
-                    let audio = Self::decode_audio_native_static(&decoder_model, &tokens, &decoder_device)?;
-                    Ok::<(Vec<f32>, T3Candle), anyhow::Error>((audio, model))
+                    let inference_result = (|| -> Result<Vec<f32>> {
+                        let tokens = T3Candle::generate_tokens_internal_static(
+                            &mut model,
+                            &tokenizer,
+                            &sentence,
+                            &speech_emb,
+                            &device,
+                            start_token,
+                            stop_token,
+                        )?;
+
+                        Self::decode_audio_native_static(&decoder_model, &tokens, &decoder_device)
+                    })();
+                    (inference_result, model)
                 }).await;
 
                 match result {
-                    Ok(Ok((audio, model))) => {
+                    Ok((Ok(audio), model)) => {
                         let _ = audio_tx.send((idx, audio));
                         debug!("AudioEngine: Chunk {} done in {}ms", idx, start_time.elapsed().as_millis());
                         pool.checkin(model);
                     }
-                    Ok(Err(e)) => {
+                    Ok((Err(e), model)) => {
                         error!("AudioEngine: Inference error on chunk {}: {}", idx, e);
                         let _ = audio_tx.send((idx, Vec::new()));
+                        pool.checkin(model);
                     }
-                    Err(e) => error!("AudioEngine: Task join error: {}", e),
+                    Err(e) => {
+                        error!("AudioEngine: Task join error on chunk {}: {}", idx, e);
+                        let _ = audio_tx.send((idx, Vec::new()));
+                    }
                 }
             });
         }
