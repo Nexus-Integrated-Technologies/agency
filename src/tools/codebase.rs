@@ -39,6 +39,37 @@ impl CodebaseTool {
         path_str.ends_with("Cargo.lock") ||
         path_str.ends_with(".gitignore")
     }
+
+    fn should_skip_dir(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| matches!(name, "target" | ".git" | ".fastembed_cache"))
+            .unwrap_or(false)
+    }
+
+    async fn collect_files(&self) -> AgentResult<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        let mut dirs = vec![self.src_dir.clone()];
+
+        while let Some(dir) = dirs.pop() {
+            let mut entries = match fs::read_dir(dir).await {
+                Ok(e) => e,
+                Err(e) => return Err(AgentError::Io(e)),
+            };
+            while let Some(entry) = entries.next_entry().await.map_err(AgentError::Io)? {
+                let path = entry.path();
+                if path.is_dir() {
+                    if !Self::should_skip_dir(&path) {
+                        dirs.push(path);
+                    }
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+
+        Ok(files)
+    }
 }
 
 impl Default for CodebaseTool {
@@ -93,33 +124,20 @@ impl Tool for CodebaseTool {
 
         match action {
             "list_files" => {
-                let mut files = Vec::new();
-                let mut dirs = vec![self.src_dir.clone()];
-                
-                while let Some(dir) = dirs.pop() {
-                    let mut entries = match fs::read_dir(dir).await {
-                        Ok(e) => e,
-                        Err(e) => return Ok(ToolOutput::failure(format!("Failed to read directory: {}", e))),
-                    };
-                    while let Some(entry) = entries.next_entry().await.map_err(|e| AgentError::Io(e))? {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            let path_str = path.to_string_lossy();
-                            if !path_str.contains("target") && !path_str.contains(".git") {
-                                dirs.push(path);
-                            }
-                        } else {
-                            files.push(path.to_string_lossy().to_string());
-                        }
-                    }
-                }
-                
+                let files = self
+                    .collect_files()
+                    .await
+                    .map_err(|e| AgentError::Tool(format!("Failed to collect files: {}", e)))?;
+                let file_strings: Vec<String> = files
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect();
                 let mut tree_summary = String::from("Codebase Files:\n");
-                for f in &files {
+                for f in &file_strings {
                     tree_summary.push_str(&format!("- {}\n", f));
                 }
                 
-                Ok(ToolOutput::success(json!({ "files": files }), tree_summary))
+                Ok(ToolOutput::success(json!({ "files": file_strings }), tree_summary))
             },
             "read_file" => {
                 let rel_path = params["path"].as_str().ok_or_else(|| AgentError::Validation("Missing path".to_string()))?;
@@ -147,6 +165,60 @@ impl Tool for CodebaseTool {
                     format!("Content of {}:\n\n{}", rel_path, content)
                 ))
             },
+            "search" => {
+                let query = params["query"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::Validation("Missing query".to_string()))?;
+                let query_lower = query.to_lowercase();
+                let files = self
+                    .collect_files()
+                    .await
+                    .map_err(|e| AgentError::Tool(format!("Failed to collect files: {}", e)))?;
+
+                let mut matches = Vec::new();
+                for path in files {
+                    let content = match fs::read_to_string(&path).await {
+                        Ok(content) => content,
+                        Err(_) => continue,
+                    };
+                    let display_path = path
+                        .strip_prefix(&self.src_dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    for (line_number, line) in content.lines().enumerate() {
+                        if line.to_lowercase().contains(&query_lower) {
+                            matches.push(json!({
+                                "path": display_path,
+                                "line": line_number + 1,
+                                "content": line.trim(),
+                            }));
+                            if matches.len() >= 100 {
+                                break;
+                            }
+                        }
+                    }
+                    if matches.len() >= 100 {
+                        break;
+                    }
+                }
+
+                let summary = if matches.is_empty() {
+                    format!("No matches found for '{}'.", query)
+                } else {
+                    format!("Found {} matches for '{}'.", matches.len(), query)
+                };
+                let total_matches = matches.len();
+                Ok(ToolOutput::success(
+                    json!({
+                        "query": query,
+                        "matches": matches,
+                        "total_matches": total_matches,
+                    }),
+                    summary
+                ))
+            }
             _ => Ok(ToolOutput::failure("Unsupported codebase action"))
         }
     }
@@ -215,5 +287,31 @@ mod tests {
         
         assert!(!res.success);
         assert!(res.summary.contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_codebase_search() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let src_path = dir.path().join("src");
+        fs::create_dir(&src_path).await.expect("Failed to create src dir");
+
+        let file_path = src_path.join("lib.rs");
+        let mut file = File::create(&file_path).expect("Failed to create lib.rs");
+        writeln!(file, "pub fn hello_world() {{}}").expect("Failed to write line");
+
+        let tool = CodebaseTool::new(&src_path);
+        let res = tool
+            .execute(json!({
+                "action": "search",
+                "query": "hello_world"
+            }))
+            .await
+            .expect("Tool execution failed");
+
+        assert!(res.success);
+        let total = res.data["total_matches"].as_u64().expect("Missing total_matches");
+        assert!(total >= 1);
+        let first = &res.data["matches"][0];
+        assert!(first["path"].as_str().expect("Missing path").contains("lib.rs"));
     }
 }
