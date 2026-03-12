@@ -4,6 +4,17 @@
 
 use regex::Regex;
 
+struct MatchRule {
+    pattern: Regex,
+    description: &'static str,
+}
+
+struct SeverityRule {
+    pattern: Regex,
+    description: &'static str,
+    severity: u8,
+}
+
 /// Result of content filtering
 #[derive(Debug, Clone)]
 pub struct ContentFilterResult {
@@ -34,11 +45,11 @@ impl ContentFilterResult {
 /// Content filter for inputs and code
 pub struct ContentFilter {
     /// Patterns that indicate prompt injection
-    injection_patterns: Vec<(Regex, String)>,
+    injection_patterns: Vec<MatchRule>,
     /// Patterns that indicate dangerous code
-    dangerous_code_patterns: Vec<(Regex, String, u8)>,
+    dangerous_code_patterns: Vec<SeverityRule>,
     /// Patterns that indicate output leaks
-    output_patterns: Vec<(Regex, String, u8)>,
+    output_patterns: Vec<SeverityRule>,
 }
 
 impl ContentFilter {
@@ -54,115 +65,131 @@ impl ContentFilter {
         Regex::new(pattern).expect("Content filter pattern must compile")
     }
 
-    fn build_injection_patterns() -> Vec<(Regex, String)> {
+    fn build_injection_patterns() -> Vec<MatchRule> {
         vec![
-            (
-                Self::compile_regex(r"(?i)ignore\s+(?:previous|all|above|the).*\s+instructions"),
-                "Prompt injection attempt detected".to_string(),
-            ),
-            (
-                Self::compile_regex(r"(?i)you\s+are\s+now\s+(a|an)"),
-                "Role override attempt detected".to_string(),
-            ),
-            (
-                Self::compile_regex(r"(?i)forget\s+everything"),
-                "Memory wipe attempt detected".to_string(),
-            ),
-            (
-                Self::compile_regex(r"(?i)system\s*:\s*you"),
-                "System prompt injection detected".to_string(),
-            ),
-            (
-                Self::compile_regex(r"(?i)\]\]\s*\[\["),
-                "Bracket injection pattern detected".to_string(),
-            ),
+            MatchRule {
+                pattern: Self::compile_regex(r"(?i)ignore\s+(?:previous|all|above|the).*\s+instructions"),
+                description: "Prompt injection attempt detected",
+            },
+            MatchRule {
+                pattern: Self::compile_regex(r"(?i)you\s+are\s+now\s+(a|an)"),
+                description: "Role override attempt detected",
+            },
+            MatchRule {
+                pattern: Self::compile_regex(r"(?i)forget\s+everything"),
+                description: "Memory wipe attempt detected",
+            },
+            MatchRule {
+                pattern: Self::compile_regex(r"(?i)system\s*:\s*you"),
+                description: "System prompt injection detected",
+            },
+            MatchRule {
+                pattern: Self::compile_regex(r"(?i)\]\]\s*\[\["),
+                description: "Bracket injection pattern detected",
+            },
         ]
     }
 
-    fn build_code_patterns() -> Vec<(Regex, String, u8)> {
+    fn build_code_patterns() -> Vec<SeverityRule> {
         vec![
             // File system dangers
-            (
-                Self::compile_regex(r"(?i)rm\s+-rf\s+/"),
-                "Dangerous recursive delete command".to_string(),
-                10,
-            ),
-            (
-                Self::compile_regex(r"(?i):\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
-                "Fork bomb detected".to_string(),
-                10,
-            ),
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)rm\s+-rf\s+/"),
+                description: "Dangerous recursive delete command",
+                severity: 10,
+            },
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i):\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
+                description: "Fork bomb detected",
+                severity: 10,
+            },
             // Network dangers
-            (
-                Self::compile_regex(r"(?i)reverse\s*shell|bind\s*shell"),
-                "Shell binding attempt".to_string(),
-                9,
-            ),
-            (
-                Self::compile_regex(r"(?i)wget.*\|\s*sh|curl.*\|\s*bash"),
-                "Remote code execution pattern".to_string(),
-                9,
-            ),
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)reverse\s*shell|bind\s*shell"),
+                description: "Shell binding attempt",
+                severity: 9,
+            },
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)wget.*\|\s*sh|curl.*\|\s*bash"),
+                description: "Remote code execution pattern",
+                severity: 9,
+            },
             // Credential access
-            (
-                Self::compile_regex(r"(?i)/etc/passwd|/etc/shadow"),
-                "System credential access attempt".to_string(),
-                8,
-            ),
-            (
-                Self::compile_regex(r"(?i)~/.ssh/|\.ssh/id_rsa"),
-                "SSH key access attempt".to_string(),
-                8,
-            ),
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)/etc/passwd|/etc/shadow"),
+                description: "System credential access attempt",
+                severity: 8,
+            },
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)~/.ssh/|\.ssh/id_rsa"),
+                description: "SSH key access attempt",
+                severity: 8,
+            },
             // Environment/secrets
-            (
-                Self::compile_regex(r"(?i)process\.env\[|os\.environ\[|env::|getenv\("),
-                "Environment variable access".to_string(),
-                5,  // Lower severity, just warn
-            ),
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)process\.env\[|os\.environ\[|env::|getenv\("),
+                description: "Environment variable access",
+                severity: 5, // Lower severity, just warn
+            },
             // Infinite loops (potential DoS)
-            (
-                Self::compile_regex(r"while\s*\(\s*true\s*\)|loop\s*\{[^}]*\}"),
-                "Potential infinite loop".to_string(),
-                4,  // Just warn
-            ),
+            SeverityRule {
+                pattern: Self::compile_regex(r"while\s*\(\s*true\s*\)|loop\s*\{[^}]*\}"),
+                description: "Potential infinite loop",
+                severity: 4, // Just warn
+            },
         ]
     }
 
-    fn build_output_patterns() -> Vec<(Regex, String, u8)> {
+    fn build_output_patterns() -> Vec<SeverityRule> {
         vec![
-            (
-                Self::compile_regex(r"(?i)api[_-]?key\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
-                "API key in output".to_string(),
-                6,
-            ),
-            (
-                Self::compile_regex(r"(?i)password\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
-                "Password in output".to_string(),
-                6,
-            ),
-            (
-                Self::compile_regex(r"(?i)secret\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
-                "Secret in output".to_string(),
-                6,
-            ),
-            (
-                Self::compile_regex(r"[A-Za-z0-9+/]{40,}={0,2}"),
-                "Possible base64 encoded secret".to_string(),
-                6,
-            ),
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)api[_-]?key\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
+                description: "API key in output",
+                severity: 6,
+            },
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)password\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
+                description: "Password in output",
+                severity: 6,
+            },
+            SeverityRule {
+                pattern: Self::compile_regex(r"(?i)secret\s*[:=]\s*['\x22][^'\x22]+['\x22]"),
+                description: "Secret in output",
+                severity: 6,
+            },
+            SeverityRule {
+                pattern: Self::compile_regex(r"[A-Za-z0-9+/]{40,}={0,2}"),
+                description: "Possible base64 encoded secret",
+                severity: 6,
+            },
         ]
+    }
+
+    fn apply_match_rules(result: &mut ContentFilterResult, content: &str, rules: &[MatchRule], severity: u8) {
+        for rule in rules {
+            if rule.pattern.is_match(content) {
+                result.add_reason(rule.description, severity);
+            }
+        }
+    }
+
+    fn apply_severity_rules(
+        result: &mut ContentFilterResult,
+        content: &str,
+        rules: &[SeverityRule],
+        min_severity: u8,
+    ) {
+        for rule in rules {
+            if rule.severity >= min_severity && rule.pattern.is_match(content) {
+                result.add_reason(rule.description, rule.severity);
+            }
+        }
     }
 
     /// Check user input for safety issues
     pub fn check_input(&self, input: &str) -> ContentFilterResult {
         let mut result = ContentFilterResult::safe();
-
-        for (pattern, description) in &self.injection_patterns {
-            if pattern.is_match(input) {
-                result.add_reason(description.clone(), 8);
-            }
-        }
+        Self::apply_match_rules(&mut result, input, &self.injection_patterns, 8);
 
         result
     }
@@ -170,15 +197,7 @@ impl ContentFilter {
     /// Check code for dangerous patterns
     pub fn check_code(&self, code: &str) -> ContentFilterResult {
         let mut result = ContentFilterResult::safe();
-
-        for (pattern, description, severity) in &self.dangerous_code_patterns {
-            if pattern.is_match(code) {
-                // Only block if severity is high enough
-                if *severity >= 7 {
-                    result.add_reason(description.clone(), *severity);
-                }
-            }
-        }
+        Self::apply_severity_rules(&mut result, code, &self.dangerous_code_patterns, 7);
 
         result
     }
@@ -186,14 +205,7 @@ impl ContentFilter {
     /// Check output for sensitive information leakage
     pub fn check_output(&self, output: &str) -> ContentFilterResult {
         let mut result = ContentFilterResult::safe();
-
-        for (pattern, description, severity) in &self.output_patterns {
-            if pattern.is_match(output) {
-                if *severity >= 6 {
-                    result.add_reason(description.clone(), *severity);
-                }
-            }
-        }
+        Self::apply_severity_rules(&mut result, output, &self.output_patterns, 6);
 
         result
     }
