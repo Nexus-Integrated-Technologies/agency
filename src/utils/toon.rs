@@ -64,7 +64,7 @@ impl ToonFormatter {
                     .join("\n")
             )
         } else {
-            format!("\"{}\"", s)
+            serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
         }
     }
 
@@ -90,11 +90,7 @@ impl ToonFormatter {
             .map(|item| {
                 let values = keys
                     .iter()
-                    .map(|key| match item.get(*key) {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(other) => other.to_string(),
-                        None => "null".to_string(),
-                    })
+                    .map(|key| item.get(*key).map(Self::format_tabular_cell).unwrap_or_else(|| "null".to_string()))
                     .collect::<Vec<_>>()
                     .join(" | ");
                 format!("{}  - {}", indent_str, values)
@@ -103,6 +99,22 @@ impl ToonFormatter {
             .join("\n");
 
         Some(format!("{header}{body}"))
+    }
+
+    fn format_tabular_cell(value: &Value) -> String {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => value.to_string(),
+            Value::String(s) => {
+                let should_quote =
+                    s.is_empty() || s.contains('\n') || s.contains('|') || s.contains('"') || s.trim() != s;
+                if should_quote {
+                    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
+                } else {
+                    s.clone()
+                }
+            }
+            Value::Array(_) | Value::Object(_) => value.to_string(),
+        }
     }
 }
 
@@ -163,6 +175,30 @@ mod tests {
         assert_eq!(
             formatted,
             "[#2 name, score:]\n  - alice | 10\n  - bob | 20"
+        );
+    }
+
+    #[test]
+    fn escapes_quotes_in_standard_strings() {
+        let value = json!({"msg": "say \"hello\""});
+
+        let formatted = ToonFormatter::format(&value);
+
+        assert!(formatted.contains("msg: \"say \\\"hello\\\"\""));
+    }
+
+    #[test]
+    fn quotes_unsafe_tabular_cells() {
+        let value = json!([
+            {"name": "alice|ops", "score": 10},
+            {"name": " bob ", "score": 20}
+        ]);
+
+        let formatted = ToonFormatter::format(&value);
+
+        assert_eq!(
+            formatted,
+            "[#2 name, score:]\n  - \"alice|ops\" | 10\n  - \" bob \" | 20"
         );
     }
 }
