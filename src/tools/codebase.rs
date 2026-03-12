@@ -18,6 +18,8 @@ pub struct CodebaseTool {
 }
 
 impl CodebaseTool {
+    const MAX_SEARCH_MATCHES: usize = 100;
+
     pub fn new(src_dir: impl Into<PathBuf>) -> Self {
         let path = src_dir.into();
         // Try to get absolute path if possible for better safety checks
@@ -95,7 +97,17 @@ impl CodebaseTool {
             }
         }
 
+        // Stable ordering keeps list/search output deterministic for callers and tests.
+        files.sort();
         Ok(files)
+    }
+
+    fn to_display_path(&self, path: &Path) -> String {
+        path
+            .strip_prefix(&self.src_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
     }
 }
 
@@ -157,7 +169,7 @@ impl Tool for CodebaseTool {
                     .map_err(|e| AgentError::Tool(format!("Failed to collect files: {}", e)))?;
                 let file_strings: Vec<String> = files
                     .iter()
-                    .map(|path| path.to_string_lossy().to_string())
+                    .map(|path| self.to_display_path(path))
                     .collect();
                 let mut tree_summary = String::from("Codebase Files:\n");
                 for f in &file_strings {
@@ -208,11 +220,7 @@ impl Tool for CodebaseTool {
                         Ok(content) => content,
                         Err(_) => continue,
                     };
-                    let display_path = path
-                        .strip_prefix(&self.src_dir)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .to_string();
+                    let display_path = self.to_display_path(&path);
 
                     for (line_number, line) in content.lines().enumerate() {
                         if line.to_lowercase().contains(&query_lower) {
@@ -221,12 +229,12 @@ impl Tool for CodebaseTool {
                                 "line": line_number + 1,
                                 "content": line.trim(),
                             }));
-                            if matches.len() >= 100 {
+                            if matches.len() >= Self::MAX_SEARCH_MATCHES {
                                 break;
                             }
                         }
                     }
-                    if matches.len() >= 100 {
+                    if matches.len() >= Self::MAX_SEARCH_MATCHES {
                         break;
                     }
                 }
@@ -257,6 +265,7 @@ mod tests {
     use tempfile::tempdir;
     use std::fs::File;
     use std::io::Write;
+    use std::path::MAIN_SEPARATOR;
 
     #[tokio::test]
     async fn test_codebase_list_files() {
@@ -275,6 +284,35 @@ mod tests {
         assert!(res.success);
         let files = res.data["files"].as_array().expect("No files in data");
         assert!(files.iter().any(|f| f.as_str().expect("Not a string").contains("lib.rs")));
+    }
+
+    #[tokio::test]
+    async fn test_codebase_list_files_relative_and_sorted() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let src_path = dir.path().join("src");
+        fs::create_dir(&src_path).await.expect("Failed to create src dir");
+
+        let nested = src_path.join("nested");
+        fs::create_dir(&nested).await.expect("Failed to create nested dir");
+
+        File::create(src_path.join("zeta.rs")).expect("Failed to create zeta.rs");
+        File::create(src_path.join("alpha.rs")).expect("Failed to create alpha.rs");
+        File::create(nested.join("beta.rs")).expect("Failed to create beta.rs");
+
+        let tool = CodebaseTool::new(&src_path);
+        let res = tool
+            .execute(json!({"action": "list_files"}))
+            .await
+            .expect("Tool execution failed");
+
+        assert!(res.success);
+        let files = res.data["files"].as_array().expect("No files in data");
+        let strings: Vec<&str> = files
+            .iter()
+            .map(|f| f.as_str().expect("Not a string"))
+            .collect();
+        let nested_path = format!("nested{}beta.rs", MAIN_SEPARATOR);
+        assert_eq!(strings, vec!["alpha.rs", nested_path.as_str(), "zeta.rs"]);
     }
 
     #[tokio::test]
