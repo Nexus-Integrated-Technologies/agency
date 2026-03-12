@@ -123,8 +123,47 @@ pub struct Router {
 }
 
 impl Router {
+    fn normalize_for_matching(input: &str) -> String {
+        let mut normalized = String::with_capacity(input.len());
+        let mut last_was_space = true;
+
+        for ch in input.chars().flat_map(char::to_lowercase) {
+            if ch.is_alphanumeric() {
+                normalized.push(ch);
+                last_was_space = false;
+            } else if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        }
+
+        if normalized.ends_with(' ') {
+            normalized.pop();
+        }
+
+        normalized
+    }
+
+    fn contains_phrase(normalized_query: &str, phrase: &str) -> bool {
+        let normalized_phrase = Self::normalize_for_matching(phrase);
+        if normalized_phrase.is_empty() {
+            return false;
+        }
+
+        if normalized_query == normalized_phrase {
+            return true;
+        }
+
+        let padded_query = format!(" {normalized_query} ");
+        let padded_phrase = format!(" {normalized_phrase} ");
+        padded_query.contains(&padded_phrase)
+    }
+
     fn contains_any(query: &str, keywords: &[&str]) -> bool {
-        keywords.iter().any(|k| query.contains(k))
+        let normalized_query = Self::normalize_for_matching(query);
+        keywords
+            .iter()
+            .any(|keyword| Self::contains_phrase(&normalized_query, keyword))
     }
 
     fn parse_agent_label(agent: &str) -> AgentType {
@@ -354,9 +393,10 @@ impl Router {
     }
 
     fn is_greeting(&self, query: &str) -> bool {
+        let normalized_query = Self::normalize_for_matching(query);
         GREETINGS
             .iter()
-            .any(|g| query.starts_with(g) || query == *g)
+            .any(|g| normalized_query == *g || normalized_query.starts_with(&format!("{g} ")))
     }
 
     fn is_identity_query(&self, query: &str) -> bool {
@@ -517,5 +557,18 @@ mod tests {
         let res = router.route("use shell to list files", None).await.unwrap();
         assert_eq!(res.candidate_agents[0], AgentType::Coder);
         assert!(res.reason.contains("tool usage"));
+    }
+
+    #[test]
+    fn test_keyword_matching_requires_word_boundaries() {
+        assert!(!Router::contains_any("classical music theory", CODE_KEYWORDS));
+        assert!(Router::contains_any("design a class in rust", CODE_KEYWORDS));
+    }
+
+    #[test]
+    fn test_greeting_detection_avoids_prefix_false_positive() {
+        let router = Router::new(Ollama::default());
+        assert!(!router.is_greeting("history of distributed systems"));
+        assert!(router.is_greeting("hi there"));
     }
 }
