@@ -3,12 +3,15 @@
 //! Filters potentially harmful content in inputs and generated code.
 
 use regex::Regex;
+use std::sync::OnceLock;
 
+#[derive(Clone)]
 struct MatchRule {
     pattern: Regex,
     description: &'static str,
 }
 
+#[derive(Clone)]
 struct SeverityRule {
     pattern: Regex,
     description: &'static str,
@@ -140,15 +143,24 @@ impl ContentFilter {
     }
 
     fn build_injection_patterns() -> Vec<MatchRule> {
-        Self::build_match_rules(&INJECTION_RULE_DEFS)
+        static RULES: OnceLock<Vec<MatchRule>> = OnceLock::new();
+        RULES
+            .get_or_init(|| Self::build_match_rules(&INJECTION_RULE_DEFS))
+            .clone()
     }
 
     fn build_code_patterns() -> Vec<SeverityRule> {
-        Self::build_severity_rules(&DANGEROUS_CODE_RULE_DEFS)
+        static RULES: OnceLock<Vec<SeverityRule>> = OnceLock::new();
+        RULES
+            .get_or_init(|| Self::build_severity_rules(&DANGEROUS_CODE_RULE_DEFS))
+            .clone()
     }
 
     fn build_output_patterns() -> Vec<SeverityRule> {
-        Self::build_severity_rules(&OUTPUT_RULE_DEFS)
+        static RULES: OnceLock<Vec<SeverityRule>> = OnceLock::new();
+        RULES
+            .get_or_init(|| Self::build_severity_rules(&OUTPUT_RULE_DEFS))
+            .clone()
     }
 
     fn apply_match_rules(result: &mut ContentFilterResult, content: &str, rules: &[MatchRule], severity: u8) {
