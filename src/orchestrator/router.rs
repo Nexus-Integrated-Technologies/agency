@@ -123,20 +123,89 @@ pub struct Router {
 }
 
 impl Router {
-    fn json_field_ci<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    fn json_value_ci<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
         let upper_key = key.to_ascii_uppercase();
-        value
-            .get(key)
-            .and_then(|entry| entry.as_str())
-            .or_else(|| value.get(&upper_key).and_then(|entry| entry.as_str()))
+        value.get(key).or_else(|| value.get(&upper_key))
+    }
+
+    fn json_field_ci<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        Self::json_value_ci(value, key).and_then(|entry| entry.as_str())
     }
 
     fn json_bool_ci(value: &serde_json::Value, key: &str) -> Option<bool> {
-        let upper_key = key.to_ascii_uppercase();
-        value
-            .get(key)
-            .and_then(|entry| entry.as_bool())
-            .or_else(|| value.get(&upper_key).and_then(|entry| entry.as_bool()))
+        Self::json_value_ci(value, key).and_then(|entry| entry.as_bool())
+    }
+
+    fn llm_decision(agent: AgentType, should_search_memory: bool, reason: String) -> RoutingDecision {
+        RoutingDecision {
+            candidate_agents: vec![agent],
+            should_search_memory,
+            reasoning_required: true, // LLM-routed queries are usually complex
+            confidence: 0.7,
+            reason,
+            scale: ScaleProfile::new(0.5, 8.0), // Placeholder, will be updated by caller
+        }
+    }
+
+    fn parse_json_routing(response: &str) -> Option<RoutingDecision> {
+        let start = response.find('{')?;
+        let end = response.rfind('}')?;
+        let json_str = &response[start..=end];
+        let v = serde_json::from_str::<serde_json::Value>(json_str).ok()?;
+
+        let agent_str = Self::json_field_ci(&v, "agent")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "reasoner".to_string());
+        let agent = Self::parse_agent_label(agent_str.as_str());
+
+        let should_search_memory = Self::json_bool_ci(&v, "memory").unwrap_or_else(|| {
+            Self::json_field_ci(&v, "memory")
+                .map(|s| matches!(s.to_ascii_lowercase().as_str(), "yes" | "true"))
+                .unwrap_or(false)
+        });
+
+        let reason = Self::json_field_ci(&v, "reason")
+            .unwrap_or("LLM routing decision")
+            .to_string();
+
+        Some(Self::llm_decision(agent, should_search_memory, reason))
+    }
+
+    fn parse_regex_routing(response: &str) -> RoutingDecision {
+        // Fallback for non-JSON outputs.
+        static AGENT_RE: OnceLock<Regex> = OnceLock::new();
+        static MEMORY_RE: OnceLock<Regex> = OnceLock::new();
+        static REASON_RE: OnceLock<Regex> = OnceLock::new();
+        let agent_re = AGENT_RE.get_or_init(|| {
+            Regex::new(r"(?i)AGENT:\s*(\w+)").expect("AGENT regex literal must be valid")
+        });
+        let memory_re = MEMORY_RE.get_or_init(|| {
+            Regex::new(r"(?i)MEMORY:\s*(yes|no)").expect("MEMORY regex literal must be valid")
+        });
+        let reason_re = REASON_RE.get_or_init(|| {
+            Regex::new(r"(?i)REASON:\s*(.+)").expect("REASON regex literal must be valid")
+        });
+
+        let agent_str = agent_re
+            .captures(response)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_else(|| "reasoner".to_string());
+        let agent = Self::parse_agent_label(agent_str.as_str());
+
+        let should_search_memory = memory_re
+            .captures(response)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().eq_ignore_ascii_case("yes"))
+            .unwrap_or(false);
+
+        let reason = reason_re
+            .captures(response)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| "LLM routing decision".to_string());
+
+        Self::llm_decision(agent, should_search_memory, reason)
     }
 
     fn normalize_for_matching(input: &str) -> String {
@@ -484,80 +553,12 @@ q = "{}"
 
     fn parse_routing_response(&self, response: &str) -> Result<RoutingDecision> {
         // Try parsing as JSON-like structure first (SNS output)
-        if let Some(start) = response.find('{') {
-            if let Some(end) = response.rfind('}') {
-                let json_str = &response[start..=end];
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    let agent_str = Self::json_field_ci(&v, "agent")
-                        .map(|s| s.to_lowercase())
-                        .unwrap_or_else(|| "reasoner".to_string());
-
-                    let agent_type = Self::parse_agent_label(agent_str.as_str());
-
-                    let should_search_memory = Self::json_bool_ci(&v, "memory").unwrap_or_else(|| {
-                        Self::json_field_ci(&v, "memory")
-                            .map(|s| matches!(s.to_ascii_lowercase().as_str(), "yes" | "true"))
-                            .unwrap_or(false)
-                    });
-
-                    let reason = Self::json_field_ci(&v, "reason")
-                        .unwrap_or("LLM routing decision")
-                        .to_string();
-
-                    return Ok(RoutingDecision {
-                        candidate_agents: vec![agent_type],
-                        should_search_memory,
-                        reasoning_required: true, // LLM-routed queries are usually complex
-                        confidence: 0.7,
-                        reason,
-                        scale: ScaleProfile::new(0.5, 8.0), // Placeholder, will be updated by caller
-                    });
-                }
-            }
+        if let Some(decision) = Self::parse_json_routing(response) {
+            return Ok(decision);
         }
 
         // Fallback to previous Regex parsing
-        static AGENT_RE: OnceLock<Regex> = OnceLock::new();
-        static MEMORY_RE: OnceLock<Regex> = OnceLock::new();
-        static REASON_RE: OnceLock<Regex> = OnceLock::new();
-        let agent_re = AGENT_RE.get_or_init(|| {
-            Regex::new(r"(?i)AGENT:\s*(\w+)").expect("AGENT regex literal must be valid")
-        });
-        let memory_re = MEMORY_RE.get_or_init(|| {
-            Regex::new(r"(?i)MEMORY:\s*(yes|no)").expect("MEMORY regex literal must be valid")
-        });
-        let reason_re = REASON_RE.get_or_init(|| {
-            Regex::new(r"(?i)REASON:\s*(.+)").expect("REASON regex literal must be valid")
-        });
-
-        let agent_str = agent_re
-            .captures(response)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_lowercase())
-            .unwrap_or_else(|| "reasoner".to_string());
-
-        let agent_type = Self::parse_agent_label(agent_str.as_str());
-
-        let should_search_memory = memory_re
-            .captures(response)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_lowercase() == "yes")
-            .unwrap_or(false);
-
-        let reason = reason_re
-            .captures(response)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_else(|| "LLM routing decision".to_string());
-
-        Ok(RoutingDecision {
-            candidate_agents: vec![agent_type],
-            should_search_memory,
-            reasoning_required: true,
-            confidence: 0.7, // LLM routing is less certain
-            reason,
-            scale: ScaleProfile::new(0.5, 8.0), // Placeholder
-        })
+        Ok(Self::parse_regex_routing(response))
     }
 }
 
