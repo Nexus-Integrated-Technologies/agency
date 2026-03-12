@@ -19,42 +19,16 @@ impl ToonFormatter {
             Value::Null => "null".to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Number(n) => n.to_string(),
-            Value::String(s) => {
-                // If it contains newlines, use a block-style quote if it helps, 
-                // otherwise just return the string.
-                if s.contains('\n') {
-                    format!("|\n{}", s.lines().map(|l| format!("{}  {}", indent_str, l)).collect::<Vec<_>>().join("\n"))
-                } else {
-                    format!("\"{}\"", s)
-                }
-            },
+            Value::String(s) => Self::format_string(s, &indent_str),
             Value::Array(arr) => {
                 if arr.is_empty() {
                     return "[]".to_string();
                 }
-                
-                // SOTA: Tabular Array Optimization
-                // If all elements are objects with the same keys, use TOON tabular format
-                if let Some(first) = arr.first() {
-                    if first.is_object() {
-                        let keys = first.as_object().unwrap().keys().collect::<Vec<_>>();
-                        let all_match = arr.iter().all(|v| {
-                            v.is_object() && v.as_object().unwrap().keys().collect::<Vec<_>>() == keys
-                        });
 
-                        if all_match {
-                            let mut out = format!("[#{} {}:]\n", arr.len(), keys.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", "));
-                            for item in arr {
-                                let values = keys.iter().map(|k| {
-                                    let val = &item[*k];
-                                    if val.is_string() { val.as_str().unwrap().to_string() }
-                                    else { val.to_string() }
-                                }).collect::<Vec<_>>().join(" | ");
-                                out.push_str(&format!("{}  - {}\n", indent_str, values));
-                            }
-                            return out.trim_end().to_string();
-                        }
-                    }
+                // SOTA: Tabular Array Optimization
+                // If all elements are objects with the same keys, use TOON tabular format.
+                if let Some(tabular) = Self::try_format_tabular_array(arr, &indent_str) {
+                    return tabular;
                 }
 
                 // Standard array
@@ -77,5 +51,101 @@ impl ToonFormatter {
                 out.trim_end().to_string()
             }
         }
+    }
+
+    fn format_string(s: &str, indent_str: &str) -> String {
+        // If the string contains newlines, preserve them in a block-like style.
+        if s.contains('\n') {
+            format!(
+                "|\n{}",
+                s.lines()
+                    .map(|line| format!("{}  {}", indent_str, line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        } else {
+            format!("\"{}\"", s)
+        }
+    }
+
+    fn try_format_tabular_array(arr: &[Value], indent_str: &str) -> Option<String> {
+        let first = arr.first()?.as_object()?;
+        let keys: Vec<&str> = first.keys().map(String::as_str).collect();
+        let all_match = arr.iter().all(|value| {
+            value
+                .as_object()
+                .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>() == keys)
+                .unwrap_or(false)
+        });
+
+        if !all_match {
+            return None;
+        }
+
+        let header = format!("[#{} {}:]\n", arr.len(), keys.join(", "));
+        let body = arr
+            .iter()
+            .map(|item| {
+                let values = keys
+                    .iter()
+                    .map(|key| match item.get(*key) {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(other) => other.to_string(),
+                        None => "null".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                format!("{}  - {}", indent_str, values)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Some(format!("{header}{body}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToonFormatter;
+    use serde_json::json;
+
+    #[test]
+    fn formats_tabular_arrays_when_keys_align() {
+        let value = json!([
+            {"name": "alice", "score": 10},
+            {"name": "bob", "score": 20}
+        ]);
+
+        let formatted = ToonFormatter::format(&value);
+
+        assert_eq!(
+            formatted,
+            "[#2 name, score:]\n  - alice | 10\n  - bob | 20"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_standard_arrays_when_shapes_differ() {
+        let value = json!([
+            {"name": "alice", "score": 10},
+            {"name": "bob"}
+        ]);
+
+        let formatted = ToonFormatter::format(&value);
+
+        assert!(formatted.starts_with("[\n"));
+        assert!(formatted.contains("name: \"alice\""));
+        assert!(formatted.contains("name: \"bob\""));
+    }
+
+    #[test]
+    fn formats_multiline_strings_as_blocks() {
+        let value = json!({"msg": "hello\nworld"});
+
+        let formatted = ToonFormatter::format(&value);
+
+        assert!(formatted.contains("msg: |"));
+        assert!(formatted.contains("  hello"));
+        assert!(formatted.contains("  world"));
     }
 }
