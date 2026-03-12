@@ -175,11 +175,10 @@ impl Router {
         padded_query.contains(&padded_phrase)
     }
 
-    fn contains_any(query: &str, keywords: &[&str]) -> bool {
-        let normalized_query = Self::normalize_for_matching(query);
+    fn contains_any_normalized(normalized_query: &str, keywords: &[&str]) -> bool {
         keywords
             .iter()
-            .any(|keyword| Self::contains_phrase(&normalized_query, keyword))
+            .any(|keyword| Self::contains_phrase(normalized_query, keyword))
     }
 
     fn parse_agent_label(agent: &str) -> AgentType {
@@ -236,6 +235,7 @@ impl Router {
     fn fast_path_decision(
         &self,
         q_lower: &str,
+        normalized_query: &str,
         tool_requested: bool,
         scale: &ScaleProfile,
     ) -> Option<RoutingDecision> {
@@ -255,12 +255,19 @@ impl Router {
         // Very short, greeting, or identity messages -> GeneralChat (1b for speed)
         // Expanded threshold to 60 chars to catch simple questions like "What is the capital of France?"
         // unless they look like code or research queries.
-        let is_short_simple = q_lower.len() < 60
-            && !self.is_code_related(q_lower)
-            && !self.is_research_related(q_lower)
-            && !self.is_planning_related(q_lower);
+        let is_code_related = Self::is_code_related_normalized(normalized_query);
+        let is_research_related = Self::is_research_related_normalized(normalized_query);
+        let is_planning_related = Self::is_planning_related_normalized(normalized_query);
 
-        if is_short_simple || self.is_greeting(q_lower) || self.is_identity_query(q_lower) {
+        let is_short_simple = q_lower.len() < 60
+            && !is_code_related
+            && !is_research_related
+            && !is_planning_related;
+
+        if is_short_simple
+            || Self::is_greeting_normalized(normalized_query)
+            || Self::is_identity_query_normalized(normalized_query)
+        {
             return Some(Self::quick_decision(
                 AgentType::GeneralChat,
                 false,
@@ -272,7 +279,7 @@ impl Router {
         }
 
         // Filesystem / Directory heuristics (Fast-Path)
-        if self.is_filesystem_related(q_lower) {
+        if Self::is_filesystem_related_normalized(normalized_query) {
             return Some(Self::quick_decision(
                 AgentType::Coder,
                 false,
@@ -297,7 +304,7 @@ impl Router {
         }
 
         // Code-related keywords -> Coder
-        if self.is_code_related(q_lower) && !self.is_complex_query(q_lower) {
+        if is_code_related && !Self::is_complex_query_lower(q_lower) {
             return Some(Self::quick_decision(
                 AgentType::Coder,
                 false,
@@ -309,7 +316,7 @@ impl Router {
         }
 
         // Planning keywords -> Planner
-        if self.is_planning_related(q_lower) || self.is_complex_query(q_lower) {
+        if is_planning_related || Self::is_complex_query_lower(q_lower) {
             return Some(Self::quick_decision(
                 AgentType::Planner,
                 true,
@@ -321,7 +328,7 @@ impl Router {
         }
 
         // Research/search keywords -> Researcher
-        if self.is_research_related(q_lower) {
+        if is_research_related {
             return Some(Self::quick_decision(
                 AgentType::Researcher,
                 true,
@@ -373,19 +380,22 @@ impl Router {
         // FPF Integration: Scaling-Law Lens (SLL) - The Scale Probe
         // 1. Calculate complexity (Scale Variables S)
         let q_lower = query.to_lowercase();
+        let normalized_query = Self::normalize_for_matching(&q_lower);
         let complexity = Self::estimate_complexity(query, &q_lower);
 
         // 2. Evaluate Scale Probe against actual hardware state
         let vram = vram_available_gb.unwrap_or(8.0); // Fallback to 8GB if tool is missing
         let scale = ScaleProfile::new(complexity, vram);
-        let tool_requested = self.mentions_tool(&q_lower);
+        let tool_requested = Self::mentions_tool_normalized(&normalized_query);
 
         // FPF Integration: Reasoning Requirement Probe
         // Determine if the task is complex enough to merit strict reasoning tags
         let reasoning_required = complexity > 0.3 || tool_requested;
 
         // Quick heuristics for simple cases
-        if let Some(decision) = self.fast_path_decision(&q_lower, tool_requested, &scale) {
+        if let Some(decision) =
+            self.fast_path_decision(&q_lower, &normalized_query, tool_requested, &scale)
+        {
             return Ok(decision);
         }
 
@@ -408,48 +418,51 @@ impl Router {
         Ok(decision)
     }
 
-    fn is_greeting(&self, query: &str) -> bool {
-        let normalized_query = Self::normalize_for_matching(query);
+    fn is_greeting_normalized(normalized_query: &str) -> bool {
         GREETINGS
             .iter()
             .any(|g| normalized_query == *g || normalized_query.starts_with(&format!("{g} ")))
     }
 
-    fn is_identity_query(&self, query: &str) -> bool {
+    fn is_identity_query_normalized(normalized_query: &str) -> bool {
         // Also handle very short identity queries
-        Self::contains_any(query, IDENTITY_KEYWORDS) || query.trim() == "what are you"
+        Self::contains_any_normalized(normalized_query, IDENTITY_KEYWORDS)
+            || normalized_query == "what are you"
     }
 
-    fn is_filesystem_related(&self, query: &str) -> bool {
-        Self::contains_any(query, FILESYSTEM_KEYWORDS)
+    fn is_filesystem_related_normalized(normalized_query: &str) -> bool {
+        Self::contains_any_normalized(normalized_query, FILESYSTEM_KEYWORDS)
     }
 
-    fn is_code_related(&self, query: &str) -> bool {
-        Self::contains_any(query, CODE_KEYWORDS)
+    fn is_code_related_normalized(normalized_query: &str) -> bool {
+        Self::contains_any_normalized(normalized_query, CODE_KEYWORDS)
     }
 
-    fn is_planning_related(&self, query: &str) -> bool {
-        Self::contains_any(query, PLANNING_KEYWORDS)
+    fn is_planning_related_normalized(normalized_query: &str) -> bool {
+        Self::contains_any_normalized(normalized_query, PLANNING_KEYWORDS)
     }
 
-    fn is_research_related(&self, query: &str) -> bool {
-        Self::contains_any(query, RESEARCH_KEYWORDS)
+    fn is_research_related_normalized(normalized_query: &str) -> bool {
+        Self::contains_any_normalized(normalized_query, RESEARCH_KEYWORDS)
     }
 
     /// FPF Integration: Detect explicit tool usage requests
     /// Routes to agent with tool access when user asks to "use" something
-    fn mentions_tool(&self, query: &str) -> bool {
+    fn mentions_tool_normalized(normalized_query: &str) -> bool {
         // Check for verb + any word (e.g., "use speaker")
-        let has_tool_verb = Self::contains_any(query, TOOL_VERBS);
-        let mentions_tool_name = Self::contains_any(query, TOOL_NAMES);
-        
+        let has_tool_verb = Self::contains_any_normalized(normalized_query, TOOL_VERBS);
+        let mentions_tool_name = Self::contains_any_normalized(normalized_query, TOOL_NAMES);
+
         // Either "use X" pattern or explicit tool name mention
-        (has_tool_verb && query.len() > 5) || (query.contains("tool") && mentions_tool_name)
+        (has_tool_verb && normalized_query.len() > 5)
+            || (normalized_query.contains("tool") && mentions_tool_name)
     }
 
-    fn is_complex_query(&self, query: &str) -> bool {
-        let q = query.to_lowercase();
-        q.contains(" and ") || q.contains(" then ") || q.contains(", then ") || q.contains(" and finally ")
+    fn is_complex_query_lower(q_lower: &str) -> bool {
+        q_lower.contains(" and ")
+            || q_lower.contains(" then ")
+            || q_lower.contains(", then ")
+            || q_lower.contains(" and finally ")
     }
 
     async fn llm_route(&self, query: &str) -> Result<RoutingDecision> {
@@ -583,15 +596,20 @@ mod tests {
 
     #[test]
     fn test_keyword_matching_requires_word_boundaries() {
-        assert!(!Router::contains_any("classical music theory", CODE_KEYWORDS));
-        assert!(Router::contains_any("design a class in rust", CODE_KEYWORDS));
+        let no_match = Router::normalize_for_matching("classical music theory");
+        assert!(!Router::contains_any_normalized(&no_match, CODE_KEYWORDS));
+
+        let match_query = Router::normalize_for_matching("design a class in rust");
+        assert!(Router::contains_any_normalized(&match_query, CODE_KEYWORDS));
     }
 
     #[test]
     fn test_greeting_detection_avoids_prefix_false_positive() {
-        let router = Router::new(Ollama::default());
-        assert!(!router.is_greeting("history of distributed systems"));
-        assert!(router.is_greeting("hi there"));
+        let no_greeting = Router::normalize_for_matching("history of distributed systems");
+        assert!(!Router::is_greeting_normalized(&no_greeting));
+
+        let greeting = Router::normalize_for_matching("hi there");
+        assert!(Router::is_greeting_normalized(&greeting));
     }
 
     #[test]
