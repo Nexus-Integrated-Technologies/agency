@@ -6,7 +6,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn, info};
@@ -112,16 +112,7 @@ impl CodeExecTool {
                     .output()
             ).await;
 
-            match result {
-                Ok(Ok(output)) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let code = output.status.code().unwrap_or(-1);
-                    Ok((self.truncate(&stdout), self.truncate(&stderr), code))
-                }
-                Ok(Err(e)) => Err(anyhow::anyhow!("Failed to execute sandboxed command: {}", e)),
-                Err(_) => Err(anyhow::anyhow!("Execution timed out after {} seconds", self.timeout_secs)),
-            }
+            self.handle_command_result(result, "Failed to execute sandboxed command")
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -137,17 +128,52 @@ impl CodeExecTool {
                     .output()
             ).await;
 
-            match result {
-                Ok(Ok(output)) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let code = output.status.code().unwrap_or(-1);
-                    Ok((self.truncate(&stdout), self.truncate(&stderr), code))
-                }
-                Ok(Err(e)) => Err(anyhow::anyhow!("Failed to execute command: {}", e)),
-                Err(_) => Err(anyhow::anyhow!("Execution timed out after {} seconds", self.timeout_secs)),
-            }
+            self.handle_command_result(result, "Failed to execute command")
         }
+    }
+
+    fn handle_command_result(
+        &self,
+        result: Result<Result<Output, std::io::Error>, tokio::time::error::Elapsed>,
+        error_prefix: &str,
+    ) -> anyhow::Result<(String, String, i32)> {
+        match result {
+            Ok(Ok(output)) => Ok(self.normalize_output(output)),
+            Ok(Err(e)) => Err(anyhow::anyhow!("{}: {}", error_prefix, e)),
+            Err(_) => Err(anyhow::anyhow!("Execution timed out after {} seconds", self.timeout_secs)),
+        }
+    }
+
+    fn normalize_output(&self, output: Output) -> (String, String, i32) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        (self.truncate(&stdout), self.truncate(&stderr), code)
+    }
+
+    fn build_execution_summary(&self, stdout: &str, stderr: &str, exit_code: i32) -> String {
+        let success = exit_code == 0;
+        let output_parts = Self::collect_output_parts(stdout, stderr);
+        if success {
+            if stdout.is_empty() && stderr.is_empty() {
+                "Code executed successfully (no output)".to_string()
+            } else {
+                output_parts.join("\n\n")
+            }
+        } else {
+            format!("Execution failed (exit code: {})\n{}", exit_code, output_parts.join("\n\n"))
+        }
+    }
+
+    fn collect_output_parts(stdout: &str, stderr: &str) -> Vec<String> {
+        let mut output_parts = Vec::new();
+        if !stdout.is_empty() {
+            output_parts.push(format!("stdout:\n{}", stdout));
+        }
+        if !stderr.is_empty() {
+            output_parts.push(format!("stderr:\n{}", stderr));
+        }
+        output_parts
     }
 
     fn truncate(&self, s: &str) -> String {
@@ -232,44 +258,20 @@ impl Tool for CodeExecTool {
         match result {
             Ok((stdout, stderr, exit_code)) => {
                 let success = exit_code == 0;
-                let mut output_parts = Vec::new();
-                
-                if !stdout.is_empty() {
-                    output_parts.push(format!("stdout:\n{}", stdout));
-                }
-                if !stderr.is_empty() {
-                    output_parts.push(format!("stderr:\n{}", stderr));
-                }
-                
-                let summary = if success {
-                    if stdout.is_empty() && stderr.is_empty() {
-                        "Code executed successfully (no output)".to_string()
-                    } else {
-                        output_parts.join("\n\n")
-                    }
-                } else {
-                    format!("Execution failed (exit code: {})\n{}", exit_code, output_parts.join("\n\n"))
-                };
+                let summary = self.build_execution_summary(&stdout, &stderr, exit_code);
+                let data = json!({
+                    "language": language,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": exit_code
+                });
 
                 if success {
-                    Ok(ToolOutput::success(
-                        json!({
-                            "language": language,
-                            "stdout": stdout,
-                            "stderr": stderr,
-                            "exit_code": exit_code
-                        }),
-                        summary
-                    ))
+                    Ok(ToolOutput::success(data, summary))
                 } else {
                     Ok(ToolOutput {
                         success: false,
-                        data: json!({
-                            "language": language,
-                            "stdout": stdout,
-                            "stderr": stderr,
-                            "exit_code": exit_code
-                        }),
+                        data,
                         summary,
                         error: Some(format!("Exit code: {}", exit_code)),
                     })
@@ -280,5 +282,31 @@ impl Tool for CodeExecTool {
                 Ok(ToolOutput::failure(format!("Execution failed: {}", e)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CodeExecTool;
+
+    #[test]
+    fn summary_is_empty_success_message_when_no_output() {
+        let tool = CodeExecTool::new();
+        let summary = tool.build_execution_summary("", "", 0);
+        assert_eq!(summary, "Code executed successfully (no output)");
+    }
+
+    #[test]
+    fn summary_includes_stdout_and_stderr() {
+        let tool = CodeExecTool::new();
+        let summary = tool.build_execution_summary("ok", "warn", 0);
+        assert_eq!(summary, "stdout:\nok\n\nstderr:\nwarn");
+    }
+
+    #[test]
+    fn summary_includes_failure_exit_code() {
+        let tool = CodeExecTool::new();
+        let summary = tool.build_execution_summary("", "boom", 1);
+        assert_eq!(summary, "Execution failed (exit code: 1)\nstderr:\nboom");
     }
 }
