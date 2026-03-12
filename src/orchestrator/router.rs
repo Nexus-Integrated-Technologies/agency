@@ -131,6 +131,14 @@ impl Router {
             .or_else(|| value.get(&upper_key).and_then(|entry| entry.as_str()))
     }
 
+    fn json_bool_ci(value: &serde_json::Value, key: &str) -> Option<bool> {
+        let upper_key = key.to_ascii_uppercase();
+        value
+            .get(key)
+            .and_then(|entry| entry.as_bool())
+            .or_else(|| value.get(&upper_key).and_then(|entry| entry.as_bool()))
+    }
+
     fn normalize_for_matching(input: &str) -> String {
         let mut normalized = String::with_capacity(input.len());
         let mut last_was_space = true;
@@ -473,11 +481,11 @@ q = "{}"
 
                     let agent_type = Self::parse_agent_label(agent_str.as_str());
 
-                    let memory_val = Self::json_field_ci(&v, "memory")
-                        .map(|s| s.to_lowercase())
-                        .unwrap_or_else(|| "no".to_string());
-                    
-                    let should_search_memory = memory_val == "yes" || memory_val == "true";
+                    let should_search_memory = Self::json_bool_ci(&v, "memory").unwrap_or_else(|| {
+                        Self::json_field_ci(&v, "memory")
+                            .map(|s| matches!(s.to_ascii_lowercase().as_str(), "yes" | "true"))
+                            .unwrap_or(false)
+                    });
 
                     let reason = Self::json_field_ci(&v, "reason")
                         .unwrap_or("LLM routing decision")
@@ -584,5 +592,28 @@ mod tests {
         let router = Router::new(Ollama::default());
         assert!(!router.is_greeting("history of distributed systems"));
         assert!(router.is_greeting("hi there"));
+    }
+
+    #[test]
+    fn test_parse_routing_response_accepts_boolean_memory() {
+        let router = Router::new(Ollama::default());
+        let response = r#"{"agent":"coder","memory":true,"reason":"Need context"}"#;
+
+        let parsed = router.parse_routing_response(response).unwrap();
+
+        assert_eq!(parsed.candidate_agents, vec![AgentType::Coder]);
+        assert!(parsed.should_search_memory);
+        assert_eq!(parsed.reason, "Need context");
+    }
+
+    #[test]
+    fn test_parse_routing_response_accepts_uppercase_boolean_memory() {
+        let router = Router::new(Ollama::default());
+        let response = r#"{"AGENT":"researcher","MEMORY":true}"#;
+
+        let parsed = router.parse_routing_response(response).unwrap();
+
+        assert_eq!(parsed.candidate_agents, vec![AgentType::Researcher]);
+        assert!(parsed.should_search_memory);
     }
 }

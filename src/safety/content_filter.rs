@@ -237,7 +237,11 @@ mod tests {
         assert!(safe.is_safe);
         
         let sensitive = filter.check_output("api_key = 'sk-abc123xyz456'");
-        // This should flag but not necessarily block
-        assert!(!sensitive.reasons.is_empty() || sensitive.is_safe);
+        assert!(!sensitive.is_safe);
+        assert!(sensitive.severity >= 6);
+        assert!(sensitive
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("API key in output")));
     }
 }
