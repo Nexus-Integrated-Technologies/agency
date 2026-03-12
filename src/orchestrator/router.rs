@@ -137,6 +137,24 @@ impl Router {
         }
     }
 
+    fn quick_decision(
+        agent: AgentType,
+        should_search_memory: bool,
+        reasoning_required: bool,
+        confidence: f32,
+        reason: &str,
+        scale: ScaleProfile,
+    ) -> RoutingDecision {
+        RoutingDecision {
+            candidate_agents: vec![agent],
+            should_search_memory,
+            reasoning_required,
+            confidence,
+            reason: reason.to_string(),
+            scale,
+        }
+    }
+
     pub fn new(ollama: Ollama) -> Self {
         Self {
             provider: Arc::new(OllamaProvider::new(ollama)),
@@ -202,14 +220,14 @@ impl Router {
         // FPF Integration: Tool-Use Detection (Pre-Route Fast Path)
         // When users explicitly request a tool, bypass GeneralChat and route to agent with tool access.
         if self.mentions_tool(&q_lower) {
-            return Ok(RoutingDecision {
-                candidate_agents: vec![AgentType::Coder], // Coder has tool access
-                should_search_memory: false,
-                reasoning_required: true,
-                confidence: 0.95,
-                reason: "Query explicitly mentions tool usage (FPF Tool Detection)".to_string(),
+            return Ok(Self::quick_decision(
+                AgentType::Coder, // Coder has tool access
+                false,
+                true,
+                0.95,
+                "Query explicitly mentions tool usage (FPF Tool Detection)",
                 scale,
-            });
+            ));
         }
         
         // Very short, greeting, or identity messages -> GeneralChat (1b for speed)
@@ -221,74 +239,74 @@ impl Router {
             && !self.is_planning_related(&q_lower);
 
         if is_short_simple || self.is_greeting(&q_lower) || self.is_identity_query(&q_lower) {
-            return Ok(RoutingDecision {
-                candidate_agents: vec![AgentType::GeneralChat],
-                should_search_memory: false,
-                reasoning_required: false, // Greetings never require strict reasoning tags
-                confidence: 0.9,
-                reason: "Simple greeting or short message".to_string(),
+            return Ok(Self::quick_decision(
+                AgentType::GeneralChat,
+                false,
+                false, // Greetings never require strict reasoning tags
+                0.9,
+                "Simple greeting or short message",
                 scale,
-            });
+            ));
         }
 
         // Filesystem / Directory heuristics (Fast-Path)
         if self.is_filesystem_related(&q_lower) {
-            return Ok(RoutingDecision {
-                candidate_agents: vec![AgentType::Coder],
-                should_search_memory: false,
-                reasoning_required: true,
-                confidence: 0.95,
-                reason: "Direct filesystem query (heuristics fast-path)".to_string(),
+            return Ok(Self::quick_decision(
+                AgentType::Coder,
+                false,
+                true,
+                0.95,
+                "Direct filesystem query (heuristics fast-path)",
                 scale,
-            });
+            ));
         }
 
         // Knowledge Graph / Relationship heuristics
         if q_lower.contains("graph") || q_lower.contains("relationship") || q_lower.contains("visualize") {
-            return Ok(RoutingDecision {
-                candidate_agents: vec![AgentType::Reasoner],
-                should_search_memory: true,
-                reasoning_required: true,
-                confidence: 0.9,
-                reason: "Knowledge graph or relationship query".to_string(),
+            return Ok(Self::quick_decision(
+                AgentType::Reasoner,
+                true,
+                true,
+                0.9,
+                "Knowledge graph or relationship query",
                 scale,
-            });
+            ));
         }
 
         // Code-related keywords -> Coder
         if self.is_code_related(&q_lower) && !self.is_complex_query(&q_lower) {
-            return Ok(RoutingDecision {
-                candidate_agents: vec![AgentType::Coder],
-                should_search_memory: false,
-                reasoning_required: true,
-                confidence: 0.85,
-                reason: "Query contains code-related keywords".to_string(),
+            return Ok(Self::quick_decision(
+                AgentType::Coder,
+                false,
+                true,
+                0.85,
+                "Query contains code-related keywords",
                 scale,
-            });
+            ));
         }
 
         // Planning keywords -> Planner
         if self.is_planning_related(&q_lower) || self.is_complex_query(&q_lower) {
-            return Ok(RoutingDecision {
-                candidate_agents: vec![AgentType::Planner],
-                should_search_memory: true,
-                reasoning_required: true,
-                confidence: 0.8,
-                reason: "Query involves planning or task decomposition".to_string(),
+            return Ok(Self::quick_decision(
+                AgentType::Planner,
+                true,
+                true,
+                0.8,
+                "Query involves planning or task decomposition",
                 scale,
-            });
+            ));
         }
 
         // Research/search keywords -> Researcher
         if self.is_research_related(&q_lower) {
-            return Ok(RoutingDecision {
-                candidate_agents: vec![AgentType::Researcher],
-                should_search_memory: true,
-                reasoning_required: true,
-                confidence: 0.8,
-                reason: "Query requires information gathering".to_string(),
+            return Ok(Self::quick_decision(
+                AgentType::Researcher,
+                true,
+                true,
+                0.8,
+                "Query requires information gathering",
                 scale,
-            });
+            ));
         }
 
         // Use LLM for complex routing decisions
