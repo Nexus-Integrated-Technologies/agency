@@ -138,6 +138,53 @@ fn find_prompt_leak_point(response: &str) -> Option<usize> {
     None
 }
 
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn find_ascii_case_insensitive_from(haystack: &str, needle: &str, start: usize) -> Option<usize> {
+    haystack
+        .get(start..)
+        .and_then(|slice| find_ascii_case_insensitive(slice, needle).map(|idx| start + idx))
+}
+
+fn find_tag_end(text: &str, start: usize, next_tags: &[&str]) -> usize {
+    let mut end = text.len();
+    for tag in next_tags {
+        if let Some(idx) = find_ascii_case_insensitive_from(text, tag, start) {
+            if idx < end {
+                end = idx;
+            }
+        }
+    }
+    end
+}
+
+fn extract_tag_with_patterns(text: &str, patterns: &[String], next_tags: &[&str]) -> Option<String> {
+    for pattern in patterns {
+        if let Some(start_idx) = find_ascii_case_insensitive(text, pattern) {
+            let start = start_idx + pattern.len();
+            let end = find_tag_end(text, start, next_tags);
+            let result = text[start..end]
+                .trim()
+                .trim_start_matches(':')
+                .trim()
+                .to_string();
+            if !result.is_empty() {
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
 impl ReActStep {
     pub fn thought(thought: impl Into<String>) -> Self {
         Self {
@@ -666,36 +713,31 @@ RULES:
             format!("### {}", tag_name.to_uppercase()),
             tag.to_string(), // Direct support for emojis like 🧠
         ];
+        let next_tags = [
+            "[PLANNING]",
+            "[REASONING]",
+            "[THOUGHT]",
+            "[ACTION]",
+            "[ANSWER]",
+            "[OBSERVATION]",
+            "PLANNING:",
+            "REASONING:",
+            "THOUGHT:",
+            "ACTION:",
+            "ANSWER:",
+            "**PLANNING**",
+            "**REASONING**",
+            "**THOUGHT**",
+            "**ACTION**",
+            "**ANSWER**",
+            "🧠",
+            "⚡",
+            "→",
+            "🎯",
+            "👁️",
+        ];
 
-        let text_upper = text.to_uppercase();
-        
-        for pattern in patterns {
-            if let Some(start_idx) = text.find(&pattern) {
-                let start = start_idx + pattern.len();
-                
-                // Look for the next possible tag to find the end
-                let next_tags = [
-                    "[PLANNING]", "[REASONING]", "[THOUGHT]", "[ACTION]", "[ANSWER]", "[OBSERVATION]", 
-                    "PLANNING:", "REASONING:", "THOUGHT:", "ACTION:", "ANSWER:",
-                    "**PLANNING**", "**REASONING**", "**THOUGHT**", "**ACTION**", "**ANSWER**",
-                    "🧠", "⚡", "→", "🎯", "👁️"
-                ];
-                let mut end = text.len();
-                
-                for t in next_tags {
-                    if let Some(next_idx) = text[start..].find(t) {
-                        let abs_next_idx = start + next_idx;
-                        if abs_next_idx < end {
-                            end = abs_next_idx;
-                        }
-                    }
-                }
-                
-                let result = text[start..end].trim().trim_start_matches(':').trim().to_string();
-                if !result.is_empty() { return Some(result); }
-            }
-        }
-        None
+        extract_tag_with_patterns(text, &patterns, &next_tags)
     }
 
     fn extract_all_tags(&self, text: &str, tag: &str) -> Vec<String> {
@@ -707,36 +749,45 @@ RULES:
             format!("**{}**:", tag_name.to_uppercase()),
             tag.to_string(),
         ];
+        let next_tags = [
+            "[PLANNING]",
+            "[REASONING]",
+            "[THOUGHT]",
+            "[ACTION]",
+            "[ANSWER]",
+            "[OBSERVATION]",
+            "PLANNING:",
+            "REASONING:",
+            "THOUGHT:",
+            "ACTION:",
+            "ANSWER:",
+            "**PLANNING**",
+            "**REASONING**",
+            "**THOUGHT**",
+            "**ACTION**",
+            "**ANSWER**",
+            "🧠",
+            "⚡",
+            "→",
+            "🎯",
+            "👁️",
+        ];
         
         // We use the first pattern that matches to find all occurrences
         for pattern in patterns {
             let mut pos = 0;
-            while let Some(start_idx) = text[pos..].find(&pattern) {
-                let start = pos + start_idx + pattern.len();
-                
-                // Find end (next tag or end of string)
-                let next_tags = [
-                    "[PLANNING]", "[REASONING]", "[THOUGHT]", "[ACTION]", "[ANSWER]", "[OBSERVATION]",
-                    "PLANNING:", "REASONING:", "THOUGHT:", "ACTION:", "ANSWER:",
-                    "**PLANNING**", "**REASONING**", "**THOUGHT**", "**ACTION**", "**ANSWER**",
-                    "🧠", "⚡", "→", "🎯", "👁️"
-                ];
-                let mut end = text.len();
-                
-                for t in next_tags {
-                    if let Some(next_idx) = text[start..].find(t) {
-                        let abs_next_idx = start + next_idx;
-                        if abs_next_idx < end {
-                            end = abs_next_idx;
-                        }
-                    }
-                }
-                
-                let result = text[start..end].trim().trim_start_matches(':').trim().to_string();
+            while let Some(start_idx) = find_ascii_case_insensitive_from(text, &pattern, pos) {
+                let start = start_idx + pattern.len();
+                let end = find_tag_end(text, start, &next_tags);
+                let result = text[start..end]
+                    .trim()
+                    .trim_start_matches(':')
+                    .trim()
+                    .to_string();
                 if !result.is_empty() {
                     results.push(result);
                 }
-                pos = end;
+                pos = end.max(start);
                 if pos >= text.len() { break; }
             }
             if !results.is_empty() { break; }
@@ -1214,31 +1265,17 @@ impl SimpleAgent {
             format!("**{}**", tag_name.to_uppercase()),
             format!("### {}", tag_name.to_uppercase()),
         ];
-
-        let text_upper = text.to_uppercase();
-        for pattern in patterns {
-            if let Some(start_idx) = text_upper.find(&pattern) {
-                let start = start_idx + pattern.len();
-                let next_tags = [
-                    "[THOUGHT]", "[ANSWER]", "THOUGHT:", "ANSWER:", 
-                    "**THOUGHT**", "**ANSWER**", "### THOUGHT", "### ANSWER"
-                ];
-                let mut end = text.len();
-                
-                for t in next_tags {
-                    if let Some(next_idx) = text_upper[start..].find(t) {
-                        let abs_next_idx = start + next_idx;
-                        if abs_next_idx < end {
-                            end = abs_next_idx;
-                        }
-                    }
-                }
-                
-                let result = text[start..end].trim().trim_start_matches(':').trim().to_string();
-                if !result.is_empty() { return Some(result); }
-            }
-        }
-        None
+        let next_tags = [
+            "[THOUGHT]",
+            "[ANSWER]",
+            "THOUGHT:",
+            "ANSWER:",
+            "**THOUGHT**",
+            "**ANSWER**",
+            "### THOUGHT",
+            "### ANSWER",
+        ];
+        extract_tag_with_patterns(text, &patterns, &next_tags)
     }
 }
 
@@ -1261,6 +1298,31 @@ mod tests {
         
         let action = agent.extract_tag(response, "[ACTION]");
         assert_eq!(action.expect("Failed to extract action"), "{\"name\": \"get_weather\", \"parameters\": {\"location\": \"Seattle\"}}");
+    }
+
+    #[test]
+    fn test_extract_tag_case_insensitive() {
+        let profile = AgencyProfile::default();
+        let config = AgentConfig::new(AgentType::GeneralChat, &profile);
+        let agent = ReActAgent::new(Ollama::default(), config, Arc::new(ToolRegistry::default()));
+
+        let response = "[thought]\ncheck logs\n[action]\n{\"name\":\"tail\"}";
+        let thought = agent.extract_tag(response, "[THOUGHT]");
+        assert_eq!(thought.expect("Failed to extract lowercase thought"), "check logs");
+    }
+
+    #[test]
+    fn test_simple_agent_extract_tag_with_unicode_prefix() {
+        let profile = AgencyProfile::default();
+        let config = AgentConfig::new(AgentType::GeneralChat, &profile);
+        let agent = SimpleAgent::new(Ollama::default(), config);
+
+        let response = "Straße prefix\n[thought]\nAnalyze quickly\n[answer]\nDone";
+        let thought = agent.extract_tag(response, "[THOUGHT]");
+        assert_eq!(
+            thought.expect("Failed to extract thought with unicode prefix"),
+            "Analyze quickly"
+        );
     }
 
     #[test]
