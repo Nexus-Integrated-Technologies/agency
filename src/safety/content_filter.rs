@@ -99,22 +99,11 @@ impl ContentFilterResult {
 }
 
 /// Content filter for inputs and code
-pub struct ContentFilter {
-    /// Patterns that indicate prompt injection
-    injection_patterns: Vec<MatchRule>,
-    /// Patterns that indicate dangerous code
-    dangerous_code_patterns: Vec<SeverityRule>,
-    /// Patterns that indicate output leaks
-    output_patterns: Vec<SeverityRule>,
-}
+pub struct ContentFilter;
 
 impl ContentFilter {
     pub fn new() -> Self {
-        Self {
-            injection_patterns: Self::build_injection_patterns(),
-            dangerous_code_patterns: Self::build_code_patterns(),
-            output_patterns: Self::build_output_patterns(),
-        }
+        Self
     }
 
     fn compile_regex(pattern: &str) -> Regex {
@@ -142,25 +131,25 @@ impl ContentFilter {
             .collect()
     }
 
-    fn build_injection_patterns() -> Vec<MatchRule> {
+    fn injection_patterns() -> &'static [MatchRule] {
         static RULES: OnceLock<Vec<MatchRule>> = OnceLock::new();
         RULES
             .get_or_init(|| Self::build_match_rules(&INJECTION_RULE_DEFS))
-            .clone()
+            .as_slice()
     }
 
-    fn build_code_patterns() -> Vec<SeverityRule> {
+    fn dangerous_code_patterns() -> &'static [SeverityRule] {
         static RULES: OnceLock<Vec<SeverityRule>> = OnceLock::new();
         RULES
             .get_or_init(|| Self::build_severity_rules(&DANGEROUS_CODE_RULE_DEFS))
-            .clone()
+            .as_slice()
     }
 
-    fn build_output_patterns() -> Vec<SeverityRule> {
+    fn output_patterns() -> &'static [SeverityRule] {
         static RULES: OnceLock<Vec<SeverityRule>> = OnceLock::new();
         RULES
             .get_or_init(|| Self::build_severity_rules(&OUTPUT_RULE_DEFS))
-            .clone()
+            .as_slice()
     }
 
     fn apply_match_rules(result: &mut ContentFilterResult, content: &str, rules: &[MatchRule], severity: u8) {
@@ -187,7 +176,7 @@ impl ContentFilter {
     /// Check user input for safety issues
     pub fn check_input(&self, input: &str) -> ContentFilterResult {
         let mut result = ContentFilterResult::safe();
-        Self::apply_match_rules(&mut result, input, &self.injection_patterns, 8);
+        Self::apply_match_rules(&mut result, input, Self::injection_patterns(), 8);
 
         result
     }
@@ -195,7 +184,7 @@ impl ContentFilter {
     /// Check code for dangerous patterns
     pub fn check_code(&self, code: &str) -> ContentFilterResult {
         let mut result = ContentFilterResult::safe();
-        Self::apply_severity_rules(&mut result, code, &self.dangerous_code_patterns, 7);
+        Self::apply_severity_rules(&mut result, code, Self::dangerous_code_patterns(), 7);
 
         result
     }
@@ -203,7 +192,7 @@ impl ContentFilter {
     /// Check output for sensitive information leakage
     pub fn check_output(&self, output: &str) -> ContentFilterResult {
         let mut result = ContentFilterResult::safe();
-        Self::apply_severity_rules(&mut result, output, &self.output_patterns, 6);
+        Self::apply_severity_rules(&mut result, output, Self::output_patterns(), 6);
 
         result
     }
