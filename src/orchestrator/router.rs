@@ -123,6 +123,14 @@ pub struct Router {
 }
 
 impl Router {
+    fn normalize_keywords(keywords: &[&str]) -> Vec<String> {
+        keywords
+            .iter()
+            .map(|keyword| Self::normalize_for_matching(keyword))
+            .filter(|keyword| !keyword.is_empty())
+            .collect()
+    }
+
     fn json_value_ci<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
         let upper_key = key.to_ascii_uppercase();
         value.get(key).or_else(|| value.get(&upper_key))
@@ -229,8 +237,7 @@ impl Router {
         normalized
     }
 
-    fn contains_phrase(normalized_query: &str, phrase: &str) -> bool {
-        let normalized_phrase = Self::normalize_for_matching(phrase);
+    fn contains_phrase(normalized_query: &str, normalized_phrase: &str) -> bool {
         if normalized_phrase.is_empty() {
             return false;
         }
@@ -239,15 +246,37 @@ impl Router {
             return true;
         }
 
-        let padded_query = format!(" {normalized_query} ");
-        let padded_phrase = format!(" {normalized_phrase} ");
-        padded_query.contains(&padded_phrase)
+        for (idx, _) in normalized_query.match_indices(normalized_phrase) {
+            let start_ok = idx == 0 || normalized_query[..idx].ends_with(' ');
+            if !start_ok {
+                continue;
+            }
+
+            let end = idx + normalized_phrase.len();
+            let end_ok = end == normalized_query.len() || normalized_query[end..].starts_with(' ');
+            if end_ok {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn contains_any_cached(
+        normalized_query: &str,
+        keywords: &[&str],
+        cache: &OnceLock<Vec<String>>,
+    ) -> bool {
+        let normalized_keywords = cache.get_or_init(|| Self::normalize_keywords(keywords));
+        normalized_keywords
+            .iter()
+            .any(|keyword| Self::contains_phrase(normalized_query, keyword))
     }
 
     fn contains_any_normalized(normalized_query: &str, keywords: &[&str]) -> bool {
         keywords
             .iter()
-            .any(|keyword| Self::contains_phrase(normalized_query, keyword))
+            .any(|keyword| Self::contains_phrase(normalized_query, &Self::normalize_for_matching(keyword)))
     }
 
     fn parse_agent_label(agent: &str) -> AgentType {
@@ -488,39 +517,52 @@ impl Router {
     }
 
     fn is_greeting_normalized(normalized_query: &str) -> bool {
-        GREETINGS
-            .iter()
-            .any(|g| normalized_query == *g || normalized_query.starts_with(&format!("{g} ")))
+        GREETINGS.iter().any(|g| {
+            normalized_query == *g
+                || (normalized_query.starts_with(g)
+                    && normalized_query
+                        .as_bytes()
+                        .get(g.len())
+                        .is_some_and(|next| *next == b' '))
+        })
     }
 
     fn is_identity_query_normalized(normalized_query: &str) -> bool {
+        static IDENTITY_NORMALIZED: OnceLock<Vec<String>> = OnceLock::new();
         // Also handle very short identity queries
-        Self::contains_any_normalized(normalized_query, IDENTITY_KEYWORDS)
+        Self::contains_any_cached(normalized_query, IDENTITY_KEYWORDS, &IDENTITY_NORMALIZED)
             || normalized_query == "what are you"
     }
 
     fn is_filesystem_related_normalized(normalized_query: &str) -> bool {
-        Self::contains_any_normalized(normalized_query, FILESYSTEM_KEYWORDS)
+        static FILESYSTEM_NORMALIZED: OnceLock<Vec<String>> = OnceLock::new();
+        Self::contains_any_cached(normalized_query, FILESYSTEM_KEYWORDS, &FILESYSTEM_NORMALIZED)
     }
 
     fn is_code_related_normalized(normalized_query: &str) -> bool {
-        Self::contains_any_normalized(normalized_query, CODE_KEYWORDS)
+        static CODE_NORMALIZED: OnceLock<Vec<String>> = OnceLock::new();
+        Self::contains_any_cached(normalized_query, CODE_KEYWORDS, &CODE_NORMALIZED)
     }
 
     fn is_planning_related_normalized(normalized_query: &str) -> bool {
-        Self::contains_any_normalized(normalized_query, PLANNING_KEYWORDS)
+        static PLANNING_NORMALIZED: OnceLock<Vec<String>> = OnceLock::new();
+        Self::contains_any_cached(normalized_query, PLANNING_KEYWORDS, &PLANNING_NORMALIZED)
     }
 
     fn is_research_related_normalized(normalized_query: &str) -> bool {
-        Self::contains_any_normalized(normalized_query, RESEARCH_KEYWORDS)
+        static RESEARCH_NORMALIZED: OnceLock<Vec<String>> = OnceLock::new();
+        Self::contains_any_cached(normalized_query, RESEARCH_KEYWORDS, &RESEARCH_NORMALIZED)
     }
 
     /// FPF Integration: Detect explicit tool usage requests
     /// Routes to agent with tool access when user asks to "use" something
     fn mentions_tool_normalized(normalized_query: &str) -> bool {
+        static TOOL_VERBS_NORMALIZED: OnceLock<Vec<String>> = OnceLock::new();
+        static TOOL_NAMES_NORMALIZED: OnceLock<Vec<String>> = OnceLock::new();
         // Check for verb + any word (e.g., "use speaker")
-        let has_tool_verb = Self::contains_any_normalized(normalized_query, TOOL_VERBS);
-        let mentions_tool_name = Self::contains_any_normalized(normalized_query, TOOL_NAMES);
+        let has_tool_verb = Self::contains_any_cached(normalized_query, TOOL_VERBS, &TOOL_VERBS_NORMALIZED);
+        let mentions_tool_name =
+            Self::contains_any_cached(normalized_query, TOOL_NAMES, &TOOL_NAMES_NORMALIZED);
 
         // Either "use X" pattern or explicit tool name mention
         (has_tool_verb && normalized_query.len() > 5)
