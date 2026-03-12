@@ -74,7 +74,9 @@ impl ToonFormatter {
         let all_match = arr.iter().all(|value| {
             value
                 .as_object()
-                .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>() == keys)
+                .map(|object| {
+                    object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+                })
                 .unwrap_or(false)
         });
 
@@ -147,5 +149,20 @@ mod tests {
         assert!(formatted.contains("msg: |"));
         assert!(formatted.contains("  hello"));
         assert!(formatted.contains("  world"));
+    }
+
+    #[test]
+    fn formats_tabular_arrays_even_when_key_order_differs() {
+        let value = json!([
+            {"name": "alice", "score": 10},
+            {"score": 20, "name": "bob"}
+        ]);
+
+        let formatted = ToonFormatter::format(&value);
+
+        assert_eq!(
+            formatted,
+            "[#2 name, score:]\n  - alice | 10\n  - bob | 20"
+        );
     }
 }
