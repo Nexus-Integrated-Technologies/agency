@@ -61,6 +61,10 @@ pub struct MemoryManager {
 }
 
 impl MemoryManager {
+    const STATUS_HEALTHY: &'static str = "Healthy";
+    const STATUS_WARNING: &'static str = "Warning";
+    const STATUS_CRITICAL: &'static str = "Critical";
+
     /// Create a new MemoryManager with default config
     pub fn new(vector_memory: Arc<dyn Memory>) -> Self {
         let mut sys = System::new_all();
@@ -76,6 +80,42 @@ impl MemoryManager {
             vector_memory,
             last_check: AtomicU64::new(now - 60), // Start with an old timestamp
         }
+    }
+
+    fn status_level_from_ram_usage(&self, ram_percent: f64) -> String {
+        if ram_percent > self.config.ram_critical_threshold {
+            Self::STATUS_CRITICAL.to_string()
+        } else if ram_percent > self.config.ram_warning_threshold {
+            Self::STATUS_WARNING.to_string()
+        } else {
+            Self::STATUS_HEALTHY.to_string()
+        }
+    }
+
+    fn detect_os_type() -> String {
+        match System::name().unwrap_or_default().to_lowercase().as_str() {
+            name if name.contains("mac") || name.contains("darwin") => "mac",
+            name if name.contains("windows") => "windows",
+            _ => "linux",
+        }
+        .to_string()
+    }
+
+    async fn store_reflection_entry(
+        &self,
+        content: &str,
+        tags: &[&str],
+        importance: Option<f32>,
+    ) -> Result<()> {
+        let mut entry = MemoryEntry::new(content, "MemoryManager", MemorySource::Reflection);
+        if let Some(importance) = importance {
+            entry.metadata.importance = importance;
+        }
+        entry
+            .metadata
+            .tags
+            .extend(tags.iter().map(|tag| (*tag).to_string()));
+        self.vector_memory.store(entry).await
     }
 
     /// Get current resource status
@@ -96,19 +136,8 @@ impl MemoryManager {
 
         let ram_percent = if total_mem > 0 { (used_mem as f64 / total_mem as f64) * 100.0 } else { 0.0 };
         
-        let level = if ram_percent > self.config.ram_critical_threshold {
-            "Critical".to_string()
-        } else if ram_percent > self.config.ram_warning_threshold {
-            "Warning".to_string()
-        } else {
-            "Healthy".to_string()
-        };
-
-        let os = match System::name().unwrap_or_default().to_lowercase().as_str() {
-            name if name.contains("mac") || name.contains("darwin") => "mac",
-            name if name.contains("windows") => "windows",
-            _ => "linux",
-        }.to_string();
+        let level = self.status_level_from_ram_usage(ram_percent);
+        let os = Self::detect_os_type();
 
         ResourceStatus {
             ram_usage_percent: ram_percent,
@@ -139,10 +168,10 @@ impl MemoryManager {
 
         let status = self.get_status().await;
 
-        if status.status_level == "Critical" {
+        if status.status_level == Self::STATUS_CRITICAL {
             warn!("CRITICAL RAM: {:.1}%. Performing emergency cleanup...", status.ram_usage_percent);
             self.cleanup_internal().await?;
-        } else if status.status_level == "Warning" {
+        } else if status.status_level == Self::STATUS_WARNING {
             debug!("High RAM Usage: {:.1}%. Optimizing context windows.", status.ram_usage_percent);
         }
 
@@ -217,21 +246,15 @@ ENTITY: [Entity Name] -> [Relationship] -> [Target]
             if let Some(fact) = line.strip_prefix("FACT:") {
                 let fact = fact.trim();
                 if !fact.is_empty() {
-                    let mut entry = MemoryEntry::new(fact, "MemoryManager", MemorySource::Reflection);
-                    entry.metadata.importance = 0.8;
-                    entry.metadata.tags.push("distilled".to_string());
-                    
-                    self.vector_memory.store(entry).await?;
+                    self.store_reflection_entry(fact, &["distilled"], Some(0.8))
+                        .await?;
                     count += 1;
                 }
             } else if let Some(entity) = line.strip_prefix("ENTITY:") {
                 let entity = entity.trim();
                 if !entity.is_empty() {
-                    let mut entry = MemoryEntry::new(entity, "MemoryManager", MemorySource::Reflection);
-                    entry.metadata.tags.push("knowledge_graph".to_string());
-                    entry.metadata.tags.push("entity".to_string());
-                    
-                    self.vector_memory.store(entry).await?;
+                    self.store_reflection_entry(entity, &["knowledge_graph", "entity"], None)
+                        .await?;
                     // Entities are stored as memories for now, but tagged for future graph conversion
                 }
             }
@@ -249,18 +272,28 @@ ENTITY: [Entity Name] -> [Relationship] -> [Target]
 mod tests {
     use super::*;
     use crate::memory::VectorMemory;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
+
+    fn should_skip_memory_tests() -> bool {
+        std::env::set_var("AGENCY_USE_REMOTE_MEMORY", "0");
+        std::env::var("ORT_DYLIB_PATH").is_err() && !std::path::Path::new("libonnxruntime.dylib").exists()
+    }
+
+    fn create_test_manager() -> Option<(MemoryManager, TempDir)> {
+        if should_skip_memory_tests() {
+            return None;
+        }
+        let temp_dir = tempdir().ok()?;
+        let path = temp_dir.path().join("test_memory.json");
+        let vector_memory = Arc::new(VectorMemory::new(path).ok()?);
+        Some((MemoryManager::new(vector_memory), temp_dir))
+    }
 
     #[tokio::test]
     async fn test_get_status() {
-        std::env::set_var("AGENCY_USE_REMOTE_MEMORY", "0");
-        if std::env::var("ORT_DYLIB_PATH").is_err() && !std::path::Path::new("libonnxruntime.dylib").exists() {
+        let Some((manager, _temp_dir)) = create_test_manager() else {
             return;
-        }
-        let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().join("test_memory.json");
-        let vector_memory = Arc::new(VectorMemory::new(path).unwrap());
-        let manager = MemoryManager::new(vector_memory);
+        };
         
         let status = manager.get_status().await;
         assert!(status.ram_usage_percent >= 0.0);
@@ -269,14 +302,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_monitor_and_optimize_throttle() {
-        std::env::set_var("AGENCY_USE_REMOTE_MEMORY", "0");
-        if std::env::var("ORT_DYLIB_PATH").is_err() && !std::path::Path::new("libonnxruntime.dylib").exists() {
+        let Some((manager, _temp_dir)) = create_test_manager() else {
             return;
-        }
-        let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().join("test_memory.json");
-        let vector_memory = Arc::new(VectorMemory::new(path).unwrap());
-        let manager = MemoryManager::new(vector_memory);
+        };
         
         // First call should proceed
         manager.monitor_and_optimize().await.unwrap();
