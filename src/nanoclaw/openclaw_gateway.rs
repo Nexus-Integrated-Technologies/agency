@@ -523,12 +523,19 @@ fn execute_gateway_run(
             is_from_me: false,
             is_bot_message: true,
         }],
+        task_id: None,
         script: None,
         omx: gateway_omx_options(params, &lane),
         assistant_name: state.config.assistant_name.clone(),
         request_plane: RequestPlane::Web,
         session,
         backend_override: None,
+        task_signature: None,
+        routing_decision: None,
+        objective: None,
+        plan: None,
+        boundary_claims: Vec::new(),
+        gate_evaluation: None,
     };
 
     let execution = executor.execute(request)?;
@@ -555,6 +562,22 @@ fn mark_run_success(
         .and_then(|value| serde_json::to_value(value).ok())
         .unwrap_or(Value::Null);
     let cost_usd = metadata.and_then(|value| value.cost_usd);
+    let routing_value = metadata
+        .and_then(|value| value.routing_decision.as_ref())
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or(Value::Null);
+    let objective_value = metadata
+        .and_then(|value| value.objective.as_ref())
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or(Value::Null);
+    let plan_value = metadata
+        .and_then(|value| value.plan.as_ref())
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or(Value::Null);
+    let session_value = metadata
+        .and_then(|value| value.session_state.as_ref())
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or(Value::Null);
     let agent_meta = json!({
         "provider": provider,
         "biller": biller,
@@ -562,6 +585,10 @@ fn mark_run_success(
         "model": model,
         "usage": usage_value.clone(),
         "costUsd": cost_usd,
+        "routingDecision": routing_value.clone(),
+        "objective": objective_value.clone(),
+        "plan": plan_value.clone(),
+        "sessionState": session_value.clone(),
     });
     let result_meta = json!({
         "provider": agent_meta.get("provider").cloned().unwrap_or(Value::Null),
@@ -571,6 +598,12 @@ fn mark_run_success(
         "usage": agent_meta.get("usage").cloned().unwrap_or(Value::Null),
         "costUsd": agent_meta.get("costUsd").cloned().unwrap_or(Value::Null),
         "agentMeta": agent_meta,
+        "foundation": {
+            "routingDecision": routing_value,
+            "objective": objective_value,
+            "plan": plan_value,
+            "sessionState": session_value,
+        },
         "gateway": {
             "lane": lane.as_str(),
             "sessionId": execution.session_id,

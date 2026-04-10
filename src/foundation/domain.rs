@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::{
+    AssuranceTuple, BoundaryClaim, BoundaryQuadrant, GateDecision, GateEvaluation, ProvenanceEdge,
+    SymbolCarrier, TaskSignature,
+};
+
 pub type GroupId = String;
 pub type ChatId = String;
 pub type TaskId = String;
@@ -470,7 +475,7 @@ impl ExecutionStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionProvenanceRecord {
     pub id: String,
     pub run_kind: ExecutionRunKind,
@@ -485,6 +490,20 @@ pub struct ExecutionProvenanceRecord {
     pub secret_handles_used: Vec<String>,
     pub fallback_reason: Option<String>,
     pub sync_scope: Option<ExecutionSyncScope>,
+    #[serde(default)]
+    pub task_signature: Option<TaskSignature>,
+    #[serde(default)]
+    pub boundary_claims: Vec<BoundaryClaim>,
+    #[serde(default)]
+    pub gate_decision: Option<GateDecision>,
+    #[serde(default)]
+    pub gate_evaluation: Option<GateEvaluation>,
+    #[serde(default)]
+    pub assurance: Option<AssuranceTuple>,
+    #[serde(default)]
+    pub symbol_carriers: Vec<SymbolCarrier>,
+    #[serde(default)]
+    pub provenance_edges: Vec<ProvenanceEdge>,
     pub status: ExecutionStatus,
     pub created_at: String,
     pub updated_at: String,
@@ -644,6 +663,10 @@ pub struct SwarmRun {
     pub created_by: String,
     pub objective: String,
     pub requested_lane: SwarmRequestedLane,
+    #[serde(default)]
+    pub objective_signature: Option<TaskSignature>,
+    #[serde(default)]
+    pub objective_gate: Option<GateEvaluation>,
     pub status: SwarmRunStatus,
     pub max_concurrency: i64,
     pub summary: Option<String>,
@@ -663,6 +686,16 @@ pub struct SwarmTask {
     pub command: Option<String>,
     pub requested_lane: SwarmRequestedLane,
     pub resolved_lane: Option<SwarmResolvedLane>,
+    #[serde(default)]
+    pub task_signature: Option<TaskSignature>,
+    #[serde(default)]
+    pub boundary_quadrant: Option<BoundaryQuadrant>,
+    #[serde(default)]
+    pub gate_decision: Option<GateDecision>,
+    #[serde(default)]
+    pub gate_evaluation: Option<GateEvaluation>,
+    #[serde(default)]
+    pub required_roles: Vec<String>,
     pub status: SwarmTaskStatus,
     pub priority: i64,
     pub target_group_folder: String,
@@ -767,6 +800,10 @@ pub struct HostOsControlApprovalRequestRecord {
     pub action_summary: String,
     pub action_payload: Option<Value>,
     pub allowed_decisions: Vec<HostOsControlApprovalDecision>,
+    #[serde(default)]
+    pub boundary_claim: Option<BoundaryClaim>,
+    #[serde(default)]
+    pub gate_evaluation: Option<GateEvaluation>,
     pub status: HostOsControlApprovalStatus,
     pub resolved_decision: Option<HostOsControlApprovalDecision>,
     pub created_at: String,

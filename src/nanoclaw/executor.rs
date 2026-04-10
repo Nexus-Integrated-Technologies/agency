@@ -15,13 +15,20 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::foundation::{
-    CapabilityManifest, ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, ExecutionLocation,
-    ExecutionMountKind, ExecutionMountSummaryEntry, ExecutionProvenanceRecord, ExecutionRunKind,
-    ExecutionStatus, Group, MessageRecord, RemoteWorkerMode, RequestPlane,
+    AssuranceTuple, BoundaryClaim, CapabilityManifest, ContextLoader, ExecutionBoundary,
+    ExecutionBoundaryKind, ExecutionLane, ExecutionLocation, ExecutionMountKind,
+    ExecutionMountSummaryEntry, ExecutionProvenanceRecord, ExecutionRunKind, ExecutionStatus,
+    GateEvaluation, Group, HarnessRouter, MessageRecord, Objective, Plan, PlanStep, PlanStepStatus,
+    RemoteWorkerMode, RequestPlane, RoutingDecision, RoutingInput, SessionRole, SessionState,
+    SessionStore, TaskKind, TaskSignature,
 };
 
 use super::config::NanoclawConfig;
 use super::dev_environment::DigitalOceanDevEnvironment;
+use super::fpf_bridge::{
+    build_boundary_claims, derive_assurance, derive_provenance_edges, derive_symbol_carriers,
+    derive_task_signature, evaluate_execution_gate, now_iso,
+};
 use super::model_router::{resolve_worker_backend, ResolvedWorkerBackend, WorkerBackend};
 use super::omx::{OmxExecutionOptions, OmxRunnerClient};
 use super::request_plane::{get_request_plane_env, get_request_plane_text_error};
@@ -116,12 +123,19 @@ pub struct ExecutionRequest {
     pub group: Group,
     pub prompt: String,
     pub messages: Vec<MessageRecord>,
+    pub task_id: Option<String>,
     pub script: Option<String>,
     pub omx: Option<OmxExecutionOptions>,
     pub assistant_name: String,
     pub request_plane: RequestPlane,
     pub session: ExecutionSession,
     pub backend_override: Option<WorkerBackend>,
+    pub task_signature: Option<TaskSignature>,
+    pub routing_decision: Option<RoutingDecision>,
+    pub objective: Option<Objective>,
+    pub plan: Option<Plan>,
+    pub boundary_claims: Vec<BoundaryClaim>,
+    pub gate_evaluation: Option<GateEvaluation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -154,6 +168,12 @@ pub struct ExecutionMetadata {
     pub model: Option<String>,
     pub usage: Option<ExecutionUsageSummary>,
     pub cost_usd: Option<f64>,
+    pub routing_decision: Option<RoutingDecision>,
+    pub objective: Option<Objective>,
+    pub plan: Option<Plan>,
+    pub session_state: Option<SessionState>,
+    pub gate_evaluation: Option<GateEvaluation>,
+    pub assurance: Option<AssuranceTuple>,
     pub status: Option<String>,
     pub question: Option<String>,
     pub tmux_session: Option<String>,
@@ -293,17 +313,101 @@ impl ExecutionLaneRouter {
         }
     }
 
-    fn lane_for_request(&self, request: &ExecutionRequest) -> ExecutionLane {
+    fn requested_lane_for_request(&self, request: &ExecutionRequest) -> ExecutionLane {
         if request.omx.is_some() {
             ExecutionLane::Omx
+        } else if matches!(self.configured_lane, ExecutionLane::Auto) {
+            if should_use_container_lane(&self.container_groups, &request.group) {
+                ExecutionLane::Container
+            } else if should_use_remote_lane(&self.remote_worker_mode, &request.group) {
+                ExecutionLane::RemoteWorker
+            } else {
+                routing_preferred_lane(request.routing_decision.as_ref())
+                    .unwrap_or_else(|| self.lane_for_group(&request.group))
+            }
         } else {
             self.lane_for_group(&request.group)
         }
+    }
+
+    fn decorate_request(&self, mut request: ExecutionRequest) -> ExecutionRequest {
+        let created_at = now_iso();
+        if request.routing_decision.is_none() {
+            request.routing_decision = Some(derive_routing_decision(
+                &request.prompt,
+                &request.request_plane,
+                Path::new(&request.session.workspace_root),
+                request.omx.as_ref().map(|_| ExecutionLane::Omx),
+            ));
+        }
+        if request.task_signature.is_none() {
+            request.task_signature = Some(derive_task_signature(
+                &request.prompt,
+                &request.messages,
+                request.script.as_deref(),
+                &request.request_plane,
+                request.omx.is_some(),
+                &created_at,
+            ));
+        }
+        if request.objective.is_none() {
+            if let (Some(signature), Some(routing_decision)) = (
+                request.task_signature.as_ref(),
+                request.routing_decision.as_ref(),
+            ) {
+                request.objective = Some(build_execution_objective(
+                    &request.prompt,
+                    &request.assistant_name,
+                    signature,
+                    routing_decision,
+                ));
+            }
+        }
+        if request.plan.is_none() {
+            if let (Some(objective), Some(routing_decision)) = (
+                request.objective.as_ref(),
+                request.routing_decision.as_ref(),
+            ) {
+                request.plan = Some(build_execution_plan(objective, routing_decision));
+            }
+        }
+        if request.boundary_claims.is_empty() {
+            request.boundary_claims = build_boundary_claims(
+                &request.group.folder,
+                request.task_id.as_deref(),
+                &request.prompt,
+                &request.request_plane,
+                &created_at,
+            );
+        }
+        if request.gate_evaluation.is_none() {
+            let requested_lane = self.requested_lane_for_request(&request);
+            if let Some(signature) = request.task_signature.as_ref() {
+                request.gate_evaluation = Some(evaluate_execution_gate(
+                    signature,
+                    &request.boundary_claims,
+                    requested_lane,
+                    Path::new(&request.session.workspace_root),
+                    request.omx.is_some(),
+                    &created_at,
+                ));
+            }
+        }
+        request
+    }
+
+    fn lane_for_request(&self, request: &ExecutionRequest) -> ExecutionLane {
+        request
+            .gate_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.resolved_lane.clone())
+            .unwrap_or_else(|| self.requested_lane_for_request(request))
     }
 }
 
 impl ExecutorBoundary for ExecutionLaneRouter {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
+        let request = self.decorate_request(request);
         match self.lane_for_request(&request) {
             ExecutionLane::Auto | ExecutionLane::Host => self.host.execute(request),
             ExecutionLane::Container => self.container.execute(request),
@@ -473,6 +577,41 @@ impl ExecutorBoundary for OmxExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
         let workspace_root = PathBuf::from(&request.session.workspace_root);
+        let created_at = now_iso();
+        let session_store = SessionStore::new(session_state_path(&request.session));
+        let mut session_state = session_store.load().unwrap_or_default();
+        record_execution_request_session_turn(&mut session_state, &request);
+        let task_signature = request.task_signature.clone().unwrap_or_else(|| {
+            derive_task_signature(
+                &request.prompt,
+                &request.messages,
+                request.script.as_deref(),
+                &request.request_plane,
+                true,
+                &created_at,
+            )
+        });
+        let boundary_claims = if request.boundary_claims.is_empty() {
+            build_boundary_claims(
+                &request.group.folder,
+                request.task_id.as_deref(),
+                &request.prompt,
+                &request.request_plane,
+                &created_at,
+            )
+        } else {
+            request.boundary_claims.clone()
+        };
+        let gate_evaluation = request.gate_evaluation.clone().or_else(|| {
+            Some(evaluate_execution_gate(
+                &task_signature,
+                &boundary_claims,
+                ExecutionLane::Omx,
+                workspace_root.as_path(),
+                true,
+                &created_at,
+            ))
+        });
         let response = self.client.invoke(
             &request.group.folder,
             Some(&request.group.jid),
@@ -481,7 +620,18 @@ impl ExecutorBoundary for OmxExecutor {
             workspace_root.as_path(),
             request.omx.as_ref(),
         )?;
+        record_response_session_turn(&mut session_state, &response.summary);
+        session_state.last_plan = request.plan.clone();
+        session_store.save(&session_state)?;
         let now = Utc::now().to_rfc3339();
+        let assurance = derive_assurance("omx", &task_signature, gate_evaluation.as_ref(), false);
+        let symbol_carriers = derive_symbol_carriers(
+            &response.session_id,
+            &request.session,
+            response.log_path.as_deref().map(Path::new),
+        );
+        let provenance_edges =
+            derive_provenance_edges(&response.session_id, &symbol_carriers, &boundary_claims);
         let provenance = build_execution_provenance_record(BuildExecutionProvenanceInput {
             id: format!("omx-{}", Uuid::new_v4()),
             run_kind: ExecutionRunKind::Omx,
@@ -507,6 +657,12 @@ impl ExecutorBoundary for OmxExecutor {
             secret_handles_used: Vec::new(),
             fallback_reason: Some("omx".to_string()),
             sync_scope: None,
+            task_signature: Some(task_signature.clone()),
+            boundary_claims: boundary_claims.clone(),
+            gate_evaluation: gate_evaluation.clone(),
+            assurance: Some(assurance.clone()),
+            symbol_carriers: symbol_carriers.clone(),
+            provenance_edges: provenance_edges.clone(),
             status: if matches!(response.status, super::omx::OmxSessionStatus::Failed) {
                 ExecutionStatus::Error
             } else {
@@ -539,6 +695,12 @@ impl ExecutorBoundary for OmxExecutor {
                 model: None,
                 usage: None,
                 cost_usd: None,
+                routing_decision: request.routing_decision.clone(),
+                objective: request.objective.clone(),
+                plan: request.plan.clone(),
+                session_state: Some(compact_session_state(&session_state, 6)),
+                gate_evaluation,
+                assurance: Some(assurance),
                 status: Some(response.status.as_str().to_string()),
                 question: response.question.clone(),
                 tmux_session: response.tmux_session.clone(),
@@ -618,12 +780,19 @@ struct WorkerRequest {
     group: Group,
     prompt: String,
     messages: Vec<MessageRecord>,
+    task_id: Option<String>,
     script: Option<String>,
     omx: Option<OmxExecutionOptions>,
     assistant_name: String,
     request_plane: RequestPlane,
     session: ExecutionSession,
     backend_override: Option<WorkerBackend>,
+    task_signature: Option<TaskSignature>,
+    routing_decision: Option<RoutingDecision>,
+    objective: Option<Objective>,
+    plan: Option<Plan>,
+    boundary_claims: Vec<BoundaryClaim>,
+    gate_evaluation: Option<GateEvaluation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -778,6 +947,7 @@ fn run_worker_daemon_with_idle_timeout(session_root: &Path, idle_timeout: Durati
 }
 
 fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
+    let mut request = request;
     request.session.ensure_layout()?;
 
     let workspace_root = PathBuf::from(&request.session.workspace_root);
@@ -791,6 +961,72 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
     let mut resolved_backend = resolved_backend;
     if let Some(backend_override) = request.backend_override.clone() {
         resolved_backend.backend = backend_override;
+    }
+    if request.task_signature.is_none() {
+        request.task_signature = Some(derive_task_signature(
+            &request.prompt,
+            &request.messages,
+            request.script.as_deref(),
+            &request.request_plane,
+            request.omx.is_some(),
+            &request.requested_at,
+        ));
+    }
+    if request.routing_decision.is_none() {
+        request.routing_decision = Some(derive_routing_decision(
+            &request.prompt,
+            &request.request_plane,
+            workspace_root.as_path(),
+            request.omx.as_ref().map(|_| ExecutionLane::Omx),
+        ));
+    }
+    if request.objective.is_none() {
+        if let (Some(signature), Some(routing_decision)) = (
+            request.task_signature.as_ref(),
+            request.routing_decision.as_ref(),
+        ) {
+            request.objective = Some(build_execution_objective(
+                &request.prompt,
+                &request.assistant_name,
+                signature,
+                routing_decision,
+            ));
+        }
+    }
+    if request.plan.is_none() {
+        if let (Some(objective), Some(routing_decision)) = (
+            request.objective.as_ref(),
+            request.routing_decision.as_ref(),
+        ) {
+            request.plan = Some(build_execution_plan(objective, routing_decision));
+        }
+    }
+    if request.boundary_claims.is_empty() {
+        request.boundary_claims = build_boundary_claims(
+            &request.group.folder,
+            request.task_id.as_deref(),
+            &request.prompt,
+            &request.request_plane,
+            &request.requested_at,
+        );
+    }
+    if request.gate_evaluation.is_none() {
+        if let Some(signature) = request.task_signature.as_ref() {
+            request.gate_evaluation = Some(evaluate_execution_gate(
+                signature,
+                &request.boundary_claims,
+                ExecutionLane::Host,
+                workspace_root.as_path(),
+                request.omx.is_some(),
+                &request.requested_at,
+            ));
+        }
+    }
+    let session_store = SessionStore::new(session_state_path(&request.session));
+    let mut session_state = session_store.load().unwrap_or_default();
+    record_request_session_turn(&mut session_state, &request);
+    if request.plan.is_some() {
+        session_state.last_plan = request.plan.clone();
     }
 
     let result = if let Some(script) = request
@@ -820,6 +1056,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 workspace_root.as_path(),
                 prior_turns,
                 &instruction_hint,
+                &session_state,
                 &resolved_backend,
                 execution_location.clone(),
             ),
@@ -828,6 +1065,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 workspace_root.as_path(),
                 prior_turns,
                 &instruction_hint,
+                &session_state,
                 &resolved_backend,
                 execution_location.clone(),
             ),
@@ -839,6 +1077,8 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
 
     match result {
         Ok(result) => {
+            record_response_session_turn(&mut session_state, &result.text);
+            session_store.save(&session_state)?;
             fs::write(&log_path, &result.log_body)
                 .with_context(|| format!("failed to write {}", log_path.display()))?;
             append_history_entry(
@@ -853,6 +1093,24 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 },
             )?;
             let completed_at = Utc::now().to_rfc3339();
+            let task_signature = request.task_signature.clone();
+            let boundary_claims = request.boundary_claims.clone();
+            let gate_evaluation = request.gate_evaluation.clone();
+            let assurance = task_signature.as_ref().map(|signature| {
+                derive_assurance(
+                    result.metadata.backend.as_str(),
+                    signature,
+                    gate_evaluation.as_ref(),
+                    request.script.is_some(),
+                )
+            });
+            let symbol_carriers = derive_symbol_carriers(
+                &request.invocation_id,
+                &request.session,
+                Some(log_path.as_path()),
+            );
+            let provenance_edges =
+                derive_provenance_edges(&request.invocation_id, &symbol_carriers, &boundary_claims);
             let provenance = build_execution_provenance_record(BuildExecutionProvenanceInput {
                 id: request.invocation_id.clone(),
                 run_kind: run_kind_for_backend(&result.metadata.backend, request.script.is_some()),
@@ -866,12 +1124,26 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 secret_handles_used: result.metadata.secret_handles.clone(),
                 fallback_reason: result.metadata.fallback_reason.clone(),
                 sync_scope: None,
+                task_signature,
+                boundary_claims,
+                gate_evaluation: gate_evaluation.clone(),
+                assurance: assurance.clone(),
+                symbol_carriers,
+                provenance_edges,
                 status: ExecutionStatus::Success,
                 created_at: request.requested_at.clone(),
                 updated_at: completed_at.clone(),
                 completed_at: Some(completed_at),
             });
-            let execution_metadata = build_execution_metadata(&result);
+            let execution_metadata = build_execution_metadata(
+                &result,
+                request.routing_decision.clone(),
+                request.objective.clone(),
+                request.plan.clone(),
+                Some(compact_session_state(&session_state, 6)),
+                gate_evaluation,
+                assurance,
+            );
             Ok(WorkerResponse {
                 text: result.text,
                 boundary: ExecutionBoundary {
@@ -887,6 +1159,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
             })
         }
         Err(error) => {
+            let _ = session_store.save(&session_state);
             let log_body = format!(
                 "invocation_id={}\nsession_id={}\nworkspace={}\nstatus=error\nerror={}\n",
                 request.invocation_id, request.session.id, request.session.workspace_root, error
@@ -930,12 +1203,19 @@ fn build_worker_request(request: ExecutionRequest) -> WorkerRequest {
         group: request.group,
         prompt: request.prompt,
         messages: request.messages,
+        task_id: request.task_id,
         script: request.script,
         omx: request.omx,
         assistant_name: request.assistant_name,
         request_plane: request.request_plane,
         session: request.session,
         backend_override: request.backend_override,
+        task_signature: request.task_signature,
+        routing_decision: request.routing_decision,
+        objective: request.objective,
+        plan: request.plan,
+        boundary_claims: request.boundary_claims,
+        gate_evaluation: request.gate_evaluation,
     }
 }
 
@@ -1015,7 +1295,15 @@ fn describe_command(command: &Command) -> String {
     }
 }
 
-fn build_execution_metadata(result: &BackendExecutionResult) -> ExecutionMetadata {
+fn build_execution_metadata(
+    result: &BackendExecutionResult,
+    routing_decision: Option<RoutingDecision>,
+    objective: Option<Objective>,
+    plan: Option<Plan>,
+    session_state: Option<SessionState>,
+    gate_evaluation: Option<GateEvaluation>,
+    assurance: Option<AssuranceTuple>,
+) -> ExecutionMetadata {
     ExecutionMetadata {
         backend: Some(result.metadata.backend.as_str().to_string()),
         provider: result.metadata.provider.clone(),
@@ -1024,6 +1312,12 @@ fn build_execution_metadata(result: &BackendExecutionResult) -> ExecutionMetadat
         model: result.metadata.model.clone(),
         usage: result.metadata.usage.clone(),
         cost_usd: result.metadata.cost_usd,
+        routing_decision,
+        objective,
+        plan,
+        session_state,
+        gate_evaluation,
+        assurance,
         status: None,
         question: None,
         tmux_session: None,
@@ -1253,10 +1547,17 @@ fn remoteize_request(remote_worker_root: &str, request: ExecutionRequest) -> Exe
         group: request.group,
         prompt: request.prompt,
         messages: request.messages,
+        task_id: request.task_id,
         script: request.script,
         assistant_name: request.assistant_name,
         request_plane: request.request_plane,
         backend_override: request.backend_override,
+        task_signature: request.task_signature,
+        routing_decision: request.routing_decision,
+        objective: request.objective,
+        plan: request.plan,
+        boundary_claims: request.boundary_claims,
+        gate_evaluation: request.gate_evaluation,
         session: ExecutionSession {
             id: request.session.id,
             group_folder: request.session.group_folder,
@@ -1468,6 +1769,7 @@ fn run_codex_request(
     workspace_root: &Path,
     prior_turns: usize,
     instruction_hint: &str,
+    session_state: &SessionState,
     resolved_backend: &ResolvedWorkerBackend,
     _execution_location: ExecutionLocation,
 ) -> Result<BackendExecutionResult> {
@@ -1521,7 +1823,7 @@ fn run_codex_request(
             push_path_if_missing(&mut add_dirs, resolved);
         }
     }
-    let prompt = build_worker_prompt(request, workspace_root)?;
+    let prompt = build_worker_prompt(request, workspace_root, session_state)?;
     let output_path =
         Path::new(&request.session.state_root).join(format!("{}.codex.out", request.invocation_id));
     let mut command = Command::new(&codex_bin);
@@ -1713,6 +2015,7 @@ fn run_claude_request(
     workspace_root: &Path,
     prior_turns: usize,
     instruction_hint: &str,
+    session_state: &SessionState,
     resolved_backend: &ResolvedWorkerBackend,
     _execution_location: ExecutionLocation,
 ) -> Result<BackendExecutionResult> {
@@ -1735,7 +2038,7 @@ fn run_claude_request(
             ..Default::default()
         },
     );
-    let prompt = build_worker_prompt(request, workspace_root)?;
+    let prompt = build_worker_prompt(request, workspace_root, session_state)?;
     let mut command = Command::new(&claude_bin);
     command
         .arg("-p")
@@ -1965,22 +2268,50 @@ fn build_host_mount_summary(
     mounts
 }
 
-fn build_worker_prompt(request: &WorkerRequest, workspace_root: &Path) -> Result<String> {
-    let claude_path = workspace_root.join("CLAUDE.md");
-    let instructions = if claude_path.exists() {
-        fs::read_to_string(&claude_path)
-            .with_context(|| format!("failed to read {}", claude_path.display()))?
-    } else {
-        String::new()
-    };
+fn build_worker_prompt(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    session_state: &SessionState,
+) -> Result<String> {
+    let project_context = ContextLoader::load_from(workspace_root)
+        .map(|context| context.render())
+        .unwrap_or_default();
+    let objective = request
+        .objective
+        .as_ref()
+        .map(Objective::format_for_prompt)
+        .unwrap_or_default();
+    let routing = request
+        .routing_decision
+        .as_ref()
+        .map(render_routing_decision)
+        .unwrap_or_default();
+    let plan = request.plan.as_ref().map(Plan::summary).unwrap_or_default();
+    let session = render_session_state(session_state);
 
     Ok(format!(
         "You are {assistant} acting for the NanoClaw group '{group}'.\n\
 \n\
-Follow the workspace instructions below exactly when they are relevant.\n\
-<workspace_instructions>\n\
-{instructions}\n\
-</workspace_instructions>\n\
+Follow the project context, execution objective, routing brief, and plan below when they are relevant.\n\
+<project_context>\n\
+{project_context}\n\
+</project_context>\n\
+\n\
+<objective>\n\
+{objective}\n\
+</objective>\n\
+\n\
+<routing>\n\
+{routing}\n\
+</routing>\n\
+\n\
+<plan>\n\
+{plan}\n\
+</plan>\n\
+\n\
+<session_state>\n\
+{session}\n\
+</session_state>\n\
 \n\
 Respond only with the message that should be sent back to the chat user.\n\
 Do not include session metadata, prompt diagnostics, execution summaries, or tool logs.\n\
@@ -1990,25 +2321,32 @@ Current conversation context:\n\
 {prompt}\n",
         assistant = request.assistant_name,
         group = request.group.name,
-        instructions = instructions,
+        project_context = project_context,
+        objective = objective,
+        routing = routing,
+        plan = plan,
+        session = session,
         prompt = request.prompt
     ))
 }
 
 fn read_workspace_hint(workspace_root: &Path) -> Result<String> {
-    let claude_path = workspace_root.join("CLAUDE.md");
-    if !claude_path.exists() {
-        return Ok("No CLAUDE.md found.".to_string());
+    let context = ContextLoader::load_from(workspace_root)?;
+    if context.documents.is_empty() {
+        return Ok("No AGENTS.md/CLAUDE.md found.".to_string());
     }
 
-    let body = fs::read_to_string(&claude_path)
-        .with_context(|| format!("failed to read {}", claude_path.display()))?;
-    Ok(body
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("CLAUDE.md is empty.")
-        .to_string())
+    for document in context.documents.iter().rev() {
+        if let Some(line) = document
+            .body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+        {
+            return Ok(line.to_string());
+        }
+    }
+    Ok("Project context files are present but empty.".to_string())
 }
 
 fn append_history_entry(path: &Path, entry: SessionHistoryEntry) -> Result<()> {
@@ -2041,6 +2379,219 @@ fn summarize_for_chat(input: &str, max_chars: usize) -> String {
         return trimmed.to_string();
     }
     format!("{}...", &trimmed[..max_chars])
+}
+
+fn derive_routing_decision(
+    prompt: &str,
+    request_plane: &RequestPlane,
+    workspace_root: &Path,
+    preferred_lane: Option<ExecutionLane>,
+) -> RoutingDecision {
+    HarnessRouter::route(&RoutingInput {
+        prompt: prompt.to_string(),
+        request_plane: request_plane.clone(),
+        has_repo: workspace_root.join(".git").exists(),
+        preferred_lane,
+    })
+}
+
+fn build_execution_objective(
+    prompt: &str,
+    assistant_name: &str,
+    signature: &TaskSignature,
+    routing_decision: &RoutingDecision,
+) -> Objective {
+    let mut objective =
+        Objective::new(prompt.trim().to_string()).with_budget(signature.budget.clone().into());
+    objective.service_clause.provider_role = assistant_name.to_string();
+    objective.service_clause.consumer_role = "Requester".to_string();
+    if routing_decision.should_load_project_context {
+        objective = objective.with_acceptance("Use the local project context and workspace rules.");
+    }
+    if routing_decision.should_verify_assumptions {
+        objective =
+            objective.with_acceptance("Verify completion and note residual risk or uncertainty.");
+    }
+    if matches!(routing_decision.task_kind, TaskKind::Coding) {
+        objective = objective
+            .with_acceptance("Work directly against the workspace when changes are needed.");
+    }
+    objective
+}
+
+fn build_execution_plan(objective: &Objective, routing_decision: &RoutingDecision) -> Plan {
+    let mut plan = Plan::new(objective.goal.clone());
+    let mut step_num = 1usize;
+    if routing_decision.should_load_project_context {
+        plan.push_step(PlanStep {
+            step_num,
+            description: "Load project context and inspect workspace instructions.".to_string(),
+            task_kind: TaskKind::Planning,
+            preferred_lane: Some(ExecutionLane::Host),
+            suggested_tools: vec!["project_context".to_string()],
+            expected_output: "Relevant local constraints and repo context.".to_string(),
+            depends_on: Vec::new(),
+            status: PlanStepStatus::Pending,
+            output: None,
+        });
+        step_num += 1;
+    }
+    let dependency = if step_num > 1 {
+        vec![step_num - 1]
+    } else {
+        Vec::new()
+    };
+    plan.push_step(PlanStep {
+        step_num,
+        description: format!("Execute the objective: {}", objective.goal),
+        task_kind: routing_decision.task_kind.clone(),
+        preferred_lane: Some(routing_decision.scale.preferred_lane.clone()),
+        suggested_tools: Vec::new(),
+        expected_output: "A concrete answer or workspace change that satisfies the objective."
+            .to_string(),
+        depends_on: dependency,
+        status: PlanStepStatus::Pending,
+        output: None,
+    });
+    if routing_decision.should_verify_assumptions {
+        plan.push_step(PlanStep {
+            step_num: step_num + 1,
+            description: "Verify the result against acceptance criteria and residual risk."
+                .to_string(),
+            task_kind: TaskKind::Planning,
+            preferred_lane: Some(ExecutionLane::Host),
+            suggested_tools: vec!["verification".to_string()],
+            expected_output: "Concise confidence statement and remaining risk.".to_string(),
+            depends_on: vec![step_num],
+            status: PlanStepStatus::Pending,
+            output: None,
+        });
+    }
+    plan
+}
+
+fn routing_preferred_lane(routing_decision: Option<&RoutingDecision>) -> Option<ExecutionLane> {
+    match routing_decision?.scale.preferred_lane {
+        ExecutionLane::Host
+        | ExecutionLane::Container
+        | ExecutionLane::RemoteWorker
+        | ExecutionLane::Omx => Some(routing_decision?.scale.preferred_lane.clone()),
+        ExecutionLane::Auto | ExecutionLane::Custom(_) => None,
+    }
+}
+
+fn render_routing_decision(routing: &RoutingDecision) -> String {
+    format!(
+        "task_kind={}\ndata_shape={}\npreferred_lane={}\ncandidate_lanes={}\nconfidence={:.2}\nreason={}\nverify_assumptions={}\nload_project_context={}",
+        routing.task_kind.as_str(),
+        routing.data_shape.as_str(),
+        routing.scale.preferred_lane.as_str(),
+        routing
+            .candidate_lanes
+            .iter()
+            .map(ExecutionLane::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
+        routing.confidence.0,
+        routing.reason,
+        routing.should_verify_assumptions,
+        routing.should_load_project_context
+    )
+}
+
+fn render_session_state(session_state: &SessionState) -> String {
+    if session_state.turns.is_empty() {
+        return "No persisted session turns yet.".to_string();
+    }
+    session_state
+        .turns
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|turn| format!("[{}] {}", turn.role.as_str(), turn.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn session_state_path(session: &ExecutionSession) -> PathBuf {
+    Path::new(&session.state_root).join("session.json")
+}
+
+fn record_request_session_turn(state: &mut SessionState, request: &WorkerRequest) {
+    if let Some((role, content)) = derive_request_session_turn(
+        request.task_id.as_deref(),
+        &request.messages,
+        &request.prompt,
+    ) {
+        push_session_turn_if_new(state, role, content);
+    }
+}
+
+fn record_execution_request_session_turn(state: &mut SessionState, request: &ExecutionRequest) {
+    if let Some((role, content)) = derive_request_session_turn(
+        request.task_id.as_deref(),
+        &request.messages,
+        &request.prompt,
+    ) {
+        push_session_turn_if_new(state, role, content);
+    }
+}
+
+fn record_response_session_turn(state: &mut SessionState, response_text: &str) {
+    let content = summarize_for_chat(response_text, 2000);
+    if content.is_empty() {
+        return;
+    }
+    push_session_turn_if_new(state, SessionRole::Assistant, content);
+}
+
+fn push_session_turn_if_new(state: &mut SessionState, role: SessionRole, content: String) {
+    let is_duplicate = state
+        .turns
+        .last()
+        .map(|turn| turn.role == role && turn.content == content)
+        .unwrap_or(false);
+    if !is_duplicate {
+        state.push_turn(role, content);
+    }
+}
+
+fn derive_request_session_turn(
+    task_id: Option<&str>,
+    messages: &[MessageRecord],
+    prompt: &str,
+) -> Option<(SessionRole, String)> {
+    let content = if let Some(task_id) = task_id {
+        format!(
+            "Scheduled task {}: {}",
+            task_id,
+            summarize_for_chat(prompt, 1200)
+        )
+    } else if let Some(message) = messages.last() {
+        message.content.trim().to_string()
+    } else {
+        summarize_for_chat(prompt, 1200)
+    };
+    if content.is_empty() {
+        return None;
+    }
+    let role = if task_id.is_some() {
+        SessionRole::System
+    } else {
+        SessionRole::User
+    };
+    Some((role, content))
+}
+
+fn compact_session_state(state: &SessionState, max_turns: usize) -> SessionState {
+    let mut compact = state.clone();
+    if compact.turns.len() > max_turns {
+        compact.turns = compact.turns[compact.turns.len() - max_turns..].to_vec();
+    }
+    compact
 }
 
 #[cfg(test)]
@@ -2090,12 +2641,19 @@ mod tests {
                     is_from_me: false,
                     is_bot_message: false,
                 }],
+                task_id: None,
                 script: None,
                 omx: None,
                 assistant_name: "Andy".to_string(),
                 request_plane: RequestPlane::Web,
                 session,
                 backend_override: None,
+                task_signature: None,
+                routing_decision: None,
+                objective: None,
+                plan: None,
+                boundary_claims: Vec::new(),
+                gate_evaluation: None,
             })
             .unwrap();
 
@@ -2119,12 +2677,19 @@ mod tests {
             group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
             prompt: "<task />".to_string(),
             messages: Vec::new(),
+            task_id: None,
             script: Some("printf 'hello from script'".to_string()),
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
             session: session.clone(),
             backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
         };
         fs::write(&request_path, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
 
@@ -2172,12 +2737,19 @@ mod tests {
                     is_from_me: false,
                     is_bot_message: false,
                 }],
+                task_id: None,
                 script: None,
                 omx: None,
                 assistant_name: "Andy".to_string(),
                 request_plane: RequestPlane::Web,
                 session: session.clone(),
                 backend_override: None,
+                task_signature: None,
+                routing_decision: None,
+                objective: None,
+                plan: None,
+                boundary_claims: Vec::new(),
+                gate_evaluation: None,
             };
             write_json(&mut stream, &request).unwrap();
             stream.shutdown(Shutdown::Write).unwrap();
@@ -2439,15 +3011,79 @@ mod tests {
             group: main,
             prompt: "launch omx".to_string(),
             messages: Vec::new(),
+            task_id: None,
             script: None,
             omx: Some(crate::nanoclaw::omx::OmxExecutionOptions::default()),
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
             session,
             backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
         };
 
         assert_eq!(router.lane_for_request(&request), ExecutionLane::Omx);
+    }
+
+    #[test]
+    fn auto_lane_promotes_parallel_coding_requests_to_omx() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(workspace_root.join(".git")).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        let router = ExecutionLaneRouter {
+            configured_lane: ExecutionLane::Auto,
+            container_groups: Vec::new(),
+            remote_worker_mode: RemoteWorkerMode::Off,
+            host: RustSubprocessExecutor::with_worker_binary("/tmp/unused"),
+            container: ContainerExecutor {
+                source_crate_root: PathBuf::from("/tmp/src"),
+                container_image: "rust:1.75-slim".to_string(),
+                container_runtime: Some("docker".to_string()),
+                target_cache_root: PathBuf::from("/tmp/cache"),
+            },
+            remote: RemoteWorkerExecutor {
+                dev_environment: DigitalOceanDevEnvironment::from_config(
+                    &NanoclawConfig::from_env(),
+                ),
+                remote_worker_root: "/root/.nanoclaw-worker".to_string(),
+                remote_worker_binary: "/usr/local/bin/nanoclaw-rs".to_string(),
+                remote_manifest_path: "Cargo.toml".to_string(),
+            },
+            omx: OmxExecutor::from_config(&NanoclawConfig::from_env()),
+        };
+        let request = router.decorate_request(ExecutionRequest {
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "refactor the rust repo and use a multi-agent codex swarm to finish it"
+                .to_string(),
+            messages: Vec::new(),
+            task_id: None,
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            session,
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        });
+
+        assert_eq!(router.lane_for_request(&request), ExecutionLane::Omx);
+        assert_eq!(
+            request
+                .routing_decision
+                .as_ref()
+                .map(|value| value.task_kind.clone()),
+            Some(crate::foundation::TaskKind::Coding)
+        );
     }
 
     #[test]
@@ -2484,12 +3120,19 @@ mod tests {
                 is_from_me: false,
                 is_bot_message: true,
             }],
+            task_id: None,
             script: None,
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
             session,
             backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
         };
 
         assert_eq!(
@@ -2523,28 +3166,36 @@ mod tests {
 
     #[test]
     fn builds_execution_metadata_from_backend_result() {
-        let metadata = build_execution_metadata(&BackendExecutionResult {
-            text: "ok".to_string(),
-            log_body: "log".to_string(),
-            metadata: BackendExecutionMetadata {
-                backend: WorkerBackend::Codex,
-                provider: Some("openai".to_string()),
-                biller: Some("chatgpt".to_string()),
-                billing_type: Some("subscription".to_string()),
-                model: Some("gpt-5.4".to_string()),
-                usage: Some(ExecutionUsageSummary {
-                    input_tokens: 100,
-                    cached_input_tokens: 25,
-                    output_tokens: 50,
-                }),
-                cost_usd: Some(0.42),
-                effective_capabilities: CapabilityManifest::default(),
-                project_environment_id: None,
-                secret_handles: Vec::new(),
-                mount_summary: Vec::new(),
-                fallback_reason: None,
+        let metadata = build_execution_metadata(
+            &BackendExecutionResult {
+                text: "ok".to_string(),
+                log_body: "log".to_string(),
+                metadata: BackendExecutionMetadata {
+                    backend: WorkerBackend::Codex,
+                    provider: Some("openai".to_string()),
+                    biller: Some("chatgpt".to_string()),
+                    billing_type: Some("subscription".to_string()),
+                    model: Some("gpt-5.4".to_string()),
+                    usage: Some(ExecutionUsageSummary {
+                        input_tokens: 100,
+                        cached_input_tokens: 25,
+                        output_tokens: 50,
+                    }),
+                    cost_usd: Some(0.42),
+                    effective_capabilities: CapabilityManifest::default(),
+                    project_environment_id: None,
+                    secret_handles: Vec::new(),
+                    mount_summary: Vec::new(),
+                    fallback_reason: None,
+                },
             },
-        });
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(metadata.backend.as_deref(), Some("codex"));
         assert_eq!(metadata.provider.as_deref(), Some("openai"));

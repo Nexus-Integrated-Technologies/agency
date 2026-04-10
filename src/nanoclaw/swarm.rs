@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::foundation::{
-    Group, RequestPlane, SwarmRequestedLane, SwarmResolvedLane, SwarmRun, SwarmRunStatus,
-    SwarmTask, SwarmTaskDependency, SwarmTaskStatus,
+    classify_boundary_text, Group, RequestPlane, RoleAlgebra, SwarmRequestedLane,
+    SwarmResolvedLane, SwarmRun, SwarmRunStatus, SwarmTask, SwarmTaskDependency, SwarmTaskStatus,
+    TaskSignature,
 };
 
 use super::app::NanoclawApp;
@@ -18,6 +19,10 @@ use super::db::NanoclawDb;
 use super::dev_environment::DigitalOceanDevEnvironment;
 use super::executor::{
     build_execution_session, ExecutionRequest, ExecutionResponse, ExecutorBoundary,
+};
+use super::fpf_bridge::{
+    build_boundary_claims, derive_task_signature, evaluate_execution_gate,
+    evaluate_swarm_role_requirements,
 };
 use super::model_router::{is_command_available, WorkerBackend};
 use super::request_plane::{
@@ -50,7 +55,9 @@ pub struct SwarmPlanTaskInput {
     pub port: Option<u16>,
     pub timeout_ms: Option<u64>,
     pub request_plane: Option<RequestPlane>,
+    pub task_signature: Option<TaskSignature>,
     pub metadata: Option<Value>,
+    pub required_roles: Option<Vec<String>>,
     pub max_attempts: Option<i64>,
     pub depends_on: Option<Vec<String>>,
 }
@@ -110,6 +117,7 @@ pub fn create_swarm_objective_run(
         .requested_lane
         .clone()
         .unwrap_or(SwarmRequestedLane::Auto);
+    let objective = input.objective.clone();
     let max_concurrency = input
         .max_concurrency
         .unwrap_or(DEFAULT_SWARM_MAX_CONCURRENCY)
@@ -120,8 +128,17 @@ pub fn create_swarm_objective_run(
         group_folder: input.group_folder,
         chat_jid: input.chat_jid,
         created_by: input.created_by,
-        objective: input.objective,
+        objective,
         requested_lane,
+        objective_signature: Some(derive_task_signature(
+            &input.objective,
+            &[],
+            None,
+            &RequestPlane::None,
+            false,
+            &now,
+        )),
+        objective_gate: None,
         status: SwarmRunStatus::Pending,
         max_concurrency,
         summary: None,
@@ -237,6 +254,22 @@ fn build_swarm_plan(
         for (index, task) in input.tasks.iter().enumerate() {
             let key = slugify_task_key(task.key.as_deref().unwrap_or(&task.title));
             let metadata = merge_plan_metadata(task);
+            let task_prompt = task
+                .prompt
+                .as_deref()
+                .or(task.command.as_deref())
+                .unwrap_or(&task.title);
+            let request_plane = task.request_plane.clone().unwrap_or(RequestPlane::None);
+            let task_signature = task.task_signature.clone().unwrap_or_else(|| {
+                derive_task_signature(
+                    task_prompt,
+                    &[],
+                    task.command.as_deref(),
+                    &request_plane,
+                    false,
+                    now,
+                )
+            });
             let swarm_task = SwarmTask {
                 id: format!("{run_id}:{key}"),
                 run_id: run_id.to_string(),
@@ -246,6 +279,11 @@ fn build_swarm_plan(
                 command: task.command.clone(),
                 requested_lane: task.lane.clone().unwrap_or(SwarmRequestedLane::Auto),
                 resolved_lane: None,
+                task_signature: Some(task_signature),
+                boundary_quadrant: Some(classify_boundary_text(task_prompt)),
+                gate_decision: None,
+                gate_evaluation: None,
+                required_roles: task.required_roles.clone().unwrap_or_default(),
                 status: SwarmTaskStatus::Pending,
                 priority: task.priority.unwrap_or(50 - index as i64),
                 target_group_folder: task
@@ -314,6 +352,18 @@ fn build_default_swarm_plan(
         command: None,
         requested_lane: SwarmRequestedLane::Agent,
         resolved_lane: None,
+        task_signature: Some(derive_task_signature(
+            &input.objective,
+            &[],
+            None,
+            &RequestPlane::None,
+            false,
+            now,
+        )),
+        boundary_quadrant: Some(classify_boundary_text(&input.objective)),
+        gate_decision: None,
+        gate_evaluation: None,
+        required_roles: Vec::new(),
         status: SwarmTaskStatus::Pending,
         priority: 90,
         target_group_folder: input.group_folder.clone(),
@@ -357,6 +407,18 @@ fn build_default_swarm_plan(
             command: None,
             requested_lane: SwarmRequestedLane::Agent,
             resolved_lane: None,
+            task_signature: Some(derive_task_signature(
+                &input.objective,
+                &[],
+                None,
+                &RequestPlane::Web,
+                false,
+                now,
+            )),
+            boundary_quadrant: Some(classify_boundary_text(&input.objective)),
+            gate_decision: None,
+            gate_evaluation: None,
+            required_roles: Vec::new(),
             status: SwarmTaskStatus::Pending,
             priority: 75,
             target_group_folder: input.group_folder.clone(),
@@ -397,6 +459,18 @@ fn build_default_swarm_plan(
             command: None,
             requested_lane: SwarmRequestedLane::Agent,
             resolved_lane: None,
+            task_signature: Some(derive_task_signature(
+                &input.objective,
+                &[],
+                None,
+                &RequestPlane::Email,
+                false,
+                now,
+            )),
+            boundary_quadrant: Some(classify_boundary_text(&input.objective)),
+            gate_decision: None,
+            gate_evaluation: None,
+            required_roles: Vec::new(),
             status: SwarmTaskStatus::Pending,
             priority: 75,
             target_group_folder: input.group_folder.clone(),
@@ -437,6 +511,18 @@ fn build_default_swarm_plan(
             command: None,
             requested_lane: SwarmRequestedLane::Agent,
             resolved_lane: None,
+            task_signature: Some(derive_task_signature(
+                &input.objective,
+                &[],
+                None,
+                &RequestPlane::None,
+                false,
+                now,
+            )),
+            boundary_quadrant: Some(classify_boundary_text(&input.objective)),
+            gate_decision: None,
+            gate_evaluation: None,
+            required_roles: Vec::new(),
             status: SwarmTaskStatus::Pending,
             priority: 50,
             target_group_folder: input.group_folder.clone(),
@@ -506,6 +592,18 @@ fn build_default_swarm_plan(
             .clone()
             .unwrap_or(SwarmRequestedLane::Auto),
         resolved_lane: None,
+        task_signature: Some(derive_task_signature(
+            &input.objective,
+            &[],
+            None,
+            &execution_request_plane,
+            false,
+            now,
+        )),
+        boundary_quadrant: Some(classify_boundary_text(&input.objective)),
+        gate_decision: None,
+        gate_evaluation: None,
+        required_roles: Vec::new(),
         status: SwarmTaskStatus::Pending,
         priority: 70,
         target_group_folder: input.group_folder.clone(),
@@ -542,6 +640,18 @@ fn build_default_swarm_plan(
         command: None,
         requested_lane: SwarmRequestedLane::Agent,
         resolved_lane: None,
+        task_signature: Some(derive_task_signature(
+            &input.objective,
+            &[],
+            None,
+            &RequestPlane::None,
+            false,
+            now,
+        )),
+        boundary_quadrant: Some(classify_boundary_text(&input.objective)),
+        gate_decision: None,
+        gate_evaluation: None,
+        required_roles: Vec::new(),
         status: SwarmTaskStatus::Pending,
         priority: 50,
         target_group_folder: input.group_folder.clone(),
@@ -622,6 +732,24 @@ fn build_runnable_tasks(
                 ready.updated_at = Utc::now().to_rfc3339();
                 app.db.update_swarm_task(&ready)?;
             }
+            if let Some(role_gate) = evaluate_swarm_role_requirements(
+                &task,
+                Some(&RoleAlgebra::new(run.id.clone())),
+                &Utc::now().to_rfc3339(),
+            ) {
+                let mut blocked = task.clone();
+                blocked.status = SwarmTaskStatus::Blocked;
+                blocked.gate_decision = Some(role_gate.decision);
+                blocked.gate_evaluation = Some(role_gate.clone());
+                blocked.error = role_gate
+                    .checks
+                    .first()
+                    .map(|check| check.rationale.clone())
+                    .or_else(|| Some("Blocked by swarm role requirements.".to_string()));
+                blocked.updated_at = Utc::now().to_rfc3339();
+                app.db.update_swarm_task(&blocked)?;
+                continue;
+            }
             runnable.push(RunnableSwarmTask {
                 run: run.clone(),
                 resolved_lane: resolve_swarm_task_lane(&task, Some(&run.objective)),
@@ -686,6 +814,10 @@ fn execute_swarm_task<E: ExecutorBoundary>(
         "metadata": result.metadata,
     }));
     stored_task.error = result.error.clone();
+    stored_task.gate_decision = stored_task
+        .gate_evaluation
+        .as_ref()
+        .map(|evaluation| evaluation.decision);
     stored_task.lease_owner = None;
     stored_task.lease_expires_at = None;
     stored_task.updated_at = completed_at.clone();
@@ -731,6 +863,7 @@ fn run_swarm_agent_lane<E: ExecutorBoundary>(
     let response = execute_swarm_prompt(
         app,
         executor,
+        &runnable.task,
         &group,
         &workspace_root,
         &prompt,
@@ -763,6 +896,7 @@ fn run_swarm_codex_lane<E: ExecutorBoundary>(
     let response = execute_swarm_prompt(
         app,
         executor,
+        &runnable.task,
         &group,
         &workspace_root,
         &prompt,
@@ -813,6 +947,7 @@ fn run_swarm_host_lane<E: ExecutorBoundary>(
     let response = execute_swarm_script(
         app,
         executor,
+        &runnable.task,
         &group,
         &workspace_root,
         command,
@@ -940,6 +1075,7 @@ fn run_swarm_symphony_lane(
 fn execute_swarm_prompt<E: ExecutorBoundary>(
     app: &NanoclawApp,
     executor: &E,
+    task: &SwarmTask,
     group: &Group,
     workspace_root: &Path,
     prompt: &str,
@@ -953,22 +1089,61 @@ fn execute_swarm_prompt<E: ExecutorBoundary>(
         workspace_root,
     );
     session.ensure_layout()?;
+    let created_at = Utc::now().to_rfc3339();
+    let task_signature = task.task_signature.clone().unwrap_or_else(|| {
+        derive_task_signature(prompt, &[], None, &request_plane, false, &created_at)
+    });
+    let gate_evaluation = task.gate_evaluation.clone().or_else(|| {
+        Some(evaluate_execution_gate(
+            &task_signature,
+            &build_boundary_claims(
+                &group.folder,
+                Some(&task.id),
+                prompt,
+                &request_plane,
+                &created_at,
+            ),
+            match backend_override {
+                Some(WorkerBackend::Codex) => crate::foundation::ExecutionLane::Host,
+                Some(WorkerBackend::Claude) => crate::foundation::ExecutionLane::Host,
+                _ => crate::foundation::ExecutionLane::Host,
+            },
+            workspace_root,
+            false,
+            &created_at,
+        ))
+    });
+    let boundary_claims = build_boundary_claims(
+        &group.folder,
+        Some(&task.id),
+        prompt,
+        &request_plane,
+        &created_at,
+    );
     executor.execute(ExecutionRequest {
         group: group.clone(),
         prompt: prompt.to_string(),
         messages: Vec::new(),
+        task_id: Some(task.id.clone()),
         script: None,
         omx: None,
         assistant_name: app.config.assistant_name.clone(),
         request_plane,
         session,
         backend_override,
+        task_signature: Some(task_signature),
+        routing_decision: None,
+        objective: None,
+        plan: None,
+        boundary_claims,
+        gate_evaluation,
     })
 }
 
 fn execute_swarm_script<E: ExecutorBoundary>(
     app: &NanoclawApp,
     executor: &E,
+    task: &SwarmTask,
     group: &Group,
     workspace_root: &Path,
     script: &str,
@@ -981,16 +1156,42 @@ fn execute_swarm_script<E: ExecutorBoundary>(
         workspace_root,
     );
     session.ensure_layout()?;
+    let created_at = Utc::now().to_rfc3339();
+    let prompt = format!("Run swarm command task for {}", group.name);
+    let task_signature = task.task_signature.clone().unwrap_or_else(|| {
+        derive_task_signature(
+            &prompt,
+            &[],
+            Some(script),
+            &request_plane,
+            false,
+            &created_at,
+        )
+    });
+    let boundary_claims = build_boundary_claims(
+        &group.folder,
+        Some(&task.id),
+        &prompt,
+        &request_plane,
+        &created_at,
+    );
     executor.execute(ExecutionRequest {
         group: group.clone(),
-        prompt: format!("Run swarm command task for {}", group.name),
+        prompt,
         messages: Vec::new(),
+        task_id: Some(task.id.clone()),
         script: Some(script.to_string()),
         omx: None,
         assistant_name: app.config.assistant_name.clone(),
         request_plane,
         session,
         backend_override: None,
+        task_signature: Some(task_signature),
+        routing_decision: None,
+        objective: None,
+        plan: None,
+        boundary_claims,
+        gate_evaluation: task.gate_evaluation.clone(),
     })
 }
 

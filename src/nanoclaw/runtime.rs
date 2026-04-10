@@ -15,6 +15,7 @@ use super::app::NanoclawApp;
 use super::executor::{
     build_execution_session, ExecutionRequest, ExecutionSession, ExecutorBoundary,
 };
+use super::fpf_bridge::{build_boundary_claims, derive_task_signature};
 use super::ingress_policy::{has_authorized_trigger, should_drop_inbound_message};
 use super::local_channel::{LocalChannel, LocalInboundEnvelope, LocalOutboundEnvelope};
 use super::request_plane::default_request_plane;
@@ -132,16 +133,29 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
         }
         let session = self.ensure_execution_session(&group)?;
         let prompt = format_messages(&messages, &self.app.config.timezone)?;
+        let request_plane = default_request_plane();
+        let created_at = Utc::now().to_rfc3339();
+        let task_signature =
+            derive_task_signature(&prompt, &messages, None, &request_plane, false, &created_at);
+        let boundary_claims =
+            build_boundary_claims(&group.folder, None, &prompt, &request_plane, &created_at);
         let execution = self.executor.execute(ExecutionRequest {
             group: group.clone(),
             prompt,
             messages: messages.clone(),
+            task_id: None,
             script: None,
             omx: None,
             assistant_name: self.app.config.assistant_name.clone(),
-            request_plane: default_request_plane(),
+            request_plane,
             session: session.clone(),
             backend_override: None,
+            task_signature: Some(task_signature),
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims,
+            gate_evaluation: None,
         })?;
         self.record_execution_provenance(&execution)?;
         self.record_execution_log_artifact(&group, None, &session, &execution)?;
@@ -215,19 +229,43 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             _ => Vec::new(),
         };
         let prompt = format_task_request(task, &context_messages, &self.app.config.timezone)?;
+        let request_plane = task
+            .request_plane
+            .clone()
+            .unwrap_or_else(default_request_plane);
+        let created_at = Utc::now().to_rfc3339();
+        let task_signature = derive_task_signature(
+            &prompt,
+            &context_messages,
+            task.script.as_deref(),
+            &request_plane,
+            false,
+            &created_at,
+        );
+        let boundary_claims = build_boundary_claims(
+            &group.folder,
+            Some(&task.id),
+            &prompt,
+            &request_plane,
+            &created_at,
+        );
         let execution = self.executor.execute(ExecutionRequest {
             group: group.clone(),
             prompt,
             messages: context_messages,
+            task_id: Some(task.id.clone()),
             script: task.script.clone(),
             omx: None,
             assistant_name: self.app.config.assistant_name.clone(),
-            request_plane: task
-                .request_plane
-                .clone()
-                .unwrap_or_else(default_request_plane),
+            request_plane,
             session: session.clone(),
             backend_override: None,
+            task_signature: Some(task_signature),
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims,
+            gate_evaluation: None,
         })?;
         self.record_execution_provenance(&execution)?;
         self.record_execution_log_artifact(&group, Some(&task.id), &session, &execution)?;

@@ -14,9 +14,18 @@ compile_error!(
 );
 
 pub use foundation::{
-    ArtifactKind, ArtifactRecord, DevelopmentEnvironment, DevelopmentEnvironmentKind,
-    ExecutionBoundary, ExecutionBoundaryKind, ExecutionContext, ExecutionLane, FoundationEvent,
-    Group, QueueOutcome, QueueSnapshot, RemoteWorkerMode, RequestPlane, ScheduledTask, SshEndpoint,
-    TaskContextMode, TaskRunLog, TaskRunStatus, TaskScheduleType, TaskStatus,
+    ArtifactKind, ArtifactRecord, AssuranceTuple, BoundaryClaim, BoundaryClaimSource,
+    BoundaryQuadrant, CongruenceLevel, ContextDocument, ContextLoader, DevelopmentEnvironment,
+    DevelopmentEnvironmentKind, DurableTaskQueue, DurableTaskRecord, DurableTaskStatus,
+    EvidenceGraph, ExecutionBoundary, ExecutionBoundaryKind, ExecutionContext, ExecutionLane,
+    Formality, FoundationEvent, GateAspect, GateCheck, GateDecision, GateEvaluation, GateScope,
+    Group, HabitDefinition, HarnessRouter, Objective, Plan, PlanStep, PlanStepStatus,
+    ProjectContext, ProvenanceEdge, ProvenanceEdgeKind, QueueOutcome, QueueSnapshot, RefreshAction,
+    RefreshPlan, RefreshReport, RefreshTrigger, RemoteWorkerMode, RequestPlane, ResourceBudget,
+    RoleAlgebra, RouteConfidence, RoutingDecision, RoutingInput, ScaleClass, ScaleElasticity,
+    ScaleProfile, ScheduledTask, ScopeSet, ScopeSlice, ServiceClause, ServiceStatus, SessionRole,
+    SessionState, SessionStore, SessionTurn, SqliteDurableTaskQueue, SshEndpoint, SymbolCarrier,
+    TaskBudget, TaskContextMode, TaskDataShape, TaskKind, TaskRunLog, TaskRunStatus,
+    TaskScheduleInput, TaskScheduleType, TaskSignature, TaskStatus,
 };
 pub use nanoclaw::{run_cli as run_nanoclaw_cli, BootstrapSummary, NanoclawApp, NanoclawConfig};
