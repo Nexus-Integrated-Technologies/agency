@@ -1,3 +1,26 @@
+# Agency on a NanoClaw Foundation
+
+This clone is being refocused into a pure-Rust Agency runtime built on a
+NanoClaw-style foundation.
+The goal is not to make Agency as small as NanoClaw; the goal is to ensure the
+runtime, artifacts, and higher-order features descend from the same core domain
+model.
+
+- The canonical base layer now lives in `src/foundation/`.
+- The first runtime descendant lives in `src/bin/nanoclaw.rs` and `src/nanoclaw/`.
+- `cargo run` now defaults to the NanoClaw Rust bootstrap path.
+- Legacy Agency modules are no longer on the default compile path; they are
+  gated behind the `legacy-agency` Cargo feature during the cutover.
+- Holonic and governance artifacts that get pruned are moved into
+  `graveyard/holonic/` instead of being deleted.
+- The foundation rules are described in `docs/foundation-model.md`.
+- The DigitalOcean VM workflow is described in
+  `docs/digitalocean-dev-environment.md`.
+- The migration map is tracked in `docs/nanoclaw-rs-migration.md`.
+
+> Legacy Agency README content follows below for reference while the cutover is
+> still in progress.
+
 # 🚀 SOTA Semi-Autonomous Agency (Rust) v0.2.0
 
 A state-of-the-art, semi-autonomous multi-agent system built in Rust. This agency features a ReAct reasoning framework, distributed microservices architecture, **First Principle Framework (FPF)** integration, and SOTA audio capabilities. It is designed for complex technical tasks, autonomous problem-solving, and seamless human-AI interaction via text and voice.

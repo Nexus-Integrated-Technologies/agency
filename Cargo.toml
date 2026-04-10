@@ -2,147 +2,29 @@
 name = "rust_agency"
 version = "0.2.0"
 edition = "2021"
-default-run = "rust_agency"
+default-run = "nanoclaw"
+
+[features]
+default = []
+legacy-agency = []
 
 [dependencies]
-# Core async runtime and error handling
-uuid = { version = "1.8", features = ["v4", "serde"] }
-sha2 = "0.10"
 anyhow = "1.0"
-thiserror = "2.0"
-tokio = { version = "1.48", features = ["full"] }
-async-trait = "0.1"
-futures-util = "0.3"
-futures = "0.3"
-
-# LLM integration
-ollama-rs = { version = "0.3", features = ["default", "stream"] }
-
-# Use LOCAL Candle for direct development and Metal optimizations
-candle-core = { path = "crates/candle/candle-core", features = ["metal", "accelerate"] }
-candle-transformers = { path = "crates/candle/candle-transformers", features = ["metal"] }
-candle-nn = { path = "crates/candle/candle-nn", features = ["metal"] }
-candle-onnx = { path = "crates/candle/candle-onnx" }
-hf-hub = "0.4.0"
-
-# Memory system - Vector DB + Embeddings
-chromadb = "0.3"
-fastembed = "5"
-rayon = "1.10"
-bincode = "1.3"
-zstd = "0.13"
-
-# ML Inference - Local Source
-# Disabled download-binaries to prevent TLS build errors
-# ort = { path = "crates/ort", default-features = false, features = ["load-dynamic", "coreml", "half"] }
-ort = { version = "2.0.0-rc.11", default-features = false, features = ["load-dynamic", "coreml", "half"] }
-
-# WASM Runtime (Self-Correction Engine)
-wasmer = "4.2"
-
-tokenizers = "0.20"
-ndarray = "0.15.6"
-ndarray-rand = "0.16"
-rand = "0.8"
-safetensors = "0.7"
-half = "2.5"
-rustfft = "6.2"
-
-# Audio Playback & Input
-rodio = "0.17"
-hound = "3.5"
-cpal = "0.15"
-rubato = "0.14"
-byteorder = "1.5"
-
-# Vision & Capture
-nokhwa = { version = "0.10", features = ["input-native"] }
-screenshots = "0.8"
-image = "0.24"
-
-# Peripheral Access & System Awareness
-nusb = "0.1"
-serialport = "4.3"
-
-# Serialization and schema
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+croner = "3.0.1"
+hmac = "0.12.1"
+libc = "0.2"
+regex = "1.12.2"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
-schemars = "1.2"
-
-# HTTP client for web search tool
-reqwest = { version = "0.12", features = ["json"] }
-
-# Utilities
-regex = "1.12"
-chrono = { version = "0.4", features = ["serde"] }
-sysinfo = "0.37"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-tracing-opentelemetry = "0.27"
-opentelemetry = "0.26"
-opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
-opentelemetry-otlp = "0.26"
-konst = "0.3"
-memmap2 = "0.9"
-aes-gcm = "0.10"
-hex = "0.4"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-urlencoding = "2.1"
-html-escape = "0.2"
-libc = "0.2"
-lazy_static = "1.4"
-pdf-extract = "0.7.2"
-ratatui = "0.29.0"
-crossterm = "0.28.1"
-
-# Rate limiting for safety
-governor = "0.8"
-e2b-sdk = "0.1.1"
-dotenv = "0.15.0"
-daytona-client = "0.5.0"
-bollard = "0.19.4"
-base64 = "0.22"
-tempfile = "3.10"
-fs2 = "0.4"
-axum = { version = "0.8.8", features = ["ws", "macros"] }
-tower = "0.5.2"
-tower-http = { version = "0.6.2", features = ["trace"] }
-tokio-stream = "0.1.18"
-
-# PAI Pure Rust Core
-pai-core = { path = "crates/pai-core" }
-
-# gRPC and Protobuf for UAP
-tonic = "0.12"
-prost = "0.13"
-prost-types = "0.13"
-
-# Persistent Task Queue
-rusqlite = { version = "0.38.0", features = ["bundled"] }
-tokio-cron-scheduler = "0.15"
-rss = "2.0"
-notify = "6.1"
-enigo = "0.2"
-teloxide = { version = "0.13", features = ["macros"] }
-matrix-sdk = { version = "0.7", default-features = false, features = ["rustls-tls"] }
-k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
-alloy-rlp = { version = "0.3", features = ["derive"] }
-alloy-primitives = { version = "1.5", features = ["serde"] }
-bs58 = "0.5"
-
-# Tor/Arti for Anonymous A2A
-arti-client = { path = "crates/arti/crates/arti-client", features = ["full", "tokio", "native-tls"] }
-tor-rtcompat = { path = "crates/arti/crates/tor-rtcompat", features = ["tokio", "native-tls"] }
-
-# Desktop Version (Tauri)
-tauri = { version = "2.9", features = ["macos-private-api"] }
-
-[build-dependencies]
-tonic-build = "0.12"
-tauri-build = "2.5"
+sha2 = "0.10.9"
+tiny_http = "0.12.0"
+tungstenite = { version = "0.24.0", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+url = "2.5.7"
+uuid = { version = "1.8", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
-tokio-test = "0.4"
