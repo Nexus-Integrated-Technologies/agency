@@ -215,6 +215,7 @@ pub struct MessageRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ArtifactKind {
     BootstrapSummary,
+    WorkersAI,
     DevelopmentEnvironmentSnapshot,
     Transcript,
     TaskResult,
@@ -418,6 +419,7 @@ pub enum ExecutionRunKind {
     HostOsControl,
     Omx,
     Summary,
+    WorkersAI,
     Custom(String),
 }
 
@@ -429,6 +431,7 @@ impl ExecutionRunKind {
             "claude" => Self::Claude,
             "host_os_control" | "host-os-control" => Self::HostOsControl,
             "omx" => Self::Omx,
+            "workers-ai" | "workers_ai" | "workersai" => Self::WorkersAI,
             "" | "summary" => Self::Summary,
             other => Self::Custom(other.to_string()),
         }
@@ -441,6 +444,7 @@ impl ExecutionRunKind {
             Self::Claude => "claude",
             Self::HostOsControl => "host_os_control",
             Self::Omx => "omx",
+            Self::WorkersAI => "workers_ai",
             Self::Summary => "summary",
             Self::Custom(value) => value.as_str(),
         }

@@ -16,6 +16,7 @@ pub enum WorkerBackend {
     Summary,
     Codex,
     Claude,
+    WorkersAI,
     Custom(String),
 }
 
@@ -25,6 +26,7 @@ impl WorkerBackend {
             "" | "summary" => Self::Summary,
             "codex" => Self::Codex,
             "claude" => Self::Claude,
+            "workers-ai" | "workers_ai" | "workersai" => Self::WorkersAI,
             other => Self::Custom(other.to_string()),
         }
     }
@@ -34,6 +36,7 @@ impl WorkerBackend {
             Self::Summary => "summary",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::WorkersAI => "workers-ai",
             Self::Custom(value) => value.as_str(),
         }
     }
@@ -42,7 +45,7 @@ impl WorkerBackend {
         match self {
             Self::Codex => Some(ProjectRuntime::Codex),
             Self::Claude => Some(ProjectRuntime::Claude),
-            Self::Summary | Self::Custom(_) => None,
+            Self::WorkersAI | Self::Summary | Self::Custom(_) => None,
         }
     }
 }
@@ -144,6 +147,7 @@ mod tests {
     fn parses_worker_backends() {
         assert_eq!(WorkerBackend::parse("codex"), WorkerBackend::Codex);
         assert_eq!(WorkerBackend::parse("claude"), WorkerBackend::Claude);
+        assert_eq!(WorkerBackend::parse("workers-ai"), WorkerBackend::WorkersAI);
         assert_eq!(WorkerBackend::parse(""), WorkerBackend::Summary);
     }
 

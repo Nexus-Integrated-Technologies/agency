@@ -122,6 +122,7 @@ pub fn build_execution_session(
 pub struct ExecutionRequest {
     pub group: Group,
     pub prompt: String,
+    pub paperclip_overlay_context: Option<String>,
     pub messages: Vec<MessageRecord>,
     pub task_id: Option<String>,
     pub script: Option<String>,
@@ -779,6 +780,7 @@ struct WorkerRequest {
     requested_at: String,
     group: Group,
     prompt: String,
+    paperclip_overlay_context: Option<String>,
     messages: Vec<MessageRecord>,
     task_id: Option<String>,
     script: Option<String>,
@@ -1051,15 +1053,36 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 workspace_root.as_path(),
                 execution_location.clone(),
             )),
-            WorkerBackend::Codex => run_codex_request(
-                &request,
-                workspace_root.as_path(),
-                prior_turns,
-                &instruction_hint,
-                &session_state,
-                &resolved_backend,
-                execution_location.clone(),
-            ),
+            WorkerBackend::Codex => {
+                match run_codex_request(
+                    &request,
+                    workspace_root.as_path(),
+                    prior_turns,
+                    &instruction_hint,
+                    &session_state,
+                    &resolved_backend,
+                    execution_location.clone(),
+                ) {
+                    Ok(res) => Ok(res),
+                    Err(err) => {
+                        let err_text = err.to_string();
+                        if err_text.contains("usage limit") || err_text.contains("usage_limit") || err_text.contains("exit status: 1") {
+                            run_workers_ai_request(
+                                &request,
+                                workspace_root.as_path(),
+                                prior_turns,
+                                &instruction_hint,
+                                &session_state,
+                                &resolved_backend,
+                                execution_location.clone(),
+                                Some(format!("codex_fallback: {}", err_text)),
+                            )
+                        } else {
+                            Err(err)
+                        }
+                    }
+                }
+            }
             WorkerBackend::Claude => run_claude_request(
                 &request,
                 workspace_root.as_path(),
@@ -1068,6 +1091,16 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 &session_state,
                 &resolved_backend,
                 execution_location.clone(),
+            ),
+            WorkerBackend::WorkersAI => run_workers_ai_request(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+                execution_location.clone(),
+                None,
             ),
             WorkerBackend::Custom(value) => {
                 bail!("unsupported worker backend '{}'", value)
@@ -1202,6 +1235,7 @@ fn build_worker_request(request: ExecutionRequest) -> WorkerRequest {
         requested_at: Utc::now().to_rfc3339(),
         group: request.group,
         prompt: request.prompt,
+        paperclip_overlay_context: request.paperclip_overlay_context,
         messages: request.messages,
         task_id: request.task_id,
         script: request.script,
@@ -1546,6 +1580,7 @@ fn remoteize_request(remote_worker_root: &str, request: ExecutionRequest) -> Exe
     ExecutionRequest {
         group: request.group,
         prompt: request.prompt,
+        paperclip_overlay_context: request.paperclip_overlay_context,
         messages: request.messages,
         task_id: request.task_id,
         script: request.script,
@@ -2152,6 +2187,100 @@ fn run_claude_request(
     })
 }
 
+
+fn run_workers_ai_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    _prior_turns: usize,
+    _instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    _execution_location: ExecutionLocation,
+    fallback_reason: Option<String>,
+) -> Result<BackendExecutionResult> {
+    if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
+        bail!(error);
+    }
+
+    let proxy_url = std::env::var("PAPERCLIP_WORKERS_AI_PROXY_URL")
+        .unwrap_or_else(|_| "http://paperclip.ai/tasks".to_string());
+    let proxy_token = std::env::var("PAPERCLIP_AI_PROXY_TOKEN").ok();
+    let model = std::env::var("NANOCLAW_WORKERS_AI_MODEL")
+        .unwrap_or_else(|_| "@cf/meta/llama-3-8b-instruct".to_string());
+
+    let prompt = build_worker_prompt(request, workspace_root, session_state)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("failed to build reqwest client")?;
+    
+    let mut rb = client.post(&proxy_url)
+        .json(&serde_json::json!({
+            "taskType": "lightweight_planning",
+            "input": prompt,
+            "model": model,
+            "correlationId": request.invocation_id
+        }));
+    
+    if let Some(token) = proxy_token {
+        rb = rb.header("x-paperclip-ai-proxy-token", token);
+    }
+
+    let response = rb.send().context("failed to send request to Workers AI proxy")?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_body = response.text().unwrap_or_default();
+        bail!("Workers AI execution failed with status {}: {}", status, error_body);
+    }
+
+    let result: serde_json::Value = response.json().context("failed to parse Workers AI response")?;
+    if !result["ok"].as_bool().unwrap_or(false) {
+        let error_msg = result["error"].as_str().unwrap_or("unknown error");
+        bail!("Workers AI proxy returned unsuccessful result: {}", error_msg);
+    }
+
+    let text = result["text"].as_str().unwrap_or_default().to_string();
+
+    if text.is_empty() {
+        bail!("Workers AI execution produced empty output");
+    }
+
+    let capability_manifest = derive_capability_manifest(
+        &request.request_plane,
+        DeriveCapabilityManifestInput::default(),
+    );
+
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nbackend=workers-ai\nmodel={}\nfallback_reason={:?}\nresponse=\n{}\n",
+        request.invocation_id,
+        request.session.id,
+        model,
+        fallback_reason,
+        text
+    );
+
+    Ok(BackendExecutionResult {
+        text,
+        log_body,
+        metadata: BackendExecutionMetadata {
+            backend: WorkerBackend::WorkersAI,
+            provider: Some("cloudflare".to_string()),
+            biller: Some("cloudflare".to_string()),
+            billing_type: None,
+            model: Some(model),
+            usage: None,
+            cost_usd: None,
+            effective_capabilities: capability_manifest,
+            project_environment_id: resolved_backend.project_environment.as_ref().map(|resolved| resolved.project.id.clone()),
+            secret_handles: Vec::new(),
+            mount_summary: Vec::new(),
+            fallback_reason,
+        },
+    })
+}
+
 fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -2236,6 +2365,7 @@ fn run_kind_for_backend(backend: &WorkerBackend, is_script: bool) -> ExecutionRu
         WorkerBackend::Summary => ExecutionRunKind::Summary,
         WorkerBackend::Codex => ExecutionRunKind::Codex,
         WorkerBackend::Claude => ExecutionRunKind::Claude,
+        WorkerBackend::WorkersAI => ExecutionRunKind::WorkersAI,
         WorkerBackend::Custom(value) => ExecutionRunKind::Custom(value.clone()),
     }
 }
@@ -2276,6 +2406,10 @@ fn build_worker_prompt(
     let project_context = ContextLoader::load_from(workspace_root)
         .map(|context| context.render())
         .unwrap_or_default();
+    let paperclip_managed_context = request
+        .paperclip_overlay_context
+        .as_deref()
+        .unwrap_or_default();
     let objective = request
         .objective
         .as_ref()
@@ -2292,7 +2426,11 @@ fn build_worker_prompt(
     Ok(format!(
         "You are {assistant} acting for the NanoClaw group '{group}'.\n\
 \n\
-Follow the project context, execution objective, routing brief, and plan below when they are relevant.\n\
+Follow the Paperclip-managed context first when it is supplied for this run. Then follow the project context, execution objective, routing brief, and plan below when they are relevant.\n\
+<paperclip_managed_context>\n\
+{paperclip_managed_context}\n\
+</paperclip_managed_context>\n\
+\n\
 <project_context>\n\
 {project_context}\n\
 </project_context>\n\
@@ -2321,6 +2459,7 @@ Current conversation context:\n\
 {prompt}\n",
         assistant = request.assistant_name,
         group = request.group.name,
+        paperclip_managed_context = paperclip_managed_context,
         project_context = project_context,
         objective = objective,
         routing = routing,
@@ -2631,6 +2770,7 @@ mod tests {
             .execute(ExecutionRequest {
                 group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
                 prompt: "<messages />".to_string(),
+                paperclip_overlay_context: None,
                 messages: vec![MessageRecord {
                     id: "m1".to_string(),
                     chat_jid: "main".to_string(),
@@ -2676,6 +2816,7 @@ mod tests {
             requested_at: "2026-04-05T00:00:00Z".to_string(),
             group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
             prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
             messages: Vec::new(),
             task_id: None,
             script: Some("printf 'hello from script'".to_string()),
@@ -2727,6 +2868,7 @@ mod tests {
                 requested_at: "2026-04-05T00:00:00Z".to_string(),
                 group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
                 prompt: "<messages />".to_string(),
+                paperclip_overlay_context: None,
                 messages: vec![MessageRecord {
                     id: invocation_id.to_string(),
                     chat_jid: "main".to_string(),
@@ -3010,6 +3152,7 @@ mod tests {
         let request = ExecutionRequest {
             group: main,
             prompt: "launch omx".to_string(),
+            paperclip_overlay_context: None,
             messages: Vec::new(),
             task_id: None,
             script: None,
@@ -3060,6 +3203,7 @@ mod tests {
             group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
             prompt: "refactor the rust repo and use a multi-agent codex swarm to finish it"
                 .to_string(),
+            paperclip_overlay_context: None,
             messages: Vec::new(),
             task_id: None,
             script: None,
@@ -3110,6 +3254,7 @@ mod tests {
                 is_main: false,
             },
             prompt: "Paperclip wake".to_string(),
+            paperclip_overlay_context: None,
             messages: vec![MessageRecord {
                 id: "paperclip:run".to_string(),
                 chat_jid: "paperclip:agent:ceo:paperclip".to_string(),
