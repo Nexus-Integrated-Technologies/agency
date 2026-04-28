@@ -1,0 +1,41 @@
+FROM rust:1-bookworm AS build
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --release --bin nanoclaw
+
+FROM node:lts-trixie-slim AS runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    python3 \
+    ripgrep \
+  && rm -rf /var/lib/apt/lists/* \
+  && npm install --global --omit=dev @openai/codex@latest
+
+ENV HOME=/nanoclaw
+ENV NANOCLAW_HOME=/nanoclaw
+ENV CODEX_HOME=/nanoclaw/.codex
+ENV NANOCLAW_OPENCLAW_GATEWAY_BIND_HOST=0.0.0.0
+ENV NANOCLAW_OPENCLAW_GATEWAY_PORT=18789
+ENV NANOCLAW_OPENCLAW_GATEWAY_EXECUTION_LANE=host
+ENV NANOCLAW_EXECUTION_LANE=host
+ENV NANOCLAW_WORKER_BACKEND=codex
+ENV NANOCLAW_CODEX_BIN=codex
+ENV NANOCLAW_CODEX_SANDBOX=danger-full-access
+
+COPY --from=build /src/target/release/nanoclaw /usr/local/bin/nanoclaw
+COPY docker/start-openclaw-gateway.sh /usr/local/bin/start-openclaw-gateway.sh
+
+RUN chmod +x /usr/local/bin/nanoclaw /usr/local/bin/start-openclaw-gateway.sh \
+  && mkdir -p /nanoclaw/.codex /nanoclaw/data /nanoclaw/groups /nanoclaw/store
+
+WORKDIR /nanoclaw
+EXPOSE 18789
+
+CMD ["/usr/local/bin/start-openclaw-gateway.sh"]

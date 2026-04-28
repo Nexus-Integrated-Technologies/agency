@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -17,14 +17,15 @@ use crate::foundation::{ExecutionLane, MessageRecord, RequestPlane};
 use super::app::NanoclawApp;
 use super::config::NanoclawConfig;
 use super::executor::{
-    build_execution_session, ExecutionLaneRouter, ExecutionRequest, ExecutionResponse,
-    ExecutorBoundary,
+    build_execution_session, ExecutionArtifactRef, ExecutionLaneRouter, ExecutionRequest,
+    ExecutionResponse, ExecutorBoundary,
 };
 use super::omx::{OmxExecutionOptions, OmxMode};
 
 const PROTOCOL_VERSION: u64 = 3;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 const RUN_POLL_INTERVAL_MS: u64 = 250;
+const WAIT_KEEPALIVE_INTERVAL_MS: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct OpenClawGatewayReadiness {
@@ -118,7 +119,42 @@ struct GatewayPaperclipPayload {
     agent_name: Option<String>,
     task_id: Option<String>,
     issue_id: Option<String>,
+    runtime_env: Option<HashMap<String, String>>,
+    managed_context: Option<GatewayManagedContext>,
     gateway: Option<GatewayHints>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GatewayManagedContext {
+    instructions_bundle: Option<GatewayManagedInstructionsBundle>,
+    skills: Option<Vec<GatewayManagedSkill>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GatewayManagedInstructionsBundle {
+    entry_file: Option<String>,
+    files: Option<Vec<GatewayManagedFile>>,
+    notices: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GatewayManagedSkill {
+    key: Option<String>,
+    runtime_name: Option<String>,
+    required: Option<bool>,
+    files: Option<Vec<GatewayManagedFile>>,
+    notices: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GatewayManagedFile {
+    path: Option<String>,
+    content: Option<String>,
+    truncated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -448,11 +484,24 @@ fn handle_agent_wait(
         .context("agent.wait requires runId")?;
     let timeout_ms = parsed.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut last_keepalive = Instant::now();
 
     loop {
         if let Some(existing) = find_run(&state.runs, &run_id)? {
             if existing.status.is_terminal() {
                 return write_ok_frame(socket, request_id, run_record_payload(&existing));
+            }
+
+            if last_keepalive.elapsed() >= Duration::from_millis(WAIT_KEEPALIVE_INTERVAL_MS) {
+                write_json_frame(
+                    socket,
+                    &json!({
+                        "type": "event",
+                        "event": "agent.wait.keepalive",
+                        "payload": run_record_payload(&existing),
+                    }),
+                )?;
+                last_keepalive = Instant::now();
             }
         } else {
             return write_error_frame(socket, request_id, "not_found", "run not found");
@@ -507,6 +556,7 @@ fn execute_gateway_run(
     let request = ExecutionRequest {
         group: group.clone(),
         prompt: prompt.to_string(),
+        paperclip_overlay_context: render_paperclip_managed_context(params.paperclip.as_ref()),
         messages: vec![MessageRecord {
             id: format!("paperclip:{run_id}"),
             chat_jid: identity.chat_jid.clone(),
@@ -528,6 +578,7 @@ fn execute_gateway_run(
         omx: gateway_omx_options(params, &lane),
         assistant_name: state.config.assistant_name.clone(),
         request_plane: RequestPlane::Web,
+        env: paperclip_runtime_env(params.paperclip.as_ref()),
         session,
         backend_override: None,
         task_signature: None,
@@ -542,6 +593,173 @@ fn execute_gateway_run(
     mark_run_success(&state.runs, run_id, &group.folder, &execution, lane)
 }
 
+fn paperclip_runtime_env(paperclip: Option<&GatewayPaperclipPayload>) -> BTreeMap<String, String> {
+    const ALLOWED_KEYS: &[&str] = &[
+        "PAPERCLIP_RUN_ID",
+        "PAPERCLIP_AGENT_ID",
+        "PAPERCLIP_COMPANY_ID",
+        "PAPERCLIP_API_URL",
+        "PAPERCLIP_API_KEY",
+        "PAPERCLIP_TASK_ID",
+        "PAPERCLIP_WAKE_REASON",
+        "PAPERCLIP_WAKE_COMMENT_ID",
+        "PAPERCLIP_APPROVAL_ID",
+        "PAPERCLIP_APPROVAL_STATUS",
+        "PAPERCLIP_LINKED_ISSUE_IDS",
+    ];
+
+    let mut env = BTreeMap::new();
+    let Some(runtime_env) = paperclip.and_then(|value| value.runtime_env.as_ref()) else {
+        return env;
+    };
+
+    for (key, value) in runtime_env {
+        if !ALLOWED_KEYS.iter().any(|allowed| allowed == key) {
+            continue;
+        }
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            env.insert(key.clone(), trimmed.to_string());
+        }
+    }
+    env
+}
+
+fn render_paperclip_managed_context(paperclip: Option<&GatewayPaperclipPayload>) -> Option<String> {
+    let managed = paperclip.and_then(|value| value.managed_context.as_ref())?;
+    let mut sections: Vec<String> = Vec::new();
+
+    if let Some(bundle) = managed.instructions_bundle.as_ref() {
+        let files = bundle.files.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+        let notices = bundle.notices.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+        if !files.is_empty() || !notices.is_empty() {
+            let mut section = vec!["Paperclip managed instructions bundle:".to_string()];
+            if let Some(entry_file) = bundle.entry_file.as_deref() {
+                section.push(format!("Entry file: {entry_file}"));
+            }
+            for notice in notices {
+                let trimmed = notice.trim();
+                if !trimmed.is_empty() {
+                    section.push(format!("Note: {trimmed}"));
+                }
+            }
+            for file in files {
+                if let Some(rendered) = render_managed_file(file) {
+                    section.push(rendered);
+                }
+            }
+            sections.push(section.join("\n\n"));
+        }
+    }
+
+    if let Some(skills) = managed.skills.as_ref() {
+        let mut skill_sections: Vec<String> = Vec::new();
+        for skill in skills {
+            let files = skill.files.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+            let notices = skill.notices.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+            if files.is_empty() && notices.is_empty() {
+                continue;
+            }
+            let skill_name = skill
+                .runtime_name
+                .as_deref()
+                .or(skill.key.as_deref())
+                .unwrap_or("paperclip-skill");
+            let mut section = vec![format!(
+                "Skill: {}{}",
+                skill_name,
+                if skill.required.unwrap_or(false) {
+                    " (required)"
+                } else {
+                    ""
+                }
+            )];
+            if let Some(key) = skill.key.as_deref() {
+                section.push(format!("Key: {key}"));
+            }
+            for notice in notices {
+                let trimmed = notice.trim();
+                if !trimmed.is_empty() {
+                    section.push(format!("Note: {trimmed}"));
+                }
+            }
+            for file in files {
+                if let Some(rendered) = render_managed_file(file) {
+                    section.push(rendered);
+                }
+            }
+            skill_sections.push(section.join("\n\n"));
+        }
+        if !skill_sections.is_empty() {
+            sections.push(format!(
+                "Paperclip managed skills:\n\n{}",
+                skill_sections.join("\n\n")
+            ));
+        }
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
+fn render_managed_file(file: &GatewayManagedFile) -> Option<String> {
+    let relative_path = file.path.as_deref()?.trim();
+    if relative_path.is_empty() {
+        return None;
+    }
+    let content = file.content.as_deref()?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let language = markdown_language_hint(relative_path);
+    let mut rendered = format!("File: {relative_path}\n```{language}\n{content}\n```");
+    if file.truncated.unwrap_or(false) {
+        rendered
+            .push_str("\nThis file was truncated by Paperclip before it was sent to the gateway.");
+    }
+    Some(rendered)
+}
+
+fn markdown_language_hint(relative_path: &str) -> &'static str {
+    match relative_path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "mdx" => "md",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "sh" => "bash",
+        "py" => "python",
+        "rs" => "rust",
+        "ts" | "tsx" => "ts",
+        "js" | "jsx" | "mjs" | "cjs" => "js",
+        "toml" => "toml",
+        _ => "",
+    }
+}
+
+fn extract_omx_team_status(artifacts: &[ExecutionArtifactRef]) -> Option<Value> {
+    for artifact in artifacts {
+        if artifact.kind != "team-status" {
+            continue;
+        }
+        let Some(body) = artifact.body.as_ref() else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            return Some(value);
+        }
+        return Some(Value::String(body.clone()));
+    }
+    None
+}
+
 fn mark_run_success(
     runs: &Arc<Mutex<HashMap<String, GatewayRunRecord>>>,
     run_id: &str,
@@ -550,6 +768,12 @@ fn mark_run_success(
     lane: ExecutionLane,
 ) -> Result<()> {
     let metadata = execution.metadata.as_ref();
+    let artifacts = metadata
+        .map(|value| value.artifacts.clone())
+        .unwrap_or_default();
+    let artifacts_value = serde_json::to_value(&artifacts).unwrap_or(Value::Null);
+    let omx_stats = extract_omx_team_status(&artifacts).unwrap_or(Value::Null);
+    let omx_stats_for_gateway = omx_stats.clone();
     let provider = metadata
         .and_then(|value| value.provider.clone())
         .or_else(|| metadata.and_then(|value| value.backend.clone()))
@@ -597,12 +821,17 @@ fn mark_run_success(
         "model": agent_meta.get("model").cloned().unwrap_or(Value::Null),
         "usage": agent_meta.get("usage").cloned().unwrap_or(Value::Null),
         "costUsd": agent_meta.get("costUsd").cloned().unwrap_or(Value::Null),
+        "artifacts": artifacts_value.clone(),
         "agentMeta": agent_meta,
         "foundation": {
             "routingDecision": routing_value,
             "objective": objective_value,
             "plan": plan_value,
             "sessionState": session_value,
+        },
+        "omx": {
+            "teamStatus": omx_stats,
+            "artifacts": artifacts_value,
         },
         "gateway": {
             "lane": lane.as_str(),
@@ -611,6 +840,7 @@ fn mark_run_success(
             "teamName": metadata.and_then(|value| value.team_name.clone()),
             "summary": metadata.and_then(|value| value.summary.clone()),
             "question": metadata.and_then(|value| value.question.clone()),
+            "omxStats": omx_stats_for_gateway,
         }
     });
     let mut guard = runs
@@ -857,5 +1087,36 @@ fn slug(value: &str) -> String {
         "gateway".to_string()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paperclip_runtime_env_filters_to_allowed_paperclip_keys() {
+        let payload = GatewayPaperclipPayload {
+            runtime_env: Some(HashMap::from([
+                ("PAPERCLIP_RUN_ID".to_string(), "run-1".to_string()),
+                ("PAPERCLIP_API_KEY".to_string(), "jwt-token".to_string()),
+                ("OPENAI_API_KEY".to_string(), "provider-secret".to_string()),
+                ("PAPERCLIP_TASK_ID".to_string(), "  ".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let env = paperclip_runtime_env(Some(&payload));
+
+        assert_eq!(
+            env.get("PAPERCLIP_RUN_ID").map(String::as_str),
+            Some("run-1")
+        );
+        assert_eq!(
+            env.get("PAPERCLIP_API_KEY").map(String::as_str),
+            Some("jwt-token")
+        );
+        assert!(!env.contains_key("OPENAI_API_KEY"));
+        assert!(!env.contains_key("PAPERCLIP_TASK_ID"));
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -44,6 +45,60 @@ const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const SOURCE_CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const DEFAULT_CONTAINER_CACHE_DIR: &str = "/tmp/nanoclaw-target";
 const DEFAULT_CODEX_SANDBOX: &str = "workspace-write";
+const DEFAULT_WORKERS_AI_PROXY_URL: &str = "https://lab.bybuddha.dev/paperclip.ai";
+
+fn summarize_workers_ai_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "empty response body".to_string();
+    }
+    const MAX_BYTES: usize = 1_024;
+    if trimmed.len() <= MAX_BYTES {
+        return trimmed.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}... [truncated {} bytes]",
+        &trimmed[..end],
+        trimmed.len() - end
+    )
+}
+
+fn normalize_workers_ai_proxy_url(raw_proxy_url: &str) -> Result<String> {
+    let raw = raw_proxy_url.trim();
+    let mut parsed =
+        reqwest::Url::parse(raw).context("PAPERCLIP_WORKERS_AI_PROXY_URL must be a valid URL")?;
+
+    let path_segments = parsed
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let mut normalized_segments = path_segments;
+
+    while normalized_segments.len() > 1
+        && normalized_segments.last() == Some(&"tasks")
+        && normalized_segments[normalized_segments.len() - 2] == "tasks"
+    {
+        normalized_segments.pop();
+    }
+
+    if normalized_segments.last() != Some(&"tasks") {
+        normalized_segments.push("tasks");
+    }
+
+    let next_path = if normalized_segments.is_empty() {
+        "/tasks".to_string()
+    } else {
+        format!("/{}", normalized_segments.join("/"))
+    };
+    parsed.set_path(&next_path);
+
+    Ok(parsed.to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionSession {
@@ -129,6 +184,7 @@ pub struct ExecutionRequest {
     pub omx: Option<OmxExecutionOptions>,
     pub assistant_name: String,
     pub request_plane: RequestPlane,
+    pub env: BTreeMap<String, String>,
     pub session: ExecutionSession,
     pub backend_override: Option<WorkerBackend>,
     pub task_signature: Option<TaskSignature>,
@@ -787,6 +843,7 @@ struct WorkerRequest {
     omx: Option<OmxExecutionOptions>,
     assistant_name: String,
     request_plane: RequestPlane,
+    env: BTreeMap<String, String>,
     session: ExecutionSession,
     backend_override: Option<WorkerBackend>,
     task_signature: Option<TaskSignature>,
@@ -1066,7 +1123,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                     Ok(res) => Ok(res),
                     Err(err) => {
                         let err_text = err.to_string();
-                        if err_text.contains("usage limit") || err_text.contains("usage_limit") || err_text.contains("exit status: 1") {
+                        if is_codex_usage_limit_error(&err_text) {
                             run_workers_ai_request(
                                 &request,
                                 workspace_root.as_path(),
@@ -1242,6 +1299,7 @@ fn build_worker_request(request: ExecutionRequest) -> WorkerRequest {
         omx: request.omx,
         assistant_name: request.assistant_name,
         request_plane: request.request_plane,
+        env: request.env,
         session: request.session,
         backend_override: request.backend_override,
         task_signature: request.task_signature,
@@ -1529,6 +1587,11 @@ fn default_codex_sandbox_for_request(request: &WorkerRequest) -> &'static str {
     }
 }
 
+fn is_codex_usage_limit_error(err_text: &str) -> bool {
+    let normalized = err_text.to_ascii_lowercase();
+    normalized.contains("usage limit") || normalized.contains("usage_limit")
+}
+
 fn should_use_container_lane(container_groups: &[String], group: &Group) -> bool {
     container_groups.iter().any(|value| {
         matches!(value.trim(), "*" | "all") || value == &group.folder || value == &group.jid
@@ -1586,6 +1649,7 @@ fn remoteize_request(remote_worker_root: &str, request: ExecutionRequest) -> Exe
         script: request.script,
         assistant_name: request.assistant_name,
         request_plane: request.request_plane,
+        env: request.env,
         backend_override: request.backend_override,
         task_signature: request.task_signature,
         routing_decision: request.routing_decision,
@@ -1901,6 +1965,9 @@ fn run_codex_request(
     for key in unset_keys {
         command.env_remove(key);
     }
+    for (key, value) in &request.env {
+        command.env(key, value);
+    }
     if let Some(project_environment) = project_environment.as_ref() {
         command.env(
             "NANOCLAW_PROJECT_ENVIRONMENT_ID",
@@ -2101,6 +2168,9 @@ fn run_claude_request(
     for key in &resolved_backend.unset_keys {
         command.env_remove(key);
     }
+    for (key, value) in &request.env {
+        command.env(key, value);
+    }
     if let Some(project_environment) = project_environment {
         command.env(
             "NANOCLAW_PROJECT_ENVIRONMENT_ID",
@@ -2187,7 +2257,6 @@ fn run_claude_request(
     })
 }
 
-
 fn run_workers_ai_request(
     request: &WorkerRequest,
     workspace_root: &Path,
@@ -2203,8 +2272,11 @@ fn run_workers_ai_request(
     }
 
     let proxy_url = std::env::var("PAPERCLIP_WORKERS_AI_PROXY_URL")
-        .unwrap_or_else(|_| "http://paperclip.ai/tasks".to_string());
-    let proxy_token = std::env::var("PAPERCLIP_AI_PROXY_TOKEN").ok();
+        .unwrap_or_else(|_| DEFAULT_WORKERS_AI_PROXY_URL.to_string());
+    let proxy_url = normalize_workers_ai_proxy_url(&proxy_url)?;
+    let proxy_token = std::env::var("PAPERCLIP_AI_PROXY_TOKEN")
+        .or_else(|_| std::env::var("PAPERCLIP_WORKERS_AI_PROXY_TOKEN"))
+        .ok();
     let model = std::env::var("NANOCLAW_WORKERS_AI_MODEL")
         .unwrap_or_else(|_| "@cf/meta/llama-3-8b-instruct".to_string());
 
@@ -2214,31 +2286,47 @@ fn run_workers_ai_request(
         .timeout(Duration::from_secs(60))
         .build()
         .context("failed to build reqwest client")?;
-    
-    let mut rb = client.post(&proxy_url)
-        .json(&serde_json::json!({
-            "taskType": "lightweight_planning",
-            "input": prompt,
-            "model": model,
-            "correlationId": request.invocation_id
-        }));
-    
+
+    let mut rb = client.post(&proxy_url).json(&serde_json::json!({
+        "taskType": "lightweight_planning",
+        "input": prompt,
+        "model": model,
+        "correlationId": request.invocation_id
+    }));
+
     if let Some(token) = proxy_token {
         rb = rb.header("x-paperclip-ai-proxy-token", token);
     }
 
-    let response = rb.send().context("failed to send request to Workers AI proxy")?;
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_body = response.text().unwrap_or_default();
-        bail!("Workers AI execution failed with status {}: {}", status, error_body);
+    let response = rb
+        .send()
+        .context("failed to send request to Workers AI proxy")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read Workers AI response body")?;
+
+    if !status.is_success() {
+        bail!(
+            "Workers AI execution failed with status {} for proxy URL {}: {}",
+            status,
+            proxy_url,
+            summarize_workers_ai_body(&body)
+        );
     }
 
-    let result: serde_json::Value = response.json().context("failed to parse Workers AI response")?;
+    let result: serde_json::Value = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "failed to parse Workers AI response: {}",
+            summarize_workers_ai_body(&body)
+        )
+    })?;
     if !result["ok"].as_bool().unwrap_or(false) {
         let error_msg = result["error"].as_str().unwrap_or("unknown error");
-        bail!("Workers AI proxy returned unsuccessful result: {}", error_msg);
+        bail!(
+            "Workers AI proxy returned unsuccessful result: {}",
+            error_msg
+        );
     }
 
     let text = result["text"].as_str().unwrap_or_default().to_string();
@@ -2273,7 +2361,10 @@ fn run_workers_ai_request(
             usage: None,
             cost_usd: None,
             effective_capabilities: capability_manifest,
-            project_environment_id: resolved_backend.project_environment.as_ref().map(|resolved| resolved.project.id.clone()),
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
             secret_handles: Vec::new(),
             mount_summary: Vec::new(),
             fallback_reason,
@@ -2751,14 +2842,67 @@ mod tests {
 
     use super::{
         build_execution_metadata, build_execution_session, connect_to_worker_socket,
-        default_codex_sandbox_for_request, parse_codex_jsonl, read_json,
-        run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
-        should_use_remote_lane, wait_for_worker_socket, write_json, BackendExecutionMetadata,
-        BackendExecutionResult, ContainerExecutor, DigitalOceanDevEnvironment, ExecutionLaneRouter,
-        ExecutionRequest, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
-        InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor, RustSubprocessExecutor,
-        WorkerOutcome, WorkerRequest, WorkerResponse,
+        default_codex_sandbox_for_request, is_codex_usage_limit_error, parse_codex_jsonl,
+        read_json, run_worker_daemon_with_idle_timeout, run_worker_from_paths,
+        should_use_container_lane, should_use_remote_lane, wait_for_worker_socket, write_json,
+        BackendExecutionMetadata, BackendExecutionResult, ContainerExecutor,
+        DigitalOceanDevEnvironment, ExecutionLaneRouter, ExecutionRequest, ExecutionSession,
+        ExecutionUsageSummary, ExecutorBoundary, InProcessEchoExecutor, OmxExecutor,
+        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
     };
+
+    #[test]
+    fn normalizes_workers_ai_proxy_url_to_tasks_suffix() {
+        let cases = [
+            (
+                "https://lab.bybuddha.dev/paperclip.ai",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks/",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks/tasks",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks/tasks/tasks",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            ("http://paperclip.ai", "http://paperclip.ai/tasks"),
+            ("https://lab.bybuddha.dev", "https://lab.bybuddha.dev/tasks"),
+            (
+                "https://lab.bybuddha.dev/",
+                "https://lab.bybuddha.dev/tasks",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let output = super::normalize_workers_ai_proxy_url(input).expect("should normalize");
+            assert_eq!(
+                output, expected,
+                "input {input} should normalize to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_fallback_only_accepts_usage_limit_errors() {
+        assert!(is_codex_usage_limit_error("Codex usage limit reached"));
+        assert!(is_codex_usage_limit_error("usage_limit exceeded"));
+        assert!(!is_codex_usage_limit_error(
+            "codex execution failed with exit status: 1"
+        ));
+    }
 
     #[test]
     fn echo_executor_returns_summary() {
@@ -2786,6 +2930,7 @@ mod tests {
                 omx: None,
                 assistant_name: "Andy".to_string(),
                 request_plane: RequestPlane::Web,
+                env: Default::default(),
                 session,
                 backend_override: None,
                 task_signature: None,
@@ -2823,6 +2968,7 @@ mod tests {
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session: session.clone(),
             backend_override: None,
             task_signature: None,
@@ -2884,6 +3030,7 @@ mod tests {
                 omx: None,
                 assistant_name: "Andy".to_string(),
                 request_plane: RequestPlane::Web,
+                env: Default::default(),
                 session: session.clone(),
                 backend_override: None,
                 task_signature: None,
@@ -2990,6 +3137,8 @@ mod tests {
                     omx_poll_interval_ms: 5_000,
                     openclaw_gateway_bind_host: "127.0.0.1".to_string(),
                     openclaw_gateway_public_host: "127.0.0.1".to_string(),
+                    openclaw_gateway_public_ws_url: None,
+                    openclaw_gateway_public_health_url: None,
                     openclaw_gateway_port: 0,
                     openclaw_gateway_token: String::new(),
                     openclaw_gateway_execution_lane: ExecutionLane::Host,
@@ -3097,6 +3246,8 @@ mod tests {
                     omx_poll_interval_ms: 5_000,
                     openclaw_gateway_bind_host: "127.0.0.1".to_string(),
                     openclaw_gateway_public_host: "127.0.0.1".to_string(),
+                    openclaw_gateway_public_ws_url: None,
+                    openclaw_gateway_public_health_url: None,
                     openclaw_gateway_port: 0,
                     openclaw_gateway_token: String::new(),
                     openclaw_gateway_execution_lane: ExecutionLane::Host,
@@ -3159,6 +3310,7 @@ mod tests {
             omx: Some(crate::nanoclaw::omx::OmxExecutionOptions::default()),
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session,
             backend_override: None,
             task_signature: None,
@@ -3210,6 +3362,7 @@ mod tests {
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session,
             backend_override: None,
             task_signature: None,
@@ -3270,6 +3423,7 @@ mod tests {
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session,
             backend_override: None,
             task_signature: None,

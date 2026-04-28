@@ -1,0 +1,68 @@
+name: Cloudflare Gateway Container
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional image tag. Defaults to ci-gateway-<sha>-<run_attempt>.
+        required: false
+        type: string
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/cloudflare-gateway-container.yml
+      - .dockerignore
+      - Dockerfile.openclaw-gateway
+      - Cargo.lock
+      - Cargo.toml
+      - docker/start-openclaw-gateway.sh
+      - src/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-gateway-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      WRANGLER_VERSION: 4.80.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="ci-gateway-${GITHUB_SHA::12}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "LOCAL_IMAGE=paperclip-cloudflare-nanoclawgatewaycontainer:$tag" >> "$GITHUB_ENV"
+
+      - name: Build linux/amd64 image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -f Dockerfile.openclaw-gateway \
+            -t "$LOCAL_IMAGE" \
+            --load \
+            .
+
+      - name: Push to Cloudflare managed registry
+        run: npx --yes wrangler@"$WRANGLER_VERSION" containers push "$LOCAL_IMAGE"
+
+      - name: Output image reference
+        run: |
+          echo "Pushed gateway image tag: $IMAGE_TAG"
