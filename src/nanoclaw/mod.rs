@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod dev_environment;
 pub mod executor;
+pub mod fpf_bridge;
 pub mod github_webhook;
 pub mod host_os_control;
 pub mod ingress_policy;

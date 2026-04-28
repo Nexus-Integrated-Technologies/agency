@@ -11,12 +11,14 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::foundation::{
-    CapabilityManifest, ExecutionLocation, ExecutionMountKind, ExecutionMountSummaryEntry,
-    ExecutionRunKind, ExecutionStatus, HostOsControlApprovalDecision,
+    BoundaryClaim, BoundaryClaimSource, BoundaryQuadrant, CapabilityManifest, ExecutionLocation,
+    ExecutionMountKind, ExecutionMountSummaryEntry, ExecutionRunKind, ExecutionStatus, GateAspect,
+    GateCheck, GateDecision, GateEvaluation, GateScope, HostOsControlApprovalDecision,
     HostOsControlApprovalRequestRecord, HostOsControlApprovalStatus, RequestPlane, SshEndpoint,
 };
 
 use super::db::NanoclawDb;
+use super::fpf_bridge::{derive_assurance, derive_task_signature};
 use super::remote_control::{run_remote_command, shell_quote, ssh_target_display};
 use super::security_profile::{
     build_execution_provenance_record, derive_capability_manifest, BuildExecutionProvenanceInput,
@@ -179,6 +181,7 @@ pub fn run_host_os_control_task(
         {
             existing
         } else {
+            let created_at = Utc::now().to_rfc3339();
             let record = HostOsControlApprovalRequestRecord {
                 id: format!("host-os-approval-{}", Uuid::new_v4()),
                 source_group: context.source_group.clone(),
@@ -189,9 +192,21 @@ pub fn run_host_os_control_task(
                 action_summary: action_summary.clone(),
                 action_payload: Some(serde_json::to_value(&action)?),
                 allowed_decisions: allowed_decisions.clone(),
+                boundary_claim: Some(build_host_os_boundary_claim(
+                    &context.source_group,
+                    &action_summary,
+                    &action_scope,
+                    &created_at,
+                )),
+                gate_evaluation: Some(build_host_os_gate_evaluation(
+                    &fingerprint,
+                    &action_summary,
+                    false,
+                    &created_at,
+                )),
                 status: HostOsControlApprovalStatus::Pending,
                 resolved_decision: None,
-                created_at: Utc::now().to_rfc3339(),
+                created_at,
                 resolved_at: None,
             };
             db.create_host_os_control_approval_request(&record)?;
@@ -459,6 +474,57 @@ fn summarize_action(action: &HostOsControlAction) -> String {
     }
 }
 
+fn build_host_os_boundary_claim(
+    source_group: &str,
+    action_summary: &str,
+    action_scope: &str,
+    created_at: &str,
+) -> BoundaryClaim {
+    BoundaryClaim {
+        id: format!("boundary-{}", Uuid::new_v4()),
+        provenance_id: None,
+        group_id: source_group.to_string(),
+        task_id: None,
+        quadrant: BoundaryQuadrant::Deontic,
+        source: BoundaryClaimSource::Approval,
+        content: action_summary.to_string(),
+        witness: Some(action_scope.to_string()),
+        created_at: created_at.to_string(),
+    }
+}
+
+fn build_host_os_gate_evaluation(
+    id_seed: &str,
+    action_summary: &str,
+    approved: bool,
+    created_at: &str,
+) -> GateEvaluation {
+    let outcome = if approved {
+        GateDecision::Pass
+    } else {
+        GateDecision::Block
+    };
+    GateEvaluation {
+        id: format!("gate-{id_seed}"),
+        requested_lane: None,
+        resolved_lane: None,
+        decision: outcome,
+        checks: vec![GateCheck {
+            aspect: GateAspect::Approval,
+            scope: GateScope::Locus,
+            name: "host-os-control-approval".to_string(),
+            outcome,
+            rationale: if approved {
+                "Host OS control is proceeding through the explicit approval path.".to_string()
+            } else {
+                "Host OS control requires explicit approval before execution.".to_string()
+            },
+            evidence: Some(action_summary.to_string()),
+        }],
+        created_at: created_at.to_string(),
+    }
+}
+
 fn execute_host_os_control_action(
     db: &NanoclawDb,
     action: HostOsControlAction,
@@ -471,6 +537,50 @@ fn execute_host_os_control_action(
     let allowed_decisions = allowed_decisions(&action);
     let provenance_id = format!("host-os-{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
+    let task_signature = derive_task_signature(
+        &action_summary,
+        &[],
+        match &action {
+            HostOsControlAction::ShellCommand { command, .. } => Some(command.as_str()),
+            _ => None,
+        },
+        &context.request_plane,
+        false,
+        &now,
+    );
+    let boundary_claim = approval_record
+        .and_then(|record| record.boundary_claim.clone())
+        .unwrap_or_else(|| {
+            build_host_os_boundary_claim(
+                &context.source_group,
+                &action_summary,
+                &action_scope,
+                &now,
+            )
+        });
+    let gate_evaluation = approval_record
+        .and_then(|record| record.gate_evaluation.clone())
+        .map(|mut evaluation| {
+            evaluation.decision = GateDecision::Pass;
+            evaluation.checks = vec![GateCheck {
+                aspect: GateAspect::Approval,
+                scope: GateScope::Locus,
+                name: "host-os-control-approved".to_string(),
+                outcome: GateDecision::Pass,
+                rationale: "Host OS control request was approved before execution.".to_string(),
+                evidence: Some(action_summary.clone()),
+            }];
+            evaluation
+        })
+        .unwrap_or_else(|| {
+            build_host_os_gate_evaluation(&provenance_id, &action_summary, true, &now)
+        });
+    let assurance = derive_assurance(
+        "host_os_control",
+        &task_signature,
+        Some(&gate_evaluation),
+        matches!(action, HostOsControlAction::ShellCommand { .. }),
+    );
     db.create_execution_provenance(&build_execution_provenance_record(
         BuildExecutionProvenanceInput {
             id: provenance_id.clone(),
@@ -485,6 +595,12 @@ fn execute_host_os_control_action(
             secret_handles_used: Vec::new(),
             fallback_reason: None,
             sync_scope: None,
+            task_signature: Some(task_signature),
+            boundary_claims: vec![boundary_claim],
+            gate_evaluation: Some(gate_evaluation),
+            assurance: Some(assurance),
+            symbol_carriers: Vec::new(),
+            provenance_edges: Vec::new(),
             status: ExecutionStatus::Started,
             created_at: now.clone(),
             updated_at: now,

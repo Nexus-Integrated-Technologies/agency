@@ -485,7 +485,9 @@ pub fn build_observability_blue_team_tasks(event: &ObservabilityEvent) -> Vec<Sw
         port: None,
         timeout_ms: None,
         request_plane: Some(RequestPlane::None),
+        task_signature: None,
         metadata: None,
+        required_roles: None,
         max_attempts: None,
         depends_on: None,
     }];
@@ -517,7 +519,9 @@ pub fn build_observability_blue_team_tasks(event: &ObservabilityEvent) -> Vec<Sw
             port: None,
             timeout_ms: None,
             request_plane: Some(RequestPlane::Web),
+            task_signature: None,
             metadata: None,
+            required_roles: None,
             max_attempts: None,
             depends_on: Some(vec!["triage".to_string()]),
         });
@@ -544,7 +548,9 @@ pub fn build_observability_blue_team_tasks(event: &ObservabilityEvent) -> Vec<Sw
             port: None,
             timeout_ms: None,
             request_plane: Some(RequestPlane::Web),
+            task_signature: None,
             metadata: Some(json!({ "incidentFingerprint": event.fingerprint })),
+            required_roles: None,
             max_attempts: None,
             depends_on: Some(vec!["triage".to_string()]),
         });
@@ -579,7 +585,9 @@ pub fn build_observability_blue_team_tasks(event: &ObservabilityEvent) -> Vec<Sw
         port: None,
         timeout_ms: None,
         request_plane: Some(RequestPlane::None),
+        task_signature: None,
         metadata: None,
+        required_roles: None,
         max_attempts: None,
         depends_on: Some(merge_dependencies),
     });
@@ -1866,6 +1874,8 @@ mod tests {
             omx_poll_interval_ms: 5_000,
             openclaw_gateway_bind_host: "127.0.0.1".to_string(),
             openclaw_gateway_public_host: "127.0.0.1".to_string(),
+            openclaw_gateway_public_ws_url: None,
+            openclaw_gateway_public_health_url: None,
             openclaw_gateway_port: 0,
             openclaw_gateway_token: String::new(),
             openclaw_gateway_execution_lane: ExecutionLane::Host,

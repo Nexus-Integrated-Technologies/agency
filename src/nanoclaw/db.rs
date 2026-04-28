@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::foundation::{
     ExecutionLocation, ExecutionProvenanceRecord, ExecutionRunKind, ExecutionStatus,
-    ExecutionTrustLevel, FoundationStore, Group, HostOsControlApprovalDecision,
+    ExecutionTrustLevel, FoundationStore, GateDecision, Group, HostOsControlApprovalDecision,
     HostOsControlApprovalRequestRecord, HostOsControlApprovalStatus, MessageRecord, RequestPlane,
     ScheduledTask, SwarmRequestedLane, SwarmResolvedLane, SwarmRun, SwarmRunStatus, SwarmTask,
     SwarmTaskDependency, SwarmTaskStatus, TaskContextMode, TaskRunLog, TaskScheduleType,
@@ -279,6 +279,13 @@ impl NanoclawDb {
                   secret_handles_used_json TEXT NOT NULL,
                   fallback_reason TEXT,
                   sync_scope_json TEXT,
+                  task_signature_json TEXT,
+                  boundary_claims_json TEXT NOT NULL DEFAULT '[]',
+                  gate_decision TEXT,
+                  gate_evaluation_json TEXT,
+                  assurance_json TEXT,
+                  symbol_carriers_json TEXT NOT NULL DEFAULT '[]',
+                  provenance_edges_json TEXT NOT NULL DEFAULT '[]',
                   status TEXT NOT NULL,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL,
@@ -342,6 +349,8 @@ impl NanoclawDb {
                   action_summary TEXT NOT NULL,
                   action_payload_json TEXT,
                   allowed_decisions_json TEXT NOT NULL,
+                  boundary_claim_json TEXT,
+                  gate_evaluation_json TEXT,
                   status TEXT NOT NULL,
                   resolved_decision TEXT,
                   created_at TEXT NOT NULL,
@@ -361,6 +370,8 @@ impl NanoclawDb {
                   created_by TEXT NOT NULL,
                   objective TEXT NOT NULL,
                   requested_lane TEXT NOT NULL,
+                  objective_signature_json TEXT,
+                  objective_gate_json TEXT,
                   status TEXT NOT NULL,
                   max_concurrency INTEGER NOT NULL DEFAULT 2,
                   summary TEXT,
@@ -383,6 +394,11 @@ impl NanoclawDb {
                   command TEXT,
                   requested_lane TEXT NOT NULL,
                   resolved_lane TEXT,
+                  task_signature_json TEXT,
+                  boundary_quadrant TEXT,
+                  gate_decision TEXT,
+                  gate_evaluation_json TEXT,
+                  required_roles_json TEXT NOT NULL DEFAULT '[]',
                   status TEXT NOT NULL,
                   priority INTEGER NOT NULL DEFAULT 50,
                   target_group_folder TEXT NOT NULL,
@@ -457,6 +473,38 @@ impl NanoclawDb {
         self.ensure_column("scheduled_tasks", "context_mode", "TEXT DEFAULT 'isolated'")?;
         self.ensure_column("linear_issue_threads", "closed_at", "TEXT")?;
         self.ensure_column("linear_issue_threads", "issue_identifier", "TEXT")?;
+        self.ensure_column("execution_provenance", "task_signature_json", "TEXT")?;
+        self.ensure_column(
+            "execution_provenance",
+            "boundary_claims_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        self.ensure_column("execution_provenance", "gate_decision", "TEXT")?;
+        self.ensure_column("execution_provenance", "gate_evaluation_json", "TEXT")?;
+        self.ensure_column("execution_provenance", "assurance_json", "TEXT")?;
+        self.ensure_column(
+            "execution_provenance",
+            "symbol_carriers_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        self.ensure_column(
+            "execution_provenance",
+            "provenance_edges_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        self.ensure_column("host_os_control_approvals", "boundary_claim_json", "TEXT")?;
+        self.ensure_column("host_os_control_approvals", "gate_evaluation_json", "TEXT")?;
+        self.ensure_column("swarm_runs", "objective_signature_json", "TEXT")?;
+        self.ensure_column("swarm_runs", "objective_gate_json", "TEXT")?;
+        self.ensure_column("swarm_tasks", "task_signature_json", "TEXT")?;
+        self.ensure_column("swarm_tasks", "boundary_quadrant", "TEXT")?;
+        self.ensure_column("swarm_tasks", "gate_decision", "TEXT")?;
+        self.ensure_column("swarm_tasks", "gate_evaluation_json", "TEXT")?;
+        self.ensure_column(
+            "swarm_tasks",
+            "required_roles_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         Ok(())
     }
 
@@ -536,12 +584,19 @@ impl NanoclawDb {
                   secret_handles_used_json,
                   fallback_reason,
                   sync_scope_json,
+                  task_signature_json,
+                  boundary_claims_json,
+                  gate_decision,
+                  gate_evaluation_json,
+                  assurance_json,
+                  symbol_carriers_json,
+                  provenance_edges_json,
                   status,
                   created_at,
                   updated_at,
                   completed_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
                 "#,
                 params![
                     record.id,
@@ -561,6 +616,25 @@ impl NanoclawDb {
                         .as_ref()
                         .map(serde_json::to_string)
                         .transpose()?,
+                    record
+                        .task_signature
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    serde_json::to_string(&record.boundary_claims)?,
+                    record.gate_decision.as_ref().map(GateDecision::as_str),
+                    record
+                        .gate_evaluation
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    record
+                        .assurance
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    serde_json::to_string(&record.symbol_carriers)?,
+                    serde_json::to_string(&record.provenance_edges)?,
                     record.status.as_str(),
                     record.created_at,
                     record.updated_at,
@@ -635,6 +709,13 @@ impl NanoclawDb {
                   secret_handles_used_json,
                   fallback_reason,
                   sync_scope_json,
+                  task_signature_json,
+                  boundary_claims_json,
+                  gate_decision,
+                  gate_evaluation_json,
+                  assurance_json,
+                  symbol_carriers_json,
+                  provenance_edges_json,
                   status,
                   created_at,
                   updated_at,
@@ -678,6 +759,13 @@ impl NanoclawDb {
                   secret_handles_used_json,
                   fallback_reason,
                   sync_scope_json,
+                  task_signature_json,
+                  boundary_claims_json,
+                  gate_decision,
+                  gate_evaluation_json,
+                  assurance_json,
+                  symbol_carriers_json,
+                  provenance_edges_json,
                   status,
                   created_at,
                   updated_at,
@@ -1013,12 +1101,14 @@ impl NanoclawDb {
                   action_summary,
                   action_payload_json,
                   allowed_decisions_json,
+                  boundary_claim_json,
+                  gate_evaluation_json,
                   status,
                   resolved_decision,
                   created_at,
                   resolved_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 "#,
                 params![
                     record.id,
@@ -1030,6 +1120,16 @@ impl NanoclawDb {
                     record.action_summary,
                     record.action_payload.as_ref().map(Value::to_string),
                     serde_json::to_string(&record.allowed_decisions)?,
+                    record
+                        .boundary_claim
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    record
+                        .gate_evaluation
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
                     record.status.as_str(),
                     record
                         .resolved_decision
@@ -1066,6 +1166,8 @@ impl NanoclawDb {
                   action_summary,
                   action_payload_json,
                   allowed_decisions_json,
+                  boundary_claim_json,
+                  gate_evaluation_json,
                   status,
                   resolved_decision,
                   created_at,
@@ -1108,6 +1210,8 @@ impl NanoclawDb {
                   action_summary,
                   action_payload_json,
                   allowed_decisions_json,
+                  boundary_claim_json,
+                  gate_evaluation_json,
                   status,
                   resolved_decision,
                   created_at,
@@ -1158,6 +1262,8 @@ impl NanoclawDb {
               action_summary,
               action_payload_json,
               allowed_decisions_json,
+              boundary_claim_json,
+              gate_evaluation_json,
               status,
               resolved_decision,
               created_at,
@@ -1246,6 +1352,8 @@ impl NanoclawDb {
                       created_by,
                       objective,
                       requested_lane,
+                      objective_signature_json,
+                      objective_gate_json,
                       status,
                       max_concurrency,
                       summary,
@@ -1254,7 +1362,7 @@ impl NanoclawDb {
                       updated_at,
                       completed_at
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                     "#,
                     params![
                         run.id,
@@ -1263,6 +1371,14 @@ impl NanoclawDb {
                         run.created_by,
                         run.objective,
                         run.requested_lane.as_str(),
+                        run.objective_signature
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                        run.objective_gate
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
                         run.status.as_str(),
                         run.max_concurrency,
                         run.summary,
@@ -1286,6 +1402,11 @@ impl NanoclawDb {
                           command,
                           requested_lane,
                           resolved_lane,
+                          task_signature_json,
+                          boundary_quadrant,
+                          gate_decision,
+                          gate_evaluation_json,
+                          required_roles_json,
                           status,
                           priority,
                           target_group_folder,
@@ -1310,7 +1431,7 @@ impl NanoclawDb {
                           started_at,
                           completed_at
                         )
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
                         "#,
                         params![
                             task.id,
@@ -1321,6 +1442,17 @@ impl NanoclawDb {
                             task.command,
                             task.requested_lane.as_str(),
                             task.resolved_lane.as_ref().map(SwarmResolvedLane::as_str),
+                            task.task_signature
+                                .as_ref()
+                                .map(serde_json::to_string)
+                                .transpose()?,
+                            task.boundary_quadrant.as_ref().map(|value| value.as_str()),
+                            task.gate_decision.as_ref().map(GateDecision::as_str),
+                            task.gate_evaluation
+                                .as_ref()
+                                .map(serde_json::to_string)
+                                .transpose()?,
+                            serde_json::to_string(&task.required_roles)?,
                             task.status.as_str(),
                             task.priority,
                             task.target_group_folder,
@@ -1388,6 +1520,8 @@ impl NanoclawDb {
                   created_by,
                   objective,
                   requested_lane,
+                  objective_signature_json,
+                  objective_gate_json,
                   status,
                   max_concurrency,
                   summary,
@@ -1420,6 +1554,8 @@ impl NanoclawDb {
                   created_by,
                   objective,
                   requested_lane,
+                  objective_signature_json,
+                  objective_gate_json,
                   status,
                   max_concurrency,
                   summary,
@@ -1455,6 +1591,8 @@ impl NanoclawDb {
                   created_by,
                   objective,
                   requested_lane,
+                  objective_signature_json,
+                  objective_gate_json,
                   status,
                   max_concurrency,
                   summary,
@@ -1492,6 +1630,11 @@ impl NanoclawDb {
                   command,
                   requested_lane,
                   resolved_lane,
+                  task_signature_json,
+                  boundary_quadrant,
+                  gate_decision,
+                  gate_evaluation_json,
+                  required_roles_json,
                   status,
                   priority,
                   target_group_folder,
@@ -1545,6 +1688,11 @@ impl NanoclawDb {
                   command,
                   requested_lane,
                   resolved_lane,
+                  task_signature_json,
+                  boundary_quadrant,
+                  gate_decision,
+                  gate_evaluation_json,
+                  required_roles_json,
                   status,
                   priority,
                   target_group_folder,
@@ -1624,14 +1772,16 @@ impl NanoclawDb {
                   created_by = ?3,
                   objective = ?4,
                   requested_lane = ?5,
-                  status = ?6,
-                  max_concurrency = ?7,
-                  summary = ?8,
-                  result_json = ?9,
-                  created_at = ?10,
-                  updated_at = ?11,
-                  completed_at = ?12
-                WHERE id = ?13
+                  objective_signature_json = ?6,
+                  objective_gate_json = ?7,
+                  status = ?8,
+                  max_concurrency = ?9,
+                  summary = ?10,
+                  result_json = ?11,
+                  created_at = ?12,
+                  updated_at = ?13,
+                  completed_at = ?14
+                WHERE id = ?15
                 "#,
                 params![
                     run.group_folder,
@@ -1639,6 +1789,14 @@ impl NanoclawDb {
                     run.created_by,
                     run.objective,
                     run.requested_lane.as_str(),
+                    run.objective_signature
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    run.objective_gate
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
                     run.status.as_str(),
                     run.max_concurrency,
                     run.summary,
@@ -1666,30 +1824,35 @@ impl NanoclawDb {
                   command = ?5,
                   requested_lane = ?6,
                   resolved_lane = ?7,
-                  status = ?8,
-                  priority = ?9,
-                  target_group_folder = ?10,
-                  target_chat_jid = ?11,
-                  cwd = ?12,
-                  repo = ?13,
-                  repo_path = ?14,
-                  sync = ?15,
-                  host = ?16,
-                  user = ?17,
-                  port = ?18,
-                  timeout_ms = ?19,
-                  metadata_json = ?20,
-                  result_json = ?21,
-                  error = ?22,
-                  lease_owner = ?23,
-                  lease_expires_at = ?24,
-                  attempts = ?25,
-                  max_attempts = ?26,
-                  created_at = ?27,
-                  updated_at = ?28,
-                  started_at = ?29,
-                  completed_at = ?30
-                WHERE id = ?31
+                  task_signature_json = ?8,
+                  boundary_quadrant = ?9,
+                  gate_decision = ?10,
+                  gate_evaluation_json = ?11,
+                  required_roles_json = ?12,
+                  status = ?13,
+                  priority = ?14,
+                  target_group_folder = ?15,
+                  target_chat_jid = ?16,
+                  cwd = ?17,
+                  repo = ?18,
+                  repo_path = ?19,
+                  sync = ?20,
+                  host = ?21,
+                  user = ?22,
+                  port = ?23,
+                  timeout_ms = ?24,
+                  metadata_json = ?25,
+                  result_json = ?26,
+                  error = ?27,
+                  lease_owner = ?28,
+                  lease_expires_at = ?29,
+                  attempts = ?30,
+                  max_attempts = ?31,
+                  created_at = ?32,
+                  updated_at = ?33,
+                  started_at = ?34,
+                  completed_at = ?35
+                WHERE id = ?36
                 "#,
                 params![
                     task.run_id,
@@ -1699,6 +1862,17 @@ impl NanoclawDb {
                     task.command,
                     task.requested_lane.as_str(),
                     task.resolved_lane.as_ref().map(SwarmResolvedLane::as_str),
+                    task.task_signature
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    task.boundary_quadrant.as_ref().map(|value| value.as_str()),
+                    task.gate_decision.as_ref().map(GateDecision::as_str),
+                    task.gate_evaluation
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    serde_json::to_string(&task.required_roles)?,
                     task.status.as_str(),
                     task.priority,
                     task.target_group_folder,
@@ -3510,10 +3684,19 @@ fn map_execution_provenance_row(
         secret_handles_used: parse_json_required(row.get(10)?)?,
         fallback_reason: row.get(11)?,
         sync_scope: parse_json_optional(row.get(12)?)?,
-        status: ExecutionStatus::parse(&row.get::<_, String>(13)?),
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
-        completed_at: row.get(16)?,
+        task_signature: parse_json_optional(row.get(13)?)?,
+        boundary_claims: parse_json_optional(row.get(14)?)?.unwrap_or_default(),
+        gate_decision: row
+            .get::<_, Option<String>>(15)?
+            .map(|value| GateDecision::parse(&value)),
+        gate_evaluation: parse_json_optional(row.get(16)?)?,
+        assurance: parse_json_optional(row.get(17)?)?,
+        symbol_carriers: parse_json_optional(row.get(18)?)?.unwrap_or_default(),
+        provenance_edges: parse_json_optional(row.get(19)?)?.unwrap_or_default(),
+        status: ExecutionStatus::parse(&row.get::<_, String>(20)?),
+        created_at: row.get(21)?,
+        updated_at: row.get(22)?,
+        completed_at: row.get(23)?,
     })
 }
 
@@ -3530,12 +3713,14 @@ fn map_host_os_control_approval_row(
         action_summary: row.get(6)?,
         action_payload: parse_json_value(row.get(7)?),
         allowed_decisions: parse_json_required(row.get(8)?)?,
-        status: HostOsControlApprovalStatus::parse(&row.get::<_, String>(9)?),
+        boundary_claim: parse_json_optional(row.get(9)?)?,
+        gate_evaluation: parse_json_optional(row.get(10)?)?,
+        status: HostOsControlApprovalStatus::parse(&row.get::<_, String>(11)?),
         resolved_decision: row
-            .get::<_, Option<String>>(10)?
+            .get::<_, Option<String>>(12)?
             .map(|value| HostOsControlApprovalDecision::parse(&value)),
-        created_at: row.get(11)?,
-        resolved_at: row.get(12)?,
+        created_at: row.get(13)?,
+        resolved_at: row.get(14)?,
     })
 }
 
@@ -3547,13 +3732,15 @@ fn map_swarm_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SwarmRun> {
         created_by: row.get(3)?,
         objective: row.get(4)?,
         requested_lane: SwarmRequestedLane::parse(&row.get::<_, String>(5)?),
-        status: SwarmRunStatus::parse(&row.get::<_, String>(6)?),
-        max_concurrency: row.get(7)?,
-        summary: row.get(8)?,
-        result: parse_json_value(row.get(9)?),
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        completed_at: row.get(12)?,
+        objective_signature: parse_json_optional(row.get(6)?)?,
+        objective_gate: parse_json_optional(row.get(7)?)?,
+        status: SwarmRunStatus::parse(&row.get::<_, String>(8)?),
+        max_concurrency: row.get(9)?,
+        summary: row.get(10)?,
+        result: parse_json_value(row.get(11)?),
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        completed_at: row.get(14)?,
     })
 }
 
@@ -3569,29 +3756,38 @@ fn map_swarm_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SwarmTask> {
         resolved_lane: row
             .get::<_, Option<String>>(7)?
             .map(|value| SwarmResolvedLane::parse(&value)),
-        status: SwarmTaskStatus::parse(&row.get::<_, String>(8)?),
-        priority: row.get(9)?,
-        target_group_folder: row.get(10)?,
-        target_chat_jid: row.get(11)?,
-        cwd: row.get(12)?,
-        repo: row.get(13)?,
-        repo_path: row.get(14)?,
-        sync: row.get::<_, i64>(15)? != 0,
-        host: row.get(16)?,
-        user: row.get(17)?,
-        port: row.get::<_, Option<i64>>(18)?.map(|value| value as u16),
-        timeout_ms: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
-        metadata: parse_json_value(row.get(20)?),
-        result: parse_json_value(row.get(21)?),
-        error: row.get(22)?,
-        lease_owner: row.get(23)?,
-        lease_expires_at: row.get(24)?,
-        attempts: row.get(25)?,
-        max_attempts: row.get(26)?,
-        created_at: row.get(27)?,
-        updated_at: row.get(28)?,
-        started_at: row.get(29)?,
-        completed_at: row.get(30)?,
+        task_signature: parse_json_optional(row.get(8)?)?,
+        boundary_quadrant: row
+            .get::<_, Option<String>>(9)?
+            .map(|value| crate::foundation::BoundaryQuadrant::parse(&value)),
+        gate_decision: row
+            .get::<_, Option<String>>(10)?
+            .map(|value| GateDecision::parse(&value)),
+        gate_evaluation: parse_json_optional(row.get(11)?)?,
+        required_roles: parse_json_optional(row.get(12)?)?.unwrap_or_default(),
+        status: SwarmTaskStatus::parse(&row.get::<_, String>(13)?),
+        priority: row.get(14)?,
+        target_group_folder: row.get(15)?,
+        target_chat_jid: row.get(16)?,
+        cwd: row.get(17)?,
+        repo: row.get(18)?,
+        repo_path: row.get(19)?,
+        sync: row.get::<_, i64>(20)? != 0,
+        host: row.get(21)?,
+        user: row.get(22)?,
+        port: row.get::<_, Option<i64>>(23)?.map(|value| value as u16),
+        timeout_ms: row.get::<_, Option<i64>>(24)?.map(|value| value as u64),
+        metadata: parse_json_value(row.get(25)?),
+        result: parse_json_value(row.get(26)?),
+        error: row.get(27)?,
+        lease_owner: row.get(28)?,
+        lease_expires_at: row.get(29)?,
+        attempts: row.get(30)?,
+        max_attempts: row.get(31)?,
+        created_at: row.get(32)?,
+        updated_at: row.get(33)?,
+        started_at: row.get(34)?,
+        completed_at: row.get(35)?,
     })
 }
 
@@ -3962,6 +4158,13 @@ mod tests {
             secret_handles_used: vec!["env-key:OPENAI_API_KEY".to_string()],
             fallback_reason: None,
             sync_scope: None,
+            task_signature: None,
+            boundary_claims: Vec::new(),
+            gate_decision: None,
+            gate_evaluation: None,
+            assurance: None,
+            symbol_carriers: Vec::new(),
+            provenance_edges: Vec::new(),
             status: ExecutionStatus::Success,
             created_at: "2026-04-06T08:00:00Z".to_string(),
             updated_at: "2026-04-06T08:00:00Z".to_string(),
@@ -3993,6 +4196,8 @@ mod tests {
                 HostOsControlApprovalDecision::Once,
                 HostOsControlApprovalDecision::Deny,
             ],
+            boundary_claim: None,
+            gate_evaluation: None,
             status: HostOsControlApprovalStatus::Pending,
             resolved_decision: None,
             created_at: "2026-04-06T08:00:00Z".to_string(),
@@ -4036,6 +4241,8 @@ mod tests {
             created_by: "tester".to_string(),
             objective: "Ship the change".to_string(),
             requested_lane: SwarmRequestedLane::Auto,
+            objective_signature: None,
+            objective_gate: None,
             status: SwarmRunStatus::Pending,
             max_concurrency: 2,
             summary: None,
@@ -4053,6 +4260,11 @@ mod tests {
             command: None,
             requested_lane: SwarmRequestedLane::Agent,
             resolved_lane: None,
+            task_signature: None,
+            boundary_quadrant: None,
+            gate_decision: None,
+            gate_evaluation: None,
+            required_roles: Vec::new(),
             status: SwarmTaskStatus::Completed,
             priority: 100,
             target_group_folder: "main".to_string(),
@@ -4086,6 +4298,11 @@ mod tests {
             command: None,
             requested_lane: SwarmRequestedLane::Agent,
             resolved_lane: None,
+            task_signature: None,
+            boundary_quadrant: None,
+            gate_decision: None,
+            gate_evaluation: None,
+            required_roles: Vec::new(),
             status: SwarmTaskStatus::Pending,
             priority: 90,
             target_group_folder: "main".to_string(),
@@ -4148,6 +4365,8 @@ mod tests {
             created_by: "tester".to_string(),
             objective: "Execute commands".to_string(),
             requested_lane: SwarmRequestedLane::Host,
+            objective_signature: None,
+            objective_gate: None,
             status: SwarmRunStatus::Pending,
             max_concurrency: 1,
             summary: None,
@@ -4165,6 +4384,11 @@ mod tests {
             command: Some("printf ok".to_string()),
             requested_lane: SwarmRequestedLane::Host,
             resolved_lane: None,
+            task_signature: None,
+            boundary_quadrant: None,
+            gate_decision: None,
+            gate_evaluation: None,
+            required_roles: Vec::new(),
             status: SwarmTaskStatus::Ready,
             priority: 50,
             target_group_folder: "main".to_string(),
