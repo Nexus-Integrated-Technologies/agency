@@ -13,10 +13,12 @@ RUN apt-get update \
     ca-certificates \
     curl \
     git \
+    bash \
     python3 \
     ripgrep \
+    tmux \
   && rm -rf /var/lib/apt/lists/* \
-  && npm install --global --omit=dev @openai/codex@latest
+  && npm install --global --omit=dev @openai/codex@latest oh-my-codex@0.15.0
 
 ENV HOME=/nanoclaw
 ENV NANOCLAW_HOME=/nanoclaw
@@ -28,12 +30,17 @@ ENV NANOCLAW_EXECUTION_LANE=host
 ENV NANOCLAW_WORKER_BACKEND=codex
 ENV NANOCLAW_CODEX_BIN=codex
 ENV NANOCLAW_CODEX_SANDBOX=danger-full-access
+ENV NANOCLAW_OMX_RUNNER_LOCATION=local
+ENV NANOCLAW_OMX_RUNNER_PATH=/usr/local/bin/omx-paperclip-runner
+ENV NANOCLAW_OMX_STATE_ROOT=/nanoclaw/.nanoclaw-omx
+ENV NANOCLAW_OMX_CALLBACK_URL=""
 
 COPY --from=build /src/target/release/nanoclaw /usr/local/bin/nanoclaw
 COPY docker/start-openclaw-gateway.sh /usr/local/bin/start-openclaw-gateway.sh
+COPY docker/omx-paperclip-runner.mjs /usr/local/bin/omx-paperclip-runner
 
-RUN chmod +x /usr/local/bin/nanoclaw /usr/local/bin/start-openclaw-gateway.sh \
-  && mkdir -p /nanoclaw/.codex /nanoclaw/data /nanoclaw/groups /nanoclaw/store
+RUN chmod +x /usr/local/bin/nanoclaw /usr/local/bin/start-openclaw-gateway.sh /usr/local/bin/omx-paperclip-runner \
+  && mkdir -p /nanoclaw/.codex /nanoclaw/.nanoclaw-omx /nanoclaw/data /nanoclaw/groups /nanoclaw/store
 
 WORKDIR /nanoclaw
 EXPOSE 18789

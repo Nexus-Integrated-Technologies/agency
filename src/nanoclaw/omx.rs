@@ -1,5 +1,8 @@
 use std::convert::Infallible;
+use std::env;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -7,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::foundation::{
-    ArtifactKind, ArtifactRecord, ArtifactStore, EventLog, ExecutionBoundary,
-    ExecutionBoundaryKind, ExecutionContext, FoundationEvent, MessageRecord,
+    ArtifactKind, ArtifactRecord, ArtifactStore, DevelopmentEnvironmentKind, EventLog,
+    ExecutionBoundary, ExecutionBoundaryKind, ExecutionContext, FoundationEvent, MessageRecord,
 };
 
 use super::app::NanoclawApp;
@@ -325,10 +328,49 @@ pub struct OmxRunnerClient {
     dev_environment: DigitalOceanDevEnvironment,
     runner_path: String,
     repo_runner_path: String,
+    runner_location: OmxRunnerLocation,
     callback_url: String,
     callback_token: String,
     default_mode: OmxMode,
     default_max_workers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OmxRunnerLocation {
+    Local,
+    RemoteSsh,
+}
+
+impl OmxRunnerLocation {
+    fn from_config(config: &NanoclawConfig) -> Self {
+        if let Ok(value) = env::var("NANOCLAW_OMX_RUNNER_LOCATION")
+            .or_else(|_| env::var("NANOCLAW_OMX_RUNNER_MODE"))
+        {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "local" | "host" | "container" | "cloudflare" => return Self::Local,
+                "remote" | "remote_ssh" | "remote-ssh" | "ssh" | "droplet" | "digitalocean" => {
+                    return Self::RemoteSsh;
+                }
+                _ => {}
+            }
+        }
+
+        if matches!(
+            config.development_environment.kind,
+            DevelopmentEnvironmentKind::Local
+        ) {
+            Self::Local
+        } else {
+            Self::RemoteSsh
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::RemoteSsh => "remote_ssh",
+        }
+    }
 }
 
 impl OmxRunnerClient {
@@ -337,6 +379,7 @@ impl OmxRunnerClient {
             dev_environment: DigitalOceanDevEnvironment::from_config(config),
             runner_path: config.omx_runner_path.clone(),
             repo_runner_path: "deploy/omx-paperclip/omx-paperclip-runner.mjs".to_string(),
+            runner_location: OmxRunnerLocation::from_config(config),
             callback_url: config.omx_callback_url.clone(),
             callback_token: config.omx_callback_token.clone(),
             default_mode: OmxMode::parse(&config.omx_default_mode),
@@ -353,8 +396,7 @@ impl OmxRunnerClient {
         cwd: &Path,
         options: Option<&OmxExecutionOptions>,
     ) -> Result<OmxRunnerResponse> {
-        self.dev_environment.sync_project()?;
-        let remote_cwd = self.sync_remote_group_workspace(group_folder, cwd)?;
+        let runner_cwd = self.prepare_group_workspace(group_folder, cwd, true)?;
         let request = OmxRunnerRequest {
             command: OmxRunnerCommand::Invoke,
             session_id: None,
@@ -370,7 +412,7 @@ impl OmxRunnerClient {
                 .or(Some(self.default_max_workers)),
             prompt: Some(prompt.to_string()),
             reply: None,
-            cwd: remote_cwd,
+            cwd: runner_cwd,
             callback_url: non_empty_string(Some(self.callback_url.clone())),
             callback_token: non_empty_string(Some(self.callback_token.clone())),
             metadata: None,
@@ -424,7 +466,7 @@ impl OmxRunnerClient {
         cwd: &Path,
         reply: &str,
     ) -> Result<OmxRunnerResponse> {
-        let remote_cwd = self.sync_remote_group_workspace(group_folder, cwd)?;
+        let runner_cwd = self.prepare_group_workspace(group_folder, cwd, false)?;
         self.run(OmxRunnerRequest {
             command: OmxRunnerCommand::Inject,
             session_id: Some(session_id.to_string()),
@@ -436,11 +478,28 @@ impl OmxRunnerClient {
             max_workers: None,
             prompt: None,
             reply: Some(reply.to_string()),
-            cwd: remote_cwd,
+            cwd: runner_cwd,
             callback_url: non_empty_string(Some(self.callback_url.clone())),
             callback_token: non_empty_string(Some(self.callback_token.clone())),
             metadata: None,
         })
+    }
+
+    fn prepare_group_workspace(
+        &self,
+        group_folder: &str,
+        cwd: &Path,
+        sync_project: bool,
+    ) -> Result<String> {
+        match self.runner_location {
+            OmxRunnerLocation::Local => Ok(cwd.display().to_string()),
+            OmxRunnerLocation::RemoteSsh => {
+                if sync_project {
+                    self.dev_environment.sync_project()?;
+                }
+                self.sync_remote_group_workspace(group_folder, cwd)
+            }
+        }
     }
 
     fn sync_remote_group_workspace(&self, group_folder: &str, cwd: &Path) -> Result<String> {
@@ -458,13 +517,68 @@ impl OmxRunnerClient {
             subcommand = request.command.as_str(),
         );
         let stdin = serde_json::to_vec(&request).context("failed to encode OMX runner request")?;
-        let result = self.dev_environment.exec_with_stdin(&command, &stdin)?;
-        let response = serde_json::from_str::<OmxRunnerResponse>(&result.stdout)
+        let stdout = match self.runner_location {
+            OmxRunnerLocation::Local => self.exec_local_runner(&command, &stdin)?,
+            OmxRunnerLocation::RemoteSsh => {
+                self.dev_environment
+                    .exec_with_stdin(&command, &stdin)?
+                    .stdout
+            }
+        };
+        let response = serde_json::from_str::<OmxRunnerResponse>(&stdout)
             .context("failed to decode OMX runner response")?;
         if !response.ok {
             bail!("OMX runner reported failure: {}", response.summary);
         }
         Ok(response)
+    }
+
+    fn exec_local_runner(&self, command: &str, stdin: &[u8]) -> Result<String> {
+        let mut process = Command::new("/bin/sh")
+            .arg("-lc")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start local OMX runner command")?;
+        process
+            .stdin
+            .as_mut()
+            .context("local OMX runner stdin was not available")?
+            .write_all(stdin)
+            .context("failed to write local OMX runner stdin")?;
+        let output = process
+            .wait_with_output()
+            .context("failed to wait for local OMX runner command")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!(
+                "local OMX runner command failed with status {}{}",
+                output.status,
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    #[cfg(test)]
+    fn local_for_test(runner_path: String) -> Self {
+        let config = NanoclawConfig::from_env();
+        Self {
+            dev_environment: DigitalOceanDevEnvironment::from_config(&config),
+            runner_path,
+            repo_runner_path: "deploy/omx-paperclip/omx-paperclip-runner.mjs".to_string(),
+            runner_location: OmxRunnerLocation::Local,
+            callback_url: String::new(),
+            callback_token: String::new(),
+            default_mode: OmxMode::Exec,
+            default_max_workers: 1,
+        }
     }
 }
 
@@ -476,6 +590,7 @@ pub fn describe_omx_readiness(config: &NanoclawConfig) -> Value {
         "method": "POST",
         "tokenRequired": !config.omx_callback_token.trim().is_empty(),
         "runnerPath": config.omx_runner_path,
+        "runnerLocation": OmxRunnerLocation::from_config(config).as_str(),
         "callbackUrl": config.omx_callback_url,
     })
 }
@@ -742,6 +857,35 @@ pub fn parse_omx_webhook_payload(body: &[u8]) -> Result<OmxWebhookPayload> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_runner_executes_without_remote_ssh_environment() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let runner = temp.path().join("omx-paperclip-runner");
+        std::fs::write(
+            &runner,
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"ok":true,"session_id":"local-test","status":"completed","tmux_session":null,"team_name":null,"summary":"local runner ok","question":null,"log_path":null,"log_body":null,"artifacts":[],"external_run_id":null,"mode":"exec","workspace_root":"/workspace"}'
+"#,
+        )
+        .expect("write runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod runner");
+        }
+
+        let client = OmxRunnerClient::local_for_test(runner.display().to_string());
+        let response = client
+            .invoke("group-1", None, None, "run locally", temp.path(), None)
+            .expect("local runner should execute");
+
+        assert_eq!(response.session_id, "local-test");
+        assert_eq!(response.status, OmxSessionStatus::Completed);
+        assert_eq!(response.summary, "local runner ok");
+    }
 
     #[test]
     fn omx_enums_round_trip_as_strings() {
