@@ -20,7 +20,7 @@ use super::executor::{
     build_execution_session, ExecutionArtifactRef, ExecutionLaneRouter, ExecutionRequest,
     ExecutionResponse, ExecutorBoundary,
 };
-use super::omx::{OmxExecutionOptions, OmxMode};
+use super::omx::{describe_omx_readiness, OmxExecutionOptions, OmxMode};
 
 const PROTOCOL_VERSION: u64 = 3;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
@@ -1062,6 +1062,7 @@ fn respond_http_health(stream: &mut TcpStream, config: &NanoclawConfig) -> Resul
         "service": "nanoclaw-openclaw-gateway",
         "websocketUrl": config.openclaw_gateway_public_ws_url(),
         "executionLane": config.openclaw_gateway_execution_lane.as_str(),
+        "omx": describe_omx_readiness(config),
     }))?;
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
