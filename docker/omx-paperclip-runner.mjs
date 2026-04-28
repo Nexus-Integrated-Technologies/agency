@@ -11,8 +11,8 @@ const STATE_ROOT =
   process.env.NANOCLAW_OMX_STATE_ROOT || path.join(os.homedir(), ".nanoclaw-omx");
 const POLL_INTERVAL_MS = parseInteger(process.env.NANOCLAW_OMX_POLL_MS, 5_000);
 const IDLE_THRESHOLD_MS = parseInteger(process.env.NANOCLAW_OMX_IDLE_MS, 120_000);
-const TEAM_AWAIT_TIMEOUT_MS = parseInteger(
-  process.env.NANOCLAW_OMX_TEAM_AWAIT_TIMEOUT_MS,
+const TEAM_MONITOR_TIMEOUT_MS = parseInteger(
+  process.env.NANOCLAW_OMX_TEAM_MONITOR_TIMEOUT_MS,
   540_000
 );
 
@@ -225,6 +225,20 @@ async function watchSession(sessionId) {
     }
 
     await maybeRefreshTeamName(state);
+    const missingTeamTerminal = await maybeFinalizeMissingTeam(state);
+    if (missingTeamTerminal) {
+      await writeState(statePath, state);
+      await emitCallback(state, "session-end");
+      return;
+    }
+
+    const teamTerminal = await maybeRefreshTeamStatus(state);
+    if (teamTerminal) {
+      await writeState(statePath, state);
+      await emitCallback(state, "session-end");
+      return;
+    }
+
     const alive = tmuxHasSession(state.tmux_session);
     const currentSize = fileSize(state.log_path);
     if (currentSize > lastSize) {
@@ -257,7 +271,7 @@ async function watchSession(sessionId) {
       }
     }
 
-    if (!alive) {
+    if (!alive && state.mode !== "team") {
       return;
     }
     await sleep(POLL_INTERVAL_MS);
@@ -290,39 +304,26 @@ async function finalizeSession(sessionId, exitCode) {
 function buildRunScript(state) {
   const runnerPath = path.resolve(process.argv[1]);
   const omxCommand = buildOmxCommand(state);
+  const logPath = shellQuote(state.log_path);
+  const shouldFinalizeInScript = state.mode !== "team";
   const lines = [
     "#!/usr/bin/env bash",
     "set +e",
     'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"',
     `cd ${shellQuote(state.cwd)}`,
-    ...buildExecutionLines(state, omxCommand),
+    `${omxCommand} >> ${logPath} 2>&1`,
     "status=$?",
-    `printf '\\n[omx-runner-exit] %s\\n' \"$status\" >> ${shellQuote(state.log_path)}`,
-    `${shellQuote(process.execPath)} ${shellQuote(runnerPath)} finalize ${shellQuote(
-      state.session_id
-    )} \"$status\"`,
+    `printf '\\n[omx-runner-exit] %s\\n' \"$status\" >> ${logPath}`,
+    ...(shouldFinalizeInScript
+      ? [
+          `${shellQuote(process.execPath)} ${shellQuote(runnerPath)} finalize ${shellQuote(
+            state.session_id
+          )} \"$status\"`,
+        ]
+      : []),
     "exit \"$status\"",
   ];
   return `${lines.join("\n")}\n`;
-}
-
-function buildExecutionLines(state, omxCommand) {
-  const logPath = shellQuote(state.log_path);
-  if (state.mode !== "team") {
-    return [`${omxCommand} >> ${logPath} 2>&1`];
-  }
-  return [
-    `${omxCommand} >> ${logPath} 2>&1`,
-    "status=$?",
-    'if [ "$status" -eq 0 ]; then',
-    `  team_name="$(grep -m 1 '^Team started:' ${logPath} | sed 's/^Team started:[[:space:]]*//')"`,
-    '  if [ -n "$team_name" ]; then',
-    `    printf '\\n[omx-runner-await] %s\\n' "$team_name" >> ${logPath}`,
-    `    omx team await "$team_name" --timeout-ms ${TEAM_AWAIT_TIMEOUT_MS} --json >> ${logPath} 2>&1`,
-    "    status=$?",
-    "  fi",
-    "fi",
-  ];
 }
 
 function buildOmxCommand(state) {
@@ -345,7 +346,22 @@ function buildOmxCommand(state) {
 
 async function refreshRuntimeState(state) {
   await maybeRefreshTeamName(state);
-  if (!tmuxHasSession(state.tmux_session) && !isTerminalStatus(state.status)) {
+  const missingTeamTerminal = await maybeFinalizeMissingTeam(state);
+  if (missingTeamTerminal) {
+    await writeState(stateFile(state.session_id), state);
+    return;
+  }
+
+  const teamTerminal = await maybeRefreshTeamStatus(state);
+  if (teamTerminal) {
+    await writeState(stateFile(state.session_id), state);
+    return;
+  }
+  if (
+    state.mode !== "team" &&
+    !tmuxHasSession(state.tmux_session) &&
+    !isTerminalStatus(state.status)
+  ) {
     const exitCode = readExitCode(state.log_path);
     await finalizeSession(state.session_id, exitCode ?? 0);
     const refreshed = await readState(state.session_id);
@@ -373,10 +389,111 @@ async function maybeRefreshTeamName(state) {
   if (state.mode !== "team" || state.team_name) {
     return;
   }
+  const fromLog = detectTeamNameFromLog(state.log_path);
+  if (fromLog) {
+    state.team_name = fromLog;
+    return;
+  }
   const detected = await detectTeamName(state.cwd, state.created_at);
   if (detected) {
     state.team_name = detected;
   }
+}
+
+async function maybeFinalizeMissingTeam(state) {
+  if (
+    state.mode !== "team" ||
+    state.team_name ||
+    isTerminalStatus(state.status) ||
+    tmuxHasSession(state.tmux_session)
+  ) {
+    return false;
+  }
+
+  const exitCode = readExitCode(state.log_path);
+  state.status = "failed";
+  state.summary =
+    exitCode === null
+      ? "OMX team launcher exited before a team was available."
+      : `OMX team launcher exited with status ${exitCode} before a team was available.`;
+  state.question = null;
+  state.updated_at = new Date().toISOString();
+  state.completed_at = state.updated_at;
+  return true;
+}
+
+async function maybeRefreshTeamStatus(state) {
+  if (state.mode !== "team" || !state.team_name || isTerminalStatus(state.status)) {
+    return false;
+  }
+
+  const result = runNoThrow(
+    "omx",
+    ["team", "status", state.team_name, "--json"],
+    { cwd: state.cwd, encoding: "utf8" }
+  );
+  if (result.ok && result.stdout.trim()) {
+    state.team_status_json = result.stdout.trim();
+    state.summary = summarizeJsonStatus(result.stdout, state.summary);
+    const status = parseTeamStatus(result.stdout);
+    if (status.terminal) {
+      state.status = status.failed ? "failed" : "completed";
+      state.summary = status.summary || state.summary || "OMX team completed.";
+      state.question = null;
+      state.updated_at = new Date().toISOString();
+      state.completed_at = state.updated_at;
+      return true;
+    }
+  }
+
+  if (Date.now() - (Date.parse(state.created_at) || Date.now()) >= TEAM_MONITOR_TIMEOUT_MS) {
+    state.status = "failed";
+    state.summary = `OMX team did not finish within ${TEAM_MONITOR_TIMEOUT_MS}ms.`;
+    state.updated_at = new Date().toISOString();
+    state.completed_at = state.updated_at;
+    return true;
+  }
+
+  return false;
+}
+
+function parseTeamStatus(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    const tasks = parsed && typeof parsed === "object" ? parsed.tasks : null;
+    if (!tasks || typeof tasks !== "object") {
+      return { terminal: false, failed: false, summary: null };
+    }
+    const total = numberOrZero(tasks.total);
+    const pending = numberOrZero(tasks.pending);
+    const blocked = numberOrZero(tasks.blocked);
+    const inProgress = numberOrZero(tasks.in_progress);
+    const failed = numberOrZero(tasks.failed);
+    const completed = numberOrZero(tasks.completed);
+    if (total > 0 && pending + blocked + inProgress === 0 && completed + failed >= total) {
+      return {
+        terminal: true,
+        failed: failed > 0,
+        summary:
+          failed > 0
+            ? `OMX team finished with ${failed} failed task(s).`
+            : `OMX team completed ${completed} task(s).`,
+      };
+    }
+  } catch {
+    return { terminal: false, failed: false, summary: null };
+  }
+  return { terminal: false, failed: false, summary: null };
+}
+
+function numberOrZero(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function detectTeamNameFromLog(filePath) {
+  const match = safeReadFile(filePath).match(/^Team started:\s*(.+)$/m);
+  return match ? match[1].trim() : null;
 }
 
 async function detectTeamName(cwd, createdAt) {

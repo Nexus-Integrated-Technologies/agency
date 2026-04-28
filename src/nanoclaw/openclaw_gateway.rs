@@ -22,7 +22,8 @@ use super::executor::{
 };
 use super::omx::{
     apply_omx_webhook_payload, describe_omx_readiness, is_valid_omx_token,
-    parse_omx_webhook_payload, OmxExecutionOptions, OmxMode, OmxRunnerClient,
+    parse_omx_webhook_payload, OmxArtifactRef, OmxExecutionOptions, OmxMode, OmxRunnerClient,
+    OmxWebhookPayload,
 };
 
 const PROTOCOL_VERSION: u64 = 3;
@@ -784,6 +785,11 @@ fn mark_run_success(
     let artifacts_value = serde_json::to_value(&artifacts).unwrap_or(Value::Null);
     let omx_stats = extract_omx_team_status(&artifacts).unwrap_or(Value::Null);
     let omx_stats_for_gateway = omx_stats.clone();
+    let gateway_status = classify_gateway_execution_status(
+        &lane,
+        metadata.and_then(|value| value.status.as_deref()),
+        &omx_stats,
+    );
     let provider = metadata
         .and_then(|value| value.provider.clone())
         .or_else(|| metadata.and_then(|value| value.backend.clone()))
@@ -859,19 +865,100 @@ fn mark_run_success(
     let existing = guard
         .get_mut(run_id)
         .context("gateway run disappeared before completion")?;
-    existing.status = GatewayRunStatus::Ok;
+    existing.status = gateway_status;
     existing.updated_at = Utc::now().to_rfc3339();
     existing.session_id = Some(execution.session_id.clone());
     existing.group_folder = Some(group_folder.to_string());
-    existing.summary = Some(
-        metadata
-            .and_then(|value| value.summary.clone())
-            .unwrap_or_else(|| execution.text.clone()),
-    );
+    let summary = metadata
+        .and_then(|value| value.summary.clone())
+        .unwrap_or_else(|| execution.text.clone());
+    existing.summary = Some(summary.clone());
     existing.result_text = Some(execution.text.clone());
     existing.metadata = Some(result_meta);
-    existing.error = None;
+    existing.error = matches!(gateway_status, GatewayRunStatus::Error).then_some(summary);
     Ok(())
+}
+
+fn classify_gateway_execution_status(
+    lane: &ExecutionLane,
+    execution_status: Option<&str>,
+    omx_team_status: &Value,
+) -> GatewayRunStatus {
+    if !matches!(lane, ExecutionLane::Omx) {
+        return GatewayRunStatus::Ok;
+    }
+
+    if is_failure_status(execution_status) {
+        return GatewayRunStatus::Error;
+    }
+    if let Some(team_status) = classify_omx_team_status(omx_team_status) {
+        return team_status;
+    }
+    if is_success_status(execution_status) {
+        return GatewayRunStatus::Ok;
+    }
+
+    // OMX launches are asynchronous. A non-terminal runner response means the
+    // Paperclip run must keep waiting for the local callback watcher.
+    GatewayRunStatus::Running
+}
+
+fn is_failure_status(status: Option<&str>) -> bool {
+    matches!(
+        normalize_status(status).as_deref(),
+        Some("failed" | "error" | "stopped" | "cancelled" | "canceled")
+    )
+}
+
+fn is_success_status(status: Option<&str>) -> bool {
+    matches!(
+        normalize_status(status).as_deref(),
+        Some("completed" | "success" | "ok")
+    )
+}
+
+fn normalize_status(status: Option<&str>) -> Option<String> {
+    let normalized = status?.trim().to_ascii_lowercase().replace('-', "_");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn classify_omx_team_status(team_status: &Value) -> Option<GatewayRunStatus> {
+    let tasks = team_status.get("tasks")?.as_object()?;
+    let total = value_count(tasks.get("total"));
+    if total == 0 {
+        return None;
+    }
+
+    let pending = value_count(tasks.get("pending"));
+    let blocked = value_count(tasks.get("blocked"));
+    let in_progress = value_count(tasks.get("in_progress"));
+    if pending + blocked + in_progress > 0 {
+        return Some(GatewayRunStatus::Running);
+    }
+
+    let failed = value_count(tasks.get("failed"));
+    let completed = value_count(tasks.get("completed"));
+    if completed + failed >= total {
+        if failed > 0 {
+            Some(GatewayRunStatus::Error)
+        } else {
+            Some(GatewayRunStatus::Ok)
+        }
+    } else {
+        Some(GatewayRunStatus::Running)
+    }
+}
+
+fn value_count(value: Option<&Value>) -> u64 {
+    match value {
+        Some(Value::Number(number)) => number.as_u64().unwrap_or(0),
+        Some(Value::String(text)) => text.trim().parse::<u64>().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn mark_run_error(
@@ -1287,10 +1374,100 @@ fn respond_http_omx_webhook(
         return respond_http_json(stream, 401, json!({ "error": "unauthorized" }), false);
     }
 
+    update_gateway_run_from_omx_webhook(&state.runs, &payload)?;
+
     let mut app = NanoclawApp::open(state.config.clone())?;
     let mut channel = None;
     let body = apply_omx_webhook_payload(&mut app, &mut channel, payload)?;
     respond_http_json(stream, 200, body, false)
+}
+
+fn update_gateway_run_from_omx_webhook(
+    runs: &Arc<Mutex<HashMap<String, GatewayRunRecord>>>,
+    payload: &OmxWebhookPayload,
+) -> Result<()> {
+    let Some(run_id) = payload
+        .external_run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let mut guard = runs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("failed to lock gateway run state"))?;
+    let Some(existing) = guard.get_mut(run_id) else {
+        return Ok(());
+    };
+
+    let status = payload.status.as_str();
+    let terminal = payload.status.is_terminal();
+    let failed = matches!(status, "failed" | "stopped");
+    let summary = payload
+        .summary
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("OMX session {status}."));
+    let artifacts_value = serde_json::to_value(&payload.artifacts).unwrap_or(Value::Null);
+    let team_status = extract_omx_artifact_team_status(&payload.artifacts).unwrap_or(Value::Null);
+
+    existing.status = if terminal {
+        if failed {
+            GatewayRunStatus::Error
+        } else {
+            GatewayRunStatus::Ok
+        }
+    } else {
+        GatewayRunStatus::Running
+    };
+    existing.updated_at = Utc::now().to_rfc3339();
+    existing.session_id = Some(payload.session_id.clone());
+    existing.group_folder = Some(payload.group_folder.clone());
+    existing.summary = Some(summary.clone());
+    existing.result_text = Some(summary.clone());
+    existing.metadata = Some(json!({
+        "provider": "omx",
+        "artifacts": artifacts_value,
+        "omx": {
+            "teamStatus": team_status,
+            "artifacts": artifacts_value,
+        },
+        "gateway": {
+            "lane": existing.lane,
+            "sessionId": payload.session_id,
+            "tmuxSession": payload.tmux_session,
+            "teamName": payload.team_name,
+            "summary": summary,
+            "question": payload.question,
+            "omxStatus": status,
+        }
+    }));
+    existing.error = failed.then(|| {
+        payload
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("OMX session {status}."))
+    });
+
+    Ok(())
+}
+
+fn extract_omx_artifact_team_status(artifacts: &[OmxArtifactRef]) -> Option<Value> {
+    for artifact in artifacts {
+        if artifact.kind != "team-status" {
+            continue;
+        }
+        let Some(body) = artifact.body.as_ref() else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            return Some(value);
+        }
+        return Some(Value::String(body.clone()));
+    }
+    None
 }
 
 fn is_authorized_http_gateway_request(config: &NanoclawConfig, request: &PlainHttpRequest) -> bool {
