@@ -15,6 +15,7 @@ RUN apt-get update \
     git \
     bash \
     python3 \
+    procps \
     ripgrep \
     tmux \
   && rm -rf /var/lib/apt/lists/* \
