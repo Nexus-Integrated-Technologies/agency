@@ -289,6 +289,7 @@ function buildRunScript(state) {
   const lines = [
     "#!/usr/bin/env bash",
     "set +e",
+    'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"',
     `cd ${shellQuote(state.cwd)}`,
     `${omxCommand} >> ${shellQuote(state.log_path)} 2>&1`,
     "status=$?",
