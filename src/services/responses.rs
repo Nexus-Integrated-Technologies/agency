@@ -11,6 +11,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use crate::server::{AppState, ServerError};
 
+const DEFAULT_RESPONSE_MODEL: &str = "rust_agency_sovereign";
+
 #[derive(Deserialize)]
 pub struct CreateResponseRequest {
     pub model: Option<String>,
@@ -50,6 +52,36 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+fn latest_message(messages: &[Message]) -> Result<String, ServerError> {
+    messages
+        .last()
+        .map(|m| m.content.clone())
+        .ok_or_else(|| anyhow::anyhow!("No messages provided").into())
+}
+
+fn unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn estimate_tokens(text: &str) -> u32 {
+    let char_count = text.chars().count() as u32;
+    if char_count == 0 {
+        return 0;
+    }
+    // Coarse fallback approximation for OpenAI-like token counts.
+    (char_count + 3) / 4
+}
+
+fn estimate_prompt_tokens(messages: &[Message]) -> u32 {
+    messages
+        .iter()
+        .map(|message| estimate_tokens(&message.content))
+        .sum()
+}
+
 pub async fn responses_handler(
     State(state): State<AppState>,
     Json(req): Json<CreateResponseRequest>,
@@ -58,9 +90,12 @@ pub async fn responses_handler(
     // The Agency Supervisor manages its own history, so we treat this as a "turn".
     // If the client sends a full history, we only really act on the last message.
     // (Future improvement: Sync client history with Agency memory if needed)
-    let query = req.messages.last()
-        .map(|m| m.content.clone())
-        .ok_or_else(|| anyhow::anyhow!("No messages provided"))?;
+    let query = latest_message(&req.messages)?;
+    let prompt_tokens = estimate_prompt_tokens(&req.messages);
+    let model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_RESPONSE_MODEL.to_string());
 
     // 2. Lock Supervisor and Execute
     let mut supervisor = state.supervisor.lock().await;
@@ -76,8 +111,8 @@ pub async fn responses_handler(
     let response = ResponseObject {
         id: format!("resp_{}", uuid::Uuid::new_v4()),
         object: "response".to_string(),
-        created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-        model: "rust_agency_sovereign".to_string(),
+        created: unix_timestamp_secs(),
+        model,
         choices: vec![
             ResponseChoice {
                 index: 0,
@@ -88,12 +123,40 @@ pub async fn responses_handler(
                 finish_reason: "stop".to_string(),
             }
         ],
-        usage: Usage {
-            prompt_tokens: 0, // TODO: Track actual tokens
-            completion_tokens: 0,
-            total_tokens: 0,
+        usage: {
+            let completion_tokens = estimate_tokens(&result.answer);
+            Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            }
         },
     };
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_tokens_handles_empty_content() {
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_uses_char_based_ceiling() {
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_sums_message_contents() {
+        let messages = vec![
+            Message { role: "user".into(), content: "abcd".into() },
+            Message { role: "assistant".into(), content: "abcdefgh".into() },
+        ];
+        assert_eq!(estimate_prompt_tokens(&messages), 3);
+    }
 }

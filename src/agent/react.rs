@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use ollama_rs::Ollama;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 use futures_util::StreamExt;
 
@@ -32,6 +32,157 @@ pub struct ReActStep {
     pub is_final: bool,
     /// The final answer (if is_final is true)
     pub answer: Option<String>,
+}
+
+struct QualityScoringProfile {
+    min_words_for_repetition_check: usize,
+    severe_repetition_ratio: f32,
+    severe_repetition_penalty: f32,
+    moderate_repetition_ratio: f32,
+    moderate_repetition_penalty: f32,
+    prompt_leak_markers: &'static [&'static str],
+    short_response_len: Option<usize>,
+    short_response_penalty: f32,
+    sparse_word_count: Option<usize>,
+    sparse_response_len: Option<usize>,
+    sparse_response_penalty: f32,
+    non_ascii_ratio_threshold: Option<f32>,
+    non_ascii_min_len: Option<usize>,
+    non_ascii_penalty: f32,
+}
+
+const REACT_QUALITY_PROFILE: QualityScoringProfile = QualityScoringProfile {
+    min_words_for_repetition_check: 10,
+    severe_repetition_ratio: 0.2,
+    severe_repetition_penalty: 0.1,
+    moderate_repetition_ratio: 0.4,
+    moderate_repetition_penalty: 0.4,
+    prompt_leak_markers: &["## User Query", "## Instruction", "<|im_start|>"],
+    short_response_len: None,
+    short_response_penalty: 1.0,
+    sparse_word_count: Some(3),
+    sparse_response_len: Some(20),
+    sparse_response_penalty: 0.1,
+    non_ascii_ratio_threshold: Some(0.5),
+    non_ascii_min_len: Some(20),
+    non_ascii_penalty: 0.5,
+};
+
+const SIMPLE_QUALITY_PROFILE: QualityScoringProfile = QualityScoringProfile {
+    min_words_for_repetition_check: 20,
+    severe_repetition_ratio: 0.3,
+    severe_repetition_penalty: 0.2,
+    moderate_repetition_ratio: 0.5,
+    moderate_repetition_penalty: 0.5,
+    prompt_leak_markers: &["## User Query", "## Instruction"],
+    short_response_len: Some(5),
+    short_response_penalty: 0.3,
+    sparse_word_count: None,
+    sparse_response_len: None,
+    sparse_response_penalty: 1.0,
+    non_ascii_ratio_threshold: None,
+    non_ascii_min_len: None,
+    non_ascii_penalty: 1.0,
+};
+
+fn score_response_quality_with_profile(response: &str, profile: &QualityScoringProfile) -> f32 {
+    let mut score = 1.0;
+    let words: Vec<&str> = response.split_whitespace().collect();
+    let total_words = words.len();
+
+    if total_words > profile.min_words_for_repetition_check {
+        let unique_words: HashSet<&str> = words.iter().copied().collect();
+        let uniqueness_ratio = unique_words.len() as f32 / total_words as f32;
+        if uniqueness_ratio < profile.severe_repetition_ratio {
+            score *= profile.severe_repetition_penalty;
+        } else if uniqueness_ratio < profile.moderate_repetition_ratio {
+            score *= profile.moderate_repetition_penalty;
+        }
+    }
+
+    if let (Some(word_limit), Some(min_len)) = (profile.sparse_word_count, profile.sparse_response_len) {
+        if total_words < word_limit && response.len() > min_len {
+            score *= profile.sparse_response_penalty;
+        }
+    }
+
+    if let (Some(threshold), Some(min_len)) = (profile.non_ascii_ratio_threshold, profile.non_ascii_min_len) {
+        if response.len() > min_len {
+            let non_ascii_count = response.chars().filter(|c| !c.is_ascii()).count() as f32;
+            let ratio = non_ascii_count / response.len() as f32;
+            if ratio > threshold {
+                score *= profile.non_ascii_penalty;
+            }
+        }
+    }
+
+    if profile.prompt_leak_markers.iter().any(|marker| response.contains(marker)) {
+        score *= 0.1;
+    }
+
+    if let Some(min_len) = profile.short_response_len {
+        if response.trim().len() < min_len {
+            score *= profile.short_response_penalty;
+        }
+    }
+
+    score
+}
+
+fn find_prompt_leak_point(response: &str) -> Option<usize> {
+    for marker in ["## User Query", "## Instruction", "<|im_start|>user"] {
+        if let Some(idx) = response.find(marker) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn find_ascii_case_insensitive_from(haystack: &str, needle: &str, start: usize) -> Option<usize> {
+    haystack
+        .get(start..)
+        .and_then(|slice| find_ascii_case_insensitive(slice, needle).map(|idx| start + idx))
+}
+
+fn find_tag_end(text: &str, start: usize, next_tags: &[&str]) -> usize {
+    let mut end = text.len();
+    for tag in next_tags {
+        if let Some(idx) = find_ascii_case_insensitive_from(text, tag, start) {
+            if idx < end {
+                end = idx;
+            }
+        }
+    }
+    end
+}
+
+fn extract_tag_with_patterns(text: &str, patterns: &[String], next_tags: &[&str]) -> Option<String> {
+    for pattern in patterns {
+        if let Some(start_idx) = find_ascii_case_insensitive(text, pattern) {
+            let start = start_idx + pattern.len();
+            let end = find_tag_end(text, start, next_tags);
+            let result = text[start..end]
+                .trim()
+                .trim_start_matches(':')
+                .trim()
+                .to_string();
+            if !result.is_empty() {
+                return Some(result);
+            }
+        }
+    }
+    None
 }
 
 impl ReActStep {
@@ -265,9 +416,7 @@ impl SovereignAgent for ReActAgent {
 
     async fn execute_step(&self, task_id: &str, input: Option<serde_json::Value>) -> anyhow::Result<UapStep> {
         let mut step = UapStep::new(task_id, "ReAct Step");
-        
-        let query = input.as_ref().and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Continue with task".to_string());
+        let query = Self::query_from_step_input(input.as_ref());
 
         // L5 Check: Ensure we aren't blocked before executing
         let audit = self.audit_alignment(&query, false).await?;
@@ -276,9 +425,6 @@ impl SovereignAgent for ReActAgent {
         }
 
         step.status = UapStepStatus::Running;
-
-        let query = input.and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Continue with task".to_string());
 
         // Execute one iteration of the ReAct loop
         let res = self.execute(&query, None).await
@@ -305,6 +451,13 @@ impl SovereignAgent for ReActAgent {
 }
 
 impl ReActAgent {
+    fn query_from_step_input(input: Option<&serde_json::Value>) -> String {
+        input
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Continue with task")
+            .to_string()
+    }
+
     /// Build the ReAct prompt
     async fn build_react_prompt(&self, query: &str, steps: &[
 ReActStep],
@@ -498,38 +651,7 @@ RULES:
 
     /// FPF Quality Scoring: Detect hallucinations and repetitive patterns
     fn score_response_quality(&self, response: &str) -> f32 {
-        let mut score = 1.0;
-        
-        // Check for repetitive patterns (same phrase appearing multiple times)
-        let words: Vec<&str> = response.split_whitespace().collect();
-        let total_words = words.len();
-        if total_words > 10 {
-            let unique_words: std::collections::HashSet<&str> = words.iter().cloned().collect();
-            let uniqueness_ratio = unique_words.len() as f32 / total_words as f32;
-            if uniqueness_ratio < 0.2 {
-                score *= 0.1; // Heavy penalty for extreme repetition
-            } else if uniqueness_ratio < 0.4 {
-                score *= 0.4;
-            }
-        } else if total_words < 3 && response.len() > 20 {
-             // Long response with very few words (likely gibberish like aaaaaaaaaaaa or punctuation spam)
-             score *= 0.1;
-        }
-        
-        // Check for common gibberish markers or non-ASCII spam if it looks like noise
-        let non_ascii_count = response.chars().filter(|c| !c.is_ascii()).count();
-        if non_ascii_count > response.len() / 2 && response.len() > 20 {
-            // More than 50% non-ASCII in a medium+ response is suspicious for a technical agent 
-            // unless it's explicitly multilingual.
-            score *= 0.5;
-        }
-
-        // Check for hallucination markers (ChatML tags in output)
-        if response.contains("## User Query") || response.contains("## Instruction") || response.contains("<|im_start|>") {
-            score *= 0.1; // Model is echoing prompt structure or leak
-        }
-        
-        score
+        score_response_quality_with_profile(response, &REACT_QUALITY_PROFILE)
     }
 
     fn find_raw_json_tool_call(&self, text: &str) -> Option<ToolCall> {
@@ -591,36 +713,31 @@ RULES:
             format!("### {}", tag_name.to_uppercase()),
             tag.to_string(), // Direct support for emojis like 🧠
         ];
+        let next_tags = [
+            "[PLANNING]",
+            "[REASONING]",
+            "[THOUGHT]",
+            "[ACTION]",
+            "[ANSWER]",
+            "[OBSERVATION]",
+            "PLANNING:",
+            "REASONING:",
+            "THOUGHT:",
+            "ACTION:",
+            "ANSWER:",
+            "**PLANNING**",
+            "**REASONING**",
+            "**THOUGHT**",
+            "**ACTION**",
+            "**ANSWER**",
+            "🧠",
+            "⚡",
+            "→",
+            "🎯",
+            "👁️",
+        ];
 
-        let text_upper = text.to_uppercase();
-        
-        for pattern in patterns {
-            if let Some(start_idx) = text.find(&pattern) {
-                let start = start_idx + pattern.len();
-                
-                // Look for the next possible tag to find the end
-                let next_tags = [
-                    "[PLANNING]", "[REASONING]", "[THOUGHT]", "[ACTION]", "[ANSWER]", "[OBSERVATION]", 
-                    "PLANNING:", "REASONING:", "THOUGHT:", "ACTION:", "ANSWER:",
-                    "**PLANNING**", "**REASONING**", "**THOUGHT**", "**ACTION**", "**ANSWER**",
-                    "🧠", "⚡", "→", "🎯", "👁️"
-                ];
-                let mut end = text.len();
-                
-                for t in next_tags {
-                    if let Some(next_idx) = text[start..].find(t) {
-                        let abs_next_idx = start + next_idx;
-                        if abs_next_idx < end {
-                            end = abs_next_idx;
-                        }
-                    }
-                }
-                
-                let result = text[start..end].trim().trim_start_matches(':').trim().to_string();
-                if !result.is_empty() { return Some(result); }
-            }
-        }
-        None
+        extract_tag_with_patterns(text, &patterns, &next_tags)
     }
 
     fn extract_all_tags(&self, text: &str, tag: &str) -> Vec<String> {
@@ -632,36 +749,45 @@ RULES:
             format!("**{}**:", tag_name.to_uppercase()),
             tag.to_string(),
         ];
+        let next_tags = [
+            "[PLANNING]",
+            "[REASONING]",
+            "[THOUGHT]",
+            "[ACTION]",
+            "[ANSWER]",
+            "[OBSERVATION]",
+            "PLANNING:",
+            "REASONING:",
+            "THOUGHT:",
+            "ACTION:",
+            "ANSWER:",
+            "**PLANNING**",
+            "**REASONING**",
+            "**THOUGHT**",
+            "**ACTION**",
+            "**ANSWER**",
+            "🧠",
+            "⚡",
+            "→",
+            "🎯",
+            "👁️",
+        ];
         
         // We use the first pattern that matches to find all occurrences
         for pattern in patterns {
             let mut pos = 0;
-            while let Some(start_idx) = text[pos..].find(&pattern) {
-                let start = pos + start_idx + pattern.len();
-                
-                // Find end (next tag or end of string)
-                let next_tags = [
-                    "[PLANNING]", "[REASONING]", "[THOUGHT]", "[ACTION]", "[ANSWER]", "[OBSERVATION]",
-                    "PLANNING:", "REASONING:", "THOUGHT:", "ACTION:", "ANSWER:",
-                    "**PLANNING**", "**REASONING**", "**THOUGHT**", "**ACTION**", "**ANSWER**",
-                    "🧠", "⚡", "→", "🎯", "👁️"
-                ];
-                let mut end = text.len();
-                
-                for t in next_tags {
-                    if let Some(next_idx) = text[start..].find(t) {
-                        let abs_next_idx = start + next_idx;
-                        if abs_next_idx < end {
-                            end = abs_next_idx;
-                        }
-                    }
-                }
-                
-                let result = text[start..end].trim().trim_start_matches(':').trim().to_string();
+            while let Some(start_idx) = find_ascii_case_insensitive_from(text, &pattern, pos) {
+                let start = start_idx + pattern.len();
+                let end = find_tag_end(text, start, &next_tags);
+                let result = text[start..end]
+                    .trim()
+                    .trim_start_matches(':')
+                    .trim()
+                    .to_string();
                 if !result.is_empty() {
                     results.push(result);
                 }
-                pos = end;
+                pos = end.max(start);
                 if pos >= text.len() { break; }
             }
             if !results.is_empty() { break; }
@@ -1066,48 +1192,12 @@ impl SimpleAgent {
 
     /// FPF Quality Scoring: Detect hallucinations and repetitive patterns
     fn score_response_quality(&self, response: &str) -> f32 {
-        let mut score = 1.0;
-        
-        // Check for repetitive patterns (same phrase appearing multiple times)
-        let words: Vec<&str> = response.split_whitespace().collect();
-        let total_words = words.len();
-        if total_words > 20 {
-            let unique_words: std::collections::HashSet<&str> = words.iter().cloned().collect();
-            let uniqueness_ratio = unique_words.len() as f32 / total_words as f32;
-            if uniqueness_ratio < 0.3 {
-                score *= 0.2; // Heavy penalty for highly repetitive responses
-            } else if uniqueness_ratio < 0.5 {
-                score *= 0.5;
-            }
-        }
-        
-        // Check for hallucination markers (ChatML tags in output)
-        if response.contains("## User Query") || response.contains("## Instruction") {
-            score *= 0.1; // Model is echoing prompt structure
-        }
-        
-        // Check for empty or very short responses
-        if response.trim().len() < 5 {
-            score *= 0.3;
-        }
-        
-        score
+        score_response_quality_with_profile(response, &SIMPLE_QUALITY_PROFILE)
     }
     
     /// Find the first point where content starts repeating
     fn find_repetition_point(&self, response: &str) -> Option<usize> {
-        // Look for "## User Query" or "## Instruction" which indicates prompt leak
-        if let Some(idx) = response.find("## User Query") {
-            return Some(idx);
-        }
-        if let Some(idx) = response.find("## Instruction") {
-            return Some(idx);
-        }
-        // Look for repeated ChatML patterns
-        if let Some(idx) = response.find("<|im_start|>user") {
-            return Some(idx);
-        }
-        None
+        find_prompt_leak_point(response)
     }
 
     /// Streaming variant of execute_simple for real-time token output
@@ -1175,31 +1265,17 @@ impl SimpleAgent {
             format!("**{}**", tag_name.to_uppercase()),
             format!("### {}", tag_name.to_uppercase()),
         ];
-
-        let text_upper = text.to_uppercase();
-        for pattern in patterns {
-            if let Some(start_idx) = text_upper.find(&pattern) {
-                let start = start_idx + pattern.len();
-                let next_tags = [
-                    "[THOUGHT]", "[ANSWER]", "THOUGHT:", "ANSWER:", 
-                    "**THOUGHT**", "**ANSWER**", "### THOUGHT", "### ANSWER"
-                ];
-                let mut end = text.len();
-                
-                for t in next_tags {
-                    if let Some(next_idx) = text_upper[start..].find(t) {
-                        let abs_next_idx = start + next_idx;
-                        if abs_next_idx < end {
-                            end = abs_next_idx;
-                        }
-                    }
-                }
-                
-                let result = text[start..end].trim().trim_start_matches(':').trim().to_string();
-                if !result.is_empty() { return Some(result); }
-            }
-        }
-        None
+        let next_tags = [
+            "[THOUGHT]",
+            "[ANSWER]",
+            "THOUGHT:",
+            "ANSWER:",
+            "**THOUGHT**",
+            "**ANSWER**",
+            "### THOUGHT",
+            "### ANSWER",
+        ];
+        extract_tag_with_patterns(text, &patterns, &next_tags)
     }
 }
 
@@ -1207,6 +1283,7 @@ impl SimpleAgent {
 mod tests {
     use super::*;
     use crate::orchestrator::profile::AgencyProfile;
+    use serde_json::json;
 
     #[test]
     fn test_extract_tag() {
@@ -1221,5 +1298,66 @@ mod tests {
         
         let action = agent.extract_tag(response, "[ACTION]");
         assert_eq!(action.expect("Failed to extract action"), "{\"name\": \"get_weather\", \"parameters\": {\"location\": \"Seattle\"}}");
+    }
+
+    #[test]
+    fn test_extract_tag_case_insensitive() {
+        let profile = AgencyProfile::default();
+        let config = AgentConfig::new(AgentType::GeneralChat, &profile);
+        let agent = ReActAgent::new(Ollama::default(), config, Arc::new(ToolRegistry::default()));
+
+        let response = "[thought]\ncheck logs\n[action]\n{\"name\":\"tail\"}";
+        let thought = agent.extract_tag(response, "[THOUGHT]");
+        assert_eq!(thought.expect("Failed to extract lowercase thought"), "check logs");
+    }
+
+    #[test]
+    fn test_simple_agent_extract_tag_with_unicode_prefix() {
+        let profile = AgencyProfile::default();
+        let config = AgentConfig::new(AgentType::GeneralChat, &profile);
+        let agent = SimpleAgent::new(Ollama::default(), config);
+
+        let response = "Straße prefix\n[thought]\nAnalyze quickly\n[answer]\nDone";
+        let thought = agent.extract_tag(response, "[THOUGHT]");
+        assert_eq!(
+            thought.expect("Failed to extract thought with unicode prefix"),
+            "Analyze quickly"
+        );
+    }
+
+    #[test]
+    fn test_query_from_step_input_uses_string_value() {
+        let input = json!("Refactor auth module");
+        let query = ReActAgent::query_from_step_input(Some(&input));
+        assert_eq!(query, "Refactor auth module");
+    }
+
+    #[test]
+    fn test_query_from_step_input_falls_back_for_non_string() {
+        let input = json!({ "task": "Refactor auth module" });
+        let query = ReActAgent::query_from_step_input(Some(&input));
+        assert_eq!(query, "Continue with task");
+    }
+
+    #[test]
+    fn test_query_from_step_input_falls_back_for_none() {
+        let query = ReActAgent::query_from_step_input(None);
+        assert_eq!(query, "Continue with task");
+    }
+
+    #[test]
+    fn test_quality_profile_keeps_agent_specific_behavior() {
+        let leaked = "## User Query\nrepeat repeat repeat repeat repeat repeat repeat repeat";
+        let react_score = score_response_quality_with_profile(leaked, &REACT_QUALITY_PROFILE);
+        let simple_score = score_response_quality_with_profile(leaked, &SIMPLE_QUALITY_PROFILE);
+        assert!(react_score <= 0.1);
+        assert!(simple_score <= 0.1);
+    }
+
+    #[test]
+    fn test_find_prompt_leak_point_finds_chatml_marker() {
+        let response = "clean prefix <|im_start|>user leaked prompt";
+        let idx = find_prompt_leak_point(response);
+        assert_eq!(idx, response.find("<|im_start|>user"));
     }
 }
