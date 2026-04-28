@@ -11,6 +11,10 @@ const STATE_ROOT =
   process.env.NANOCLAW_OMX_STATE_ROOT || path.join(os.homedir(), ".nanoclaw-omx");
 const POLL_INTERVAL_MS = parseInteger(process.env.NANOCLAW_OMX_POLL_MS, 5_000);
 const IDLE_THRESHOLD_MS = parseInteger(process.env.NANOCLAW_OMX_IDLE_MS, 120_000);
+const TEAM_AWAIT_TIMEOUT_MS = parseInteger(
+  process.env.NANOCLAW_OMX_TEAM_AWAIT_TIMEOUT_MS,
+  540_000
+);
 
 const [subcommand, ...rest] = process.argv.slice(2);
 const wantsJson = rest.includes("--json");
@@ -291,7 +295,7 @@ function buildRunScript(state) {
     "set +e",
     'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"',
     `cd ${shellQuote(state.cwd)}`,
-    `${omxCommand} >> ${shellQuote(state.log_path)} 2>&1`,
+    ...buildExecutionLines(state, omxCommand),
     "status=$?",
     `printf '\\n[omx-runner-exit] %s\\n' \"$status\" >> ${shellQuote(state.log_path)}`,
     `${shellQuote(process.execPath)} ${shellQuote(runnerPath)} finalize ${shellQuote(
@@ -300,6 +304,25 @@ function buildRunScript(state) {
     "exit \"$status\"",
   ];
   return `${lines.join("\n")}\n`;
+}
+
+function buildExecutionLines(state, omxCommand) {
+  const logPath = shellQuote(state.log_path);
+  if (state.mode !== "team") {
+    return [`${omxCommand} >> ${logPath} 2>&1`];
+  }
+  return [
+    `${omxCommand} >> ${logPath} 2>&1`,
+    "status=$?",
+    'if [ "$status" -eq 0 ]; then',
+    `  team_name="$(grep -m 1 '^Team started:' ${logPath} | sed 's/^Team started:[[:space:]]*//')"`,
+    '  if [ -n "$team_name" ]; then',
+    `    printf '\\n[omx-runner-await] %s\\n' "$team_name" >> ${logPath}`,
+    `    omx team await "$team_name" --timeout-ms ${TEAM_AWAIT_TIMEOUT_MS} --json >> ${logPath} 2>&1`,
+    "    status=$?",
+    "  fi",
+    "fi",
+  ];
 }
 
 function buildOmxCommand(state) {
