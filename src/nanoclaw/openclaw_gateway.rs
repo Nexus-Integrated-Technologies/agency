@@ -20,7 +20,10 @@ use super::executor::{
     build_execution_session, ExecutionArtifactRef, ExecutionLaneRouter, ExecutionRequest,
     ExecutionResponse, ExecutorBoundary,
 };
-use super::omx::{describe_omx_readiness, OmxExecutionOptions, OmxMode};
+use super::omx::{
+    apply_omx_webhook_payload, describe_omx_readiness, is_valid_omx_token,
+    parse_omx_webhook_payload, OmxExecutionOptions, OmxMode, OmxRunnerClient,
+};
 
 const PROTOCOL_VERSION: u64 = 3;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
@@ -172,6 +175,13 @@ struct GatewayWaitParams {
     timeout_ms: Option<u64>,
 }
 
+struct PlainHttpRequest {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
 struct ConnectionState {
     connected: bool,
     challenge_nonce: String,
@@ -250,7 +260,7 @@ pub fn start_openclaw_gateway_server(config: NanoclawConfig) -> Result<()> {
 
 fn handle_connection(mut stream: TcpStream, state: GatewayServerState) -> Result<()> {
     if is_plain_http_request(&stream)? {
-        return respond_http_health(&mut stream, &state.config);
+        return handle_http_request(&mut stream, &state);
     }
 
     let mut socket = accept(stream).context("failed to accept websocket")?;
@@ -1048,30 +1058,292 @@ fn is_plain_http_request(stream: &TcpStream) -> Result<bool> {
     }
     let preview = String::from_utf8_lossy(&peek[..bytes]).to_string();
     let lower = preview.to_ascii_lowercase();
-    if !(lower.starts_with("get ") || lower.starts_with("head ")) {
+    if !(lower.starts_with("get ") || lower.starts_with("head ") || lower.starts_with("post ")) {
         return Ok(false);
     }
     Ok(!lower.contains("upgrade: websocket"))
 }
 
-fn respond_http_health(stream: &mut TcpStream, config: &NanoclawConfig) -> Result<()> {
-    let mut buffer = [0u8; 4096];
-    let _ = stream.read(&mut buffer);
-    let body = serde_json::to_string(&json!({
-        "status": "ok",
-        "service": "nanoclaw-openclaw-gateway",
-        "websocketUrl": config.openclaw_gateway_public_ws_url(),
-        "executionLane": config.openclaw_gateway_execution_lane.as_str(),
-        "omx": describe_omx_readiness(config),
-    }))?;
+fn handle_http_request(stream: &mut TcpStream, state: &GatewayServerState) -> Result<()> {
+    let request = read_plain_http_request(stream)?;
+    let method = request.method.to_ascii_uppercase();
+    let path = logical_openclaw_path(&request.path);
+    let head_only = method == "HEAD";
+
+    if matches!(method.as_str(), "GET" | "HEAD") && (path == "/" || path == "/health") {
+        return respond_http_health(stream, &state.config, head_only);
+    }
+
+    if matches!(method.as_str(), "GET" | "HEAD") {
+        if let Some(session_id) = path.strip_prefix("/omx/sessions/") {
+            return respond_http_omx_session(stream, state, &request, session_id, head_only);
+        }
+    }
+
+    if method == "POST" && path == "/webhook/omx" {
+        return respond_http_omx_webhook(stream, state, &request);
+    }
+
+    respond_http_json(
+        stream,
+        404,
+        json!({
+            "error": "not_found",
+            "path": path,
+        }),
+        head_only,
+    )
+}
+
+fn read_plain_http_request(stream: &mut TcpStream) -> Result<PlainHttpRequest> {
+    const MAX_HTTP_BYTES: usize = 2 * 1024 * 1024;
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut data = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+
+    loop {
+        let bytes = stream
+            .read(&mut buffer)
+            .context("failed to read HTTP request")?;
+        if bytes == 0 {
+            break;
+        }
+        data.extend_from_slice(&buffer[..bytes]);
+        if data.len() > MAX_HTTP_BYTES {
+            anyhow::bail!("HTTP request exceeded maximum size");
+        }
+
+        if header_end.is_none() {
+            if let Some(index) = find_header_end(&data) {
+                header_end = Some(index);
+                content_length = parse_content_length(&data[..index]).unwrap_or(0);
+            }
+        }
+
+        if let Some(index) = header_end {
+            if data.len() >= index + 4 + content_length {
+                break;
+            }
+        }
+    }
+
+    let header_end = header_end.context("HTTP request missing header terminator")?;
+    let header_text = String::from_utf8_lossy(&data[..header_end]);
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().context("HTTP request missing request line")?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .context("HTTP request missing method")?
+        .to_string();
+    let path = request_parts
+        .next()
+        .context("HTTP request missing path")?
+        .to_string();
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    let body_start = header_end + 4;
+    let body_end = body_start.saturating_add(content_length).min(data.len());
+    let body = data[body_start..body_end].to_vec();
+
+    Ok(PlainHttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(header_bytes: &[u8]) -> Option<usize> {
+    let header_text = String::from_utf8_lossy(header_bytes);
+    for line in header_text.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn logical_openclaw_path(path: &str) -> String {
+    let path = path.split('?').next().unwrap_or("/");
+    let stripped = path
+        .strip_prefix("/openclaw")
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .unwrap_or(path);
+    if stripped.is_empty() {
+        "/".to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn respond_http_health(
+    stream: &mut TcpStream,
+    config: &NanoclawConfig,
+    head_only: bool,
+) -> Result<()> {
+    respond_http_json(
+        stream,
+        200,
+        json!({
+            "status": "ok",
+            "service": "nanoclaw-openclaw-gateway",
+            "websocketUrl": config.openclaw_gateway_public_ws_url(),
+            "executionLane": config.openclaw_gateway_execution_lane.as_str(),
+            "omx": describe_omx_readiness(config),
+        }),
+        head_only,
+    )
+}
+
+fn respond_http_omx_session(
+    stream: &mut TcpStream,
+    state: &GatewayServerState,
+    request: &PlainHttpRequest,
+    session_id: &str,
+    head_only: bool,
+) -> Result<()> {
+    let session_id = session_id.trim_matches('/');
+    if session_id.is_empty() {
+        return respond_http_json(
+            stream,
+            400,
+            json!({ "error": "missing_session_id" }),
+            head_only,
+        );
+    }
+    if !is_authorized_http_gateway_request(&state.config, request) {
+        return respond_http_json(stream, 401, json!({ "error": "unauthorized" }), head_only);
+    }
+
+    let client = OmxRunnerClient::from_config(&state.config);
+    match client.status(session_id, state.config.project_root.as_path()) {
+        Ok(status) => respond_http_json(
+            stream,
+            200,
+            json!({
+                "ok": true,
+                "session": status,
+            }),
+            head_only,
+        ),
+        Err(error) => respond_http_json(
+            stream,
+            404,
+            json!({
+                "ok": false,
+                "error": error.to_string(),
+                "sessionId": session_id,
+            }),
+            head_only,
+        ),
+    }
+}
+
+fn respond_http_omx_webhook(
+    stream: &mut TcpStream,
+    state: &GatewayServerState,
+    request: &PlainHttpRequest,
+) -> Result<()> {
+    let header_token = request
+        .headers
+        .get("x-nanoclaw-omx-token")
+        .map(String::as_str)
+        .or_else(|| request.headers.get("x-openclaw-token").map(String::as_str));
+    if !is_valid_omx_token(&state.config, header_token) {
+        return respond_http_json(stream, 401, json!({ "error": "unauthorized" }), false);
+    }
+
+    let payload = match parse_omx_webhook_payload(&request.body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return respond_http_json(
+                stream,
+                400,
+                json!({
+                    "error": "invalid_omx_payload",
+                    "message": error.to_string(),
+                }),
+                false,
+            );
+        }
+    };
+    if !is_valid_omx_token(&state.config, payload.token.as_deref().or(header_token)) {
+        return respond_http_json(stream, 401, json!({ "error": "unauthorized" }), false);
+    }
+
+    let mut app = NanoclawApp::open(state.config.clone())?;
+    let mut channel = None;
+    let body = apply_omx_webhook_payload(&mut app, &mut channel, payload)?;
+    respond_http_json(stream, 200, body, false)
+}
+
+fn is_authorized_http_gateway_request(config: &NanoclawConfig, request: &PlainHttpRequest) -> bool {
+    let Some(token) = http_gateway_token(request) else {
+        return false;
+    };
+    token == config.openclaw_gateway_token.trim()
+}
+
+fn http_gateway_token(request: &PlainHttpRequest) -> Option<&str> {
+    request
+        .headers
+        .get("x-openclaw-token")
+        .map(String::as_str)
+        .or_else(|| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.strip_prefix("Bearer "))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn respond_http_json(
+    stream: &mut TcpStream,
+    status: u16,
+    value: Value,
+    head_only: bool,
+) -> Result<()> {
+    let body = serde_json::to_string(&value)?;
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "Internal Server Error",
+    };
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        status_text,
+        if head_only { 0 } else { body.len() },
     );
     stream
         .write_all(response.as_bytes())
-        .context("failed to write gateway health response")?;
+        .context("failed to write gateway HTTP response headers")?;
+    if !head_only {
+        stream
+            .write_all(body.as_bytes())
+            .context("failed to write gateway HTTP response body")?;
+    }
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
