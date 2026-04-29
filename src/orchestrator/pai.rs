@@ -36,6 +36,29 @@ pub struct PAIOrchestrator<'a> {
 }
 
 impl<'a> PAIOrchestrator<'a> {
+    fn verification_analysis(
+        success: bool,
+        has_pending_approval: bool,
+        reflections: &[String],
+        update_notice: &str,
+    ) -> String {
+        let verification = if has_pending_approval {
+            "Task execution paused: verification pending user approval."
+        } else if success {
+            "Task verified: supervisor reported successful execution."
+        } else {
+            "Task verification failed: supervisor reported unresolved issues."
+        };
+
+        let rationale = if reflections.is_empty() {
+            String::new()
+        } else {
+            format!(" Rationale: {}", reflections.join(" | "))
+        };
+
+        format!("{verification}{rationale}{update_notice}")
+    }
+
     pub fn new(mut _effort: EffortLevel, supervisor: Arc<tokio::sync::Mutex<Supervisor>>) -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
         let pai_dir = PathBuf::from(std::env::var("PAI_DIR").unwrap_or_else(|_| format!("{}/.config/pai", home)));
@@ -117,14 +140,51 @@ impl<'a> PAIOrchestrator<'a> {
             }
         }
 
+        let analysis = Self::verification_analysis(
+            res.success,
+            res.pending_approval.is_some(),
+            &res.reflections,
+            &update_notice,
+        );
+
         let output = self.formatter.format_response(
             &format!("Executed task: {}", request),
-            &format!("Task verified. {}{}", "No issues found.", update_notice),
+            &analysis,
             &["Observation", "Execution", "Verification", "Sentinel Update Check"],
             &res.answer,
             "PAI cycle complete."
         );
         
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PAIOrchestrator;
+
+    #[test]
+    fn verification_analysis_reports_success_without_overclaiming() {
+        let analysis = PAIOrchestrator::verification_analysis(
+            true,
+            false,
+            &vec!["Selected performer: Coder".to_string()],
+            "",
+        );
+        assert!(analysis.contains("Task verified: supervisor reported successful execution."));
+        assert!(!analysis.contains("No issues found"));
+        assert!(analysis.contains("Selected performer: Coder"));
+    }
+
+    #[test]
+    fn verification_analysis_reports_pending_approval() {
+        let analysis = PAIOrchestrator::verification_analysis(false, true, &[], "");
+        assert!(analysis.contains("verification pending user approval"));
+    }
+
+    #[test]
+    fn verification_analysis_reports_failure() {
+        let analysis = PAIOrchestrator::verification_analysis(false, false, &[], "");
+        assert!(analysis.contains("verification failed"));
     }
 }
