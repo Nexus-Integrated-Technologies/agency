@@ -15,6 +15,15 @@ const TEAM_MONITOR_TIMEOUT_MS = parseInteger(
   process.env.NANOCLAW_OMX_TEAM_MONITOR_TIMEOUT_MS,
   540_000
 );
+const EXEC_MONITOR_TIMEOUT_MS = parseInteger(
+  process.env.NANOCLAW_OMX_EXEC_MONITOR_TIMEOUT_MS,
+  300_000
+);
+const STATE_READ_RETRIES = parseInteger(process.env.NANOCLAW_OMX_STATE_READ_RETRIES, 5);
+const STATE_READ_RETRY_DELAY_MS = parseInteger(
+  process.env.NANOCLAW_OMX_STATE_READ_RETRY_DELAY_MS,
+  25
+);
 
 const [subcommand, ...rest] = process.argv.slice(2);
 const wantsJson = rest.includes("--json");
@@ -157,7 +166,46 @@ async function invokeSession(request) {
   await maybeRefreshTeamName(state);
   await writeState(statePath, state);
   await emitCallback(state, "session-start");
+  if (state.mode !== "team") {
+    return buildResponse(await waitForNonTeamTerminalState(sessionId));
+  }
   return buildResponse(state);
+}
+
+async function waitForNonTeamTerminalState(sessionId) {
+  const deadline = Date.now() + EXEC_MONITOR_TIMEOUT_MS;
+  const statePath = stateFile(sessionId);
+  let state = await readState(sessionId);
+
+  while (Date.now() < deadline) {
+    await refreshRuntimeState(state);
+    state = await readState(sessionId);
+    if (isTerminalStatus(state.status)) {
+      return state;
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  state = await readState(sessionId);
+  if (!isTerminalStatus(state.status)) {
+    killTmuxSession(state.tmux_session);
+    const now = new Date().toISOString();
+    const detectedFailure = detectKnownFailureSummary(state.log_path);
+    state.status = "failed";
+    state.question = null;
+    state.summary =
+      detectedFailure ||
+      `OMX ${state.mode} session did not finish within ${EXEC_MONITOR_TIMEOUT_MS}ms.`;
+    state.updated_at = now;
+    state.completed_at = now;
+    if (state.log_path) {
+      await fsp.appendFile(state.log_path, `\n[omx-runner-timeout] ${state.summary}\n`);
+    }
+    await writeState(statePath, state);
+    await emitCallback(state, "session-end");
+  }
+
+  return state;
 }
 
 async function sessionStatus(sessionId) {
@@ -293,6 +341,7 @@ async function finalizeSession(sessionId, exitCode) {
   } else {
     state.status = "failed";
     state.summary =
+      detectKnownFailureSummary(state.log_path) ||
       summarizeTail(state.log_path, 80) || `OMX session failed with exit code ${exitCode}.`;
   }
   state.updated_at = now;
@@ -328,20 +377,46 @@ function buildRunScript(state) {
 
 function buildOmxCommand(state) {
   const prompt = shellQuote(state.prompt);
+  const codexExecPrefix = buildCodexExecPrefix(state.cwd);
   switch (state.mode) {
     case "exec":
-      return `omx exec --json --skip-git-repo-check --cd ${shellQuote(state.cwd)} ${prompt}`;
+      return `${codexExecPrefix} ${prompt}`;
     case "team":
       return `omx team ${state.max_workers || 3}:executor ${prompt}`;
     case "ralph":
       return `omx ralph ${prompt}`;
     case "deep-interview":
-      return `omx exec --json --skip-git-repo-check --cd ${shellQuote(state.cwd)} ${shellQuote(`$deep-interview ${state.prompt}`)}`;
+      return `${codexExecPrefix} ${shellQuote(`$deep-interview ${state.prompt}`)}`;
     case "ralplan":
-      return `omx exec --json --skip-git-repo-check --cd ${shellQuote(state.cwd)} ${shellQuote(`$ralplan ${state.prompt}`)}`;
+      return `${codexExecPrefix} ${shellQuote(`$ralplan ${state.prompt}`)}`;
     default:
-      return `omx exec --json --skip-git-repo-check --cd ${shellQuote(state.cwd)} ${prompt}`;
+      return `${codexExecPrefix} ${prompt}`;
   }
+}
+
+function buildCodexExecPrefix(cwd) {
+  return [
+    "omx",
+    "exec",
+    ...codexExecSandboxArgs(),
+    "--json",
+    "--skip-git-repo-check",
+    "--cd",
+    cwd,
+  ]
+    .map(shellQuote)
+    .join(" ");
+}
+
+function codexExecSandboxArgs() {
+  const sandbox = String(
+    process.env.NANOCLAW_CODEX_SANDBOX || process.env.CODEX_SANDBOX || ""
+  ).trim();
+  if (!sandbox) return [];
+  if (sandbox === "danger-full-access") {
+    return ["--dangerously-bypass-approvals-and-sandbox"];
+  }
+  return ["-s", sandbox];
 }
 
 async function refreshRuntimeState(state) {
@@ -459,7 +534,7 @@ async function maybeRefreshTeamStatus(state) {
 
 function parseTeamStatus(raw) {
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = parseJsonValue(raw);
     const tasks = parsed && typeof parsed === "object" ? parsed.tasks : null;
     if (!tasks || typeof tasks !== "object") {
       return { terminal: false, failed: false, summary: null };
@@ -638,20 +713,35 @@ async function readState(sessionId) {
 }
 
 async function maybeReadState(sessionId) {
-  try {
-    const raw = await fsp.readFile(stateFile(sessionId), "utf8");
-    return JSON.parse(raw);
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      return null;
+  const filePath = stateFile(sessionId);
+  let lastError = null;
+  for (let attempt = 0; attempt <= STATE_READ_RETRIES; attempt += 1) {
+    try {
+      const raw = await fsp.readFile(filePath, "utf8");
+      return JSON.parse(raw);
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        return null;
+      }
+      lastError = error;
+      if (!isJsonParseError(error) || attempt === STATE_READ_RETRIES) {
+        break;
+      }
+      await sleep(STATE_READ_RETRY_DELAY_MS);
     }
-    throw error;
   }
+  throw lastError;
 }
 
 async function writeState(filePath, state) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`);
+  const dir = path.dirname(filePath);
+  await fsp.mkdir(dir, { recursive: true });
+  const tmpPath = path.join(
+    dir,
+    `.state.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
+  );
+  await fsp.writeFile(tmpPath, `${JSON.stringify(state, null, 2)}\n`);
+  await fsp.rename(tmpPath, filePath);
 }
 
 function stateFile(sessionId) {
@@ -666,9 +756,26 @@ function summarizeTail(filePath, lines) {
   return content.trim().split(/\r?\n/).slice(-lines).join("\n").slice(-8_000);
 }
 
+function detectKnownFailureSummary(filePath) {
+  const content = safeReadFile(filePath);
+  if (!content.trim()) {
+    return null;
+  }
+  if (
+    /401 Unauthorized/i.test(content) &&
+    /Missing bearer or basic authentication/i.test(content)
+  ) {
+    return "Codex auth failed: OpenAI returned 401 Unauthorized. Refresh PAPERCLIP_CODEX_AUTH_JSON or PAPERCLIP_CODEX_AUTH_JSON_B64 for the gateway container.";
+  }
+  if (/required command not found:\s*omx/i.test(content) || /command not found:\s*omx/i.test(content)) {
+    return "OMX runner failed: the omx command is not installed or not on PATH in the gateway container.";
+  }
+  return null;
+}
+
 function summarizeJsonStatus(raw, fallback) {
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = parseJsonValue(raw);
     return (
       parsed.summary ||
       parsed.statusline ||
@@ -679,6 +786,66 @@ function summarizeJsonStatus(raw, fallback) {
   } catch {
     return fallback || "OMX team status available.";
   }
+}
+
+function parseJsonValue(raw) {
+  const text = String(raw || "").trim();
+  if (!text) {
+    throw new SyntaxError("empty JSON payload");
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const extracted = extractFirstJsonValue(text);
+    if (extracted) {
+      return JSON.parse(extracted);
+    }
+    throw error;
+  }
+}
+
+function extractFirstJsonValue(text) {
+  const start = text.search(/[\[{]/);
+  if (start < 0) {
+    return null;
+  }
+  const opening = text[start];
+  const closing = opening === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === opening) {
+      depth += 1;
+      continue;
+    }
+    if (char === closing) {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function isJsonParseError(error) {
+  return error instanceof SyntaxError;
 }
 
 function detectQuestion(text) {
