@@ -676,6 +676,7 @@ impl ExecutorBoundary for OmxExecutor {
             &request.prompt,
             workspace_root.as_path(),
             request.omx.as_ref(),
+            request.env.clone(),
         )?;
         record_response_session_turn(&mut session_state, &response.summary);
         session_state.last_plan = request.plan.clone();

@@ -24,6 +24,20 @@ const STATE_READ_RETRY_DELAY_MS = parseInteger(
   process.env.NANOCLAW_OMX_STATE_READ_RETRY_DELAY_MS,
   25
 );
+const ALLOWED_RUN_ENV_KEYS = new Set([
+  "PAPERCLIP_RUN_ID",
+  "PAPERCLIP_AGENT_ID",
+  "PAPERCLIP_COMPANY_ID",
+  "PAPERCLIP_API_URL",
+  "PAPERCLIP_API_KEY",
+  "PAPERCLIP_TASK_ID",
+  "PAPERCLIP_ISSUE_ID",
+  "PAPERCLIP_WAKE_REASON",
+  "PAPERCLIP_WAKE_COMMENT_ID",
+  "PAPERCLIP_APPROVAL_ID",
+  "PAPERCLIP_APPROVAL_STATUS",
+  "PAPERCLIP_LINKED_ISSUE_IDS",
+]);
 
 const [subcommand, ...rest] = process.argv.slice(2);
 const wantsJson = rest.includes("--json");
@@ -150,7 +164,7 @@ async function invokeSession(request) {
     log_path: logPath,
   };
 
-  await fsp.writeFile(runScriptPath, buildRunScript(state), { mode: 0o755 });
+  await fsp.writeFile(runScriptPath, buildRunScript(state, request.env), { mode: 0o700 });
   await writeState(statePath, state);
   await fsp.appendFile(logPath, `[runner] invoke ${now}\n`);
 
@@ -350,7 +364,7 @@ async function finalizeSession(sessionId, exitCode) {
   await emitCallback(state, state.status === "stopped" ? "session-stop" : "session-end");
 }
 
-function buildRunScript(state) {
+function buildRunScript(state, runEnv = {}) {
   const runnerPath = path.resolve(process.argv[1]);
   const omxCommand = buildOmxCommand(state);
   const logPath = shellQuote(state.log_path);
@@ -359,6 +373,7 @@ function buildRunScript(state) {
     "#!/usr/bin/env bash",
     "set +e",
     'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"',
+    ...buildRunEnvExports(runEnv),
     `cd ${shellQuote(state.cwd)}`,
     `${omxCommand} >> ${logPath} 2>&1`,
     "status=$?",
@@ -373,6 +388,17 @@ function buildRunScript(state) {
     "exit \"$status\"",
   ];
   return `${lines.join("\n")}\n`;
+}
+
+function buildRunEnvExports(runEnv) {
+  if (!runEnv || typeof runEnv !== "object" || Array.isArray(runEnv)) {
+    return [];
+  }
+
+  return Object.entries(runEnv)
+    .filter(([key, value]) => ALLOWED_RUN_ENV_KEYS.has(key) && String(value || "").trim())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `export ${key}=${shellQuote(String(value))}`);
 }
 
 function buildOmxCommand(state) {

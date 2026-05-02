@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
 use std::io::Write;
@@ -283,6 +284,8 @@ pub struct OmxRunnerRequest {
     pub cwd: String,
     pub callback_url: Option<String>,
     pub callback_token: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     pub metadata: Option<Value>,
 }
 
@@ -395,6 +398,7 @@ impl OmxRunnerClient {
         prompt: &str,
         cwd: &Path,
         options: Option<&OmxExecutionOptions>,
+        env: BTreeMap<String, String>,
     ) -> Result<OmxRunnerResponse> {
         let runner_cwd = self.prepare_group_workspace(group_folder, cwd, true)?;
         let request = OmxRunnerRequest {
@@ -415,6 +419,7 @@ impl OmxRunnerClient {
             cwd: runner_cwd,
             callback_url: non_empty_string(Some(self.callback_url.clone())),
             callback_token: non_empty_string(Some(self.callback_token.clone())),
+            env,
             metadata: None,
         };
         self.run(request)
@@ -435,6 +440,7 @@ impl OmxRunnerClient {
             cwd: cwd.display().to_string(),
             callback_url: non_empty_string(Some(self.callback_url.clone())),
             callback_token: non_empty_string(Some(self.callback_token.clone())),
+            env: BTreeMap::new(),
             metadata: None,
         })
     }
@@ -454,6 +460,7 @@ impl OmxRunnerClient {
             cwd: cwd.display().to_string(),
             callback_url: non_empty_string(Some(self.callback_url.clone())),
             callback_token: non_empty_string(Some(self.callback_token.clone())),
+            env: BTreeMap::new(),
             metadata: None,
         })
     }
@@ -481,6 +488,7 @@ impl OmxRunnerClient {
             cwd: runner_cwd,
             callback_url: non_empty_string(Some(self.callback_url.clone())),
             callback_token: non_empty_string(Some(self.callback_token.clone())),
+            env: BTreeMap::new(),
             metadata: None,
         })
     }
@@ -553,13 +561,19 @@ impl OmxRunnerClient {
             .context("failed to wait for local OMX runner command")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             bail!(
-                "local OMX runner command failed with status {}{}",
+                "local OMX runner command failed with status {}{}{}",
                 output.status,
                 if stderr.is_empty() {
                     String::new()
                 } else {
                     format!(": {stderr}")
+                },
+                if stdout.is_empty() {
+                    String::new()
+                } else {
+                    format!("; stdout: {}", truncate_runner_output(&stdout))
                 }
             );
         }
@@ -842,6 +856,17 @@ fn non_empty_string(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn truncate_runner_output(value: &str) -> String {
+    const MAX_CHARS: usize = 2_000;
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...[truncated]")
+    } else {
+        truncated
+    }
+}
+
 pub fn parse_omx_webhook_payload(body: &[u8]) -> Result<OmxWebhookPayload> {
     let payload = serde_json::from_slice::<OmxWebhookPayload>(body)
         .context("failed to decode OMX webhook payload")?;
@@ -879,12 +904,105 @@ printf '%s\n' '{"ok":true,"session_id":"local-test","status":"completed","tmux_s
 
         let client = OmxRunnerClient::local_for_test(runner.display().to_string());
         let response = client
-            .invoke("group-1", None, None, "run locally", temp.path(), None)
+            .invoke(
+                "group-1",
+                None,
+                None,
+                "run locally",
+                temp.path(),
+                None,
+                BTreeMap::new(),
+            )
             .expect("local runner should execute");
 
         assert_eq!(response.session_id, "local-test");
         assert_eq!(response.status, OmxSessionStatus::Completed);
         assert_eq!(response.summary, "local runner ok");
+    }
+
+    #[test]
+    fn invoke_request_carries_per_run_env_to_local_runner() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let runner = temp.path().join("omx-paperclip-runner");
+        std::fs::write(
+            &runner,
+            r#"#!/bin/sh
+payload="$(cat)"
+case "$payload" in
+  *'"PAPERCLIP_AGENT_ID":"agent-1"'*'"PAPERCLIP_API_KEY":"run-key"'*)
+    printf '%s\n' '{"ok":true,"session_id":"local-test","status":"completed","tmux_session":null,"team_name":null,"summary":"env carried","question":null,"log_path":null,"log_body":null,"artifacts":[],"external_run_id":null,"mode":"exec","workspace_root":"/workspace"}'
+    ;;
+  *)
+    printf '%s\n' "$payload" >&2
+    exit 1
+    ;;
+esac
+"#,
+        )
+        .expect("write runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod runner");
+        }
+
+        let client = OmxRunnerClient::local_for_test(runner.display().to_string());
+        let response = client
+            .invoke(
+                "group-1",
+                None,
+                None,
+                "run locally",
+                temp.path(),
+                None,
+                BTreeMap::from([
+                    ("PAPERCLIP_AGENT_ID".to_string(), "agent-1".to_string()),
+                    ("PAPERCLIP_API_KEY".to_string(), "run-key".to_string()),
+                ]),
+            )
+            .expect("local runner should receive env");
+
+        assert_eq!(response.summary, "env carried");
+    }
+
+    #[test]
+    fn local_runner_nonzero_error_includes_stdout_diagnostics() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let runner = temp.path().join("omx-paperclip-runner");
+        std::fs::write(
+            &runner,
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"ok":false,"session_id":"","status":"failed","summary":"codex auth failed","question":null,"tmux_session":null,"team_name":null,"log_path":null,"log_body":"401 Unauthorized","artifacts":[],"external_run_id":null,"mode":"exec","workspace_root":""}'
+exit 1
+"#,
+        )
+        .expect("write runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod runner");
+        }
+
+        let client = OmxRunnerClient::local_for_test(runner.display().to_string());
+        let error = client
+            .invoke(
+                "group-1",
+                None,
+                None,
+                "run locally",
+                temp.path(),
+                None,
+                BTreeMap::new(),
+            )
+            .expect_err("local runner should fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("local OMX runner command failed"));
+        assert!(message.contains("codex auth failed"));
+        assert!(message.contains("401 Unauthorized"));
     }
 
     #[test]
