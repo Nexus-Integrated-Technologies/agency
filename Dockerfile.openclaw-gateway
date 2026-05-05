@@ -1,10 +1,27 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:1-bookworm AS build
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+
+# Prime Cargo's registry/git caches before copying application source. BuildKit
+# target cache in the release build step keeps compiled artifacts across rebuilds.
+RUN --mount=type=cache,id=nanoclaw-gateway-cargo-registry-amd64,target=/usr/local/cargo/registry,sharing=locked \
+  --mount=type=cache,id=nanoclaw-gateway-cargo-git-amd64,target=/usr/local/cargo/git,sharing=locked \
+  mkdir -p src/bin \
+  && printf 'pub fn placeholder() {}\n' > src/lib.rs \
+  && printf 'fn main() {}\n' > src/bin/nanoclaw.rs \
+  && cargo fetch --locked \
+  && rm -rf src
+
 COPY src ./src
 
-RUN cargo build --release --bin nanoclaw
+RUN --mount=type=cache,id=nanoclaw-gateway-cargo-registry-amd64,target=/usr/local/cargo/registry,sharing=locked \
+  --mount=type=cache,id=nanoclaw-gateway-cargo-git-amd64,target=/usr/local/cargo/git,sharing=locked \
+  --mount=type=cache,id=nanoclaw-gateway-target-amd64,target=/src/target,sharing=locked \
+  cargo build --release --bin nanoclaw --locked \
+  && mkdir -p /out \
+  && cp /src/target/release/nanoclaw /out/nanoclaw
 
 FROM node:lts-trixie-slim AS runtime
 
@@ -16,10 +33,11 @@ RUN apt-get update \
     bash \
     python3 \
     procps \
+    jq \
     ripgrep \
     tmux \
   && rm -rf /var/lib/apt/lists/* \
-  && npm install --global --omit=dev @openai/codex@latest oh-my-codex@0.15.0
+  && npm install --global --omit=dev @openai/codex@latest @anthropic-ai/claude-code@latest oh-my-codex@0.15.0
 
 ENV HOME=/nanoclaw
 ENV NANOCLAW_HOME=/nanoclaw
@@ -31,13 +49,17 @@ ENV NANOCLAW_EXECUTION_LANE=omx
 ENV NANOCLAW_WORKER_BACKEND=codex
 ENV NANOCLAW_CODEX_BIN=codex
 ENV NANOCLAW_CODEX_SANDBOX=danger-full-access
+ENV NANOCLAW_CLAUDE_BIN=claude
+ENV NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND=zai
+ENV NANOCLAW_ZAI_ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
+ENV NANOCLAW_ZAI_MODEL=glm-4
 ENV NANOCLAW_OMX_RUNNER_LOCATION=local
 ENV NANOCLAW_OMX_RUNNER_MODE=local
 ENV NANOCLAW_OMX_RUNNER_PATH=/usr/local/bin/omx-paperclip-runner
 ENV NANOCLAW_OMX_STATE_ROOT=/nanoclaw/.nanoclaw-omx
 ENV NANOCLAW_OMX_CALLBACK_URL=""
 
-COPY --from=build /src/target/release/nanoclaw /usr/local/bin/nanoclaw
+COPY --from=build /out/nanoclaw /usr/local/bin/nanoclaw
 COPY docker/start-openclaw-gateway.sh /usr/local/bin/start-openclaw-gateway.sh
 COPY docker/omx-paperclip-runner.mjs /usr/local/bin/omx-paperclip-runner
 

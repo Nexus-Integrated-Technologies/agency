@@ -1125,7 +1125,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                     Err(err) => {
                         let err_text = err.to_string();
                         if is_codex_usage_limit_error(&err_text) {
-                            run_workers_ai_request(
+                            run_codex_usage_limit_fallback(
                                 &request,
                                 workspace_root.as_path(),
                                 prior_turns,
@@ -1133,7 +1133,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                                 &session_state,
                                 &resolved_backend,
                                 execution_location.clone(),
-                                Some(format!("codex_fallback: {}", err_text)),
+                                err_text,
                             )
                         } else {
                             Err(err)
@@ -1590,7 +1590,89 @@ fn default_codex_sandbox_for_request(request: &WorkerRequest) -> &'static str {
 
 fn is_codex_usage_limit_error(err_text: &str) -> bool {
     let normalized = err_text.to_ascii_lowercase();
-    normalized.contains("usage limit") || normalized.contains("usage_limit")
+    normalized.contains("usage limit")
+        || normalized.contains("usage_limit")
+        || normalized.contains("rate limit")
+        || normalized.contains("rate_limit")
+        || normalized.contains("quota exceeded")
+        || normalized.contains("insufficient_quota")
+        || normalized.contains("429 too many requests")
+        || normalized.contains("status 429")
+}
+
+fn run_codex_usage_limit_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+    codex_error: String,
+) -> Result<BackendExecutionResult> {
+    let fallback = non_empty_env("NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND")
+        .or_else(|| non_empty_env("NANOCLAW_CODEX_LIMIT_FALLBACK_BACKEND"))
+        .unwrap_or_else(|| "zai".to_string())
+        .to_ascii_lowercase();
+    let fallback_reason = Some(format!("codex_usage_limit: {}", codex_error));
+
+    match fallback.as_str() {
+        "off" | "none" | "disabled" => {
+            bail!("codex usage limit reached and fallback is disabled: {codex_error}")
+        }
+        "workers-ai" | "workers_ai" | "workersai" => run_workers_ai_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            execution_location,
+            fallback_reason,
+        ),
+        "zai" | "z-ai" | "glm" | "zhipu" => {
+            let token = non_empty_env("ZAI_ANTHROPIC_AUTH_TOKEN")
+                .or_else(|| non_empty_env("NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN"))
+                .or_else(|| non_empty_env("ZAI_API_KEY"))
+                .or_else(|| non_empty_env("NANOCLAW_ZAI_API_KEY"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "codex usage limit reached and ZAI fallback is enabled, but no ZAI token is configured; set ZAI_ANTHROPIC_AUTH_TOKEN or ZAI_API_KEY"
+                    )
+                })?;
+            let base_url = non_empty_env("ZAI_ANTHROPIC_BASE_URL")
+                .or_else(|| non_empty_env("NANOCLAW_ZAI_ANTHROPIC_BASE_URL"))
+                .unwrap_or_else(|| "https://api.z.ai/api/anthropic".to_string());
+            let model = non_empty_env("NANOCLAW_ZAI_MODEL")
+                .or_else(|| non_empty_env("ZAI_ANTHROPIC_MODEL"))
+                .unwrap_or_else(|| "glm-4".to_string());
+
+            run_claude_request_with_options(
+                request,
+                workspace_root,
+                prior_turns,
+                instruction_hint,
+                session_state,
+                resolved_backend,
+                ClaudeRequestOptions {
+                    provider: Some("zai".to_string()),
+                    biller: Some("zai".to_string()),
+                    billing_type: Some("api".to_string()),
+                    model: Some(model),
+                    env_overrides: vec![
+                        ("ANTHROPIC_AUTH_TOKEN".to_string(), token.clone()),
+                        ("ANTHROPIC_API_KEY".to_string(), token),
+                        ("ANTHROPIC_BASE_URL".to_string(), base_url),
+                    ],
+                    fallback_reason,
+                },
+            )
+        }
+        other => bail!(
+            "unsupported NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND '{}'; expected zai, workers-ai, or disabled",
+            other
+        ),
+    }
 }
 
 fn should_use_container_lane(container_groups: &[String], group: &Group) -> bool {
@@ -2122,6 +2204,36 @@ fn run_claude_request(
     resolved_backend: &ResolvedWorkerBackend,
     _execution_location: ExecutionLocation,
 ) -> Result<BackendExecutionResult> {
+    run_claude_request_with_options(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        ClaudeRequestOptions::default(),
+    )
+}
+
+#[derive(Debug, Default)]
+struct ClaudeRequestOptions {
+    provider: Option<String>,
+    biller: Option<String>,
+    billing_type: Option<String>,
+    model: Option<String>,
+    env_overrides: Vec<(String, String)>,
+    fallback_reason: Option<String>,
+}
+
+fn run_claude_request_with_options(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    options: ClaudeRequestOptions,
+) -> Result<BackendExecutionResult> {
     if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
         bail!(error);
     }
@@ -2148,7 +2260,11 @@ fn run_claude_request(
         .arg(&prompt)
         .arg("--output-format")
         .arg("text");
-    if let Some(model) = non_empty_env("NANOCLAW_CLAUDE_MODEL") {
+    let selected_model = options
+        .model
+        .clone()
+        .or_else(|| non_empty_env("NANOCLAW_CLAUDE_MODEL"));
+    if let Some(model) = selected_model.as_deref() {
         command.arg("--model").arg(model);
     }
     if let Some(permission_mode) = non_empty_env("NANOCLAW_CLAUDE_PERMISSION_MODE") {
@@ -2170,6 +2286,9 @@ fn run_claude_request(
         command.env_remove(key);
     }
     for (key, value) in &request.env {
+        command.env(key, value);
+    }
+    for (key, value) in &options.env_overrides {
         command.env(key, value);
     }
     if let Some(project_environment) = project_environment {
@@ -2207,7 +2326,7 @@ fn run_claude_request(
     }
 
     let log_body = format!(
-        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=claude\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
+        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=claude\nprovider={}\nbiller={}\nbilling_type={}\nmodel={}\nfallback_reason={:?}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
         request.invocation_id,
         request.session.id,
         workspace_root.display(),
@@ -2215,6 +2334,11 @@ fn run_claude_request(
         prior_turns + 1,
         instruction_hint,
         prompt.len(),
+        options.provider.as_deref().unwrap_or("-"),
+        options.biller.as_deref().unwrap_or("-"),
+        options.billing_type.as_deref().unwrap_or("-"),
+        selected_model.as_deref().unwrap_or("-"),
+        options.fallback_reason,
         request.request_plane.as_str(),
         project_environment
             .map(|resolved| resolved.project.id.as_str())
@@ -2241,10 +2365,10 @@ fn run_claude_request(
         log_body,
         metadata: BackendExecutionMetadata {
             backend: WorkerBackend::Claude,
-            provider: None,
-            biller: None,
-            billing_type: None,
-            model: None,
+            provider: options.provider,
+            biller: options.biller,
+            billing_type: options.billing_type,
+            model: selected_model,
             usage: None,
             cost_usd: None,
             effective_capabilities: capability_manifest,
@@ -2253,7 +2377,7 @@ fn run_claude_request(
                 .map(|state| state.secret_handles.clone())
                 .unwrap_or_default(),
             mount_summary: build_host_mount_summary(workspace_root, &cwd, &[], "workspace-write"),
-            fallback_reason: None,
+            fallback_reason: options.fallback_reason,
         },
     })
 }
@@ -2900,6 +3024,8 @@ mod tests {
     fn codex_fallback_only_accepts_usage_limit_errors() {
         assert!(is_codex_usage_limit_error("Codex usage limit reached"));
         assert!(is_codex_usage_limit_error("usage_limit exceeded"));
+        assert!(is_codex_usage_limit_error("status 429 rate limit"));
+        assert!(is_codex_usage_limit_error("insufficient_quota"));
         assert!(!is_codex_usage_limit_error(
             "codex execution failed with exit status: 1"
         ));
