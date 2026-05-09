@@ -40,6 +40,8 @@ pub struct NanoclawConfig {
     pub omx_poll_interval_ms: u64,
     pub openclaw_gateway_bind_host: String,
     pub openclaw_gateway_public_host: String,
+    pub openclaw_gateway_public_ws_url: Option<String>,
+    pub openclaw_gateway_public_health_url: Option<String>,
     pub openclaw_gateway_port: u16,
     pub openclaw_gateway_token: String,
     pub openclaw_gateway_execution_lane: ExecutionLane,
@@ -166,6 +168,15 @@ impl NanoclawConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| droplet_ssh_host.clone());
+        let openclaw_gateway_public_ws_url = env::var("NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let openclaw_gateway_public_health_url =
+            env::var("NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
         let openclaw_gateway_port = env::var("NANOCLAW_OPENCLAW_GATEWAY_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -352,6 +363,8 @@ impl NanoclawConfig {
             omx_poll_interval_ms,
             openclaw_gateway_bind_host,
             openclaw_gateway_public_host,
+            openclaw_gateway_public_ws_url,
+            openclaw_gateway_public_health_url,
             openclaw_gateway_port,
             openclaw_gateway_token,
             openclaw_gateway_execution_lane,
@@ -385,6 +398,9 @@ impl NanoclawConfig {
     }
 
     pub fn openclaw_gateway_public_ws_url(&self) -> Option<String> {
+        if self.openclaw_gateway_public_ws_url.is_some() {
+            return self.openclaw_gateway_public_ws_url.clone();
+        }
         if self.openclaw_gateway_port == 0 || self.openclaw_gateway_public_host.trim().is_empty() {
             return None;
         }
@@ -395,6 +411,9 @@ impl NanoclawConfig {
     }
 
     pub fn openclaw_gateway_public_health_url(&self) -> Option<String> {
+        if self.openclaw_gateway_public_health_url.is_some() {
+            return self.openclaw_gateway_public_health_url.clone();
+        }
         if self.openclaw_gateway_port == 0 || self.openclaw_gateway_public_host.trim().is_empty() {
             return None;
         }

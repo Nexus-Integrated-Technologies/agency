@@ -189,6 +189,8 @@ mod tests {
             omx_poll_interval_ms: 5_000,
             openclaw_gateway_bind_host: "127.0.0.1".to_string(),
             openclaw_gateway_public_host: "127.0.0.1".to_string(),
+            openclaw_gateway_public_ws_url: None,
+            openclaw_gateway_public_health_url: None,
             openclaw_gateway_port: 0,
             openclaw_gateway_token: String::new(),
             openclaw_gateway_execution_lane: ExecutionLane::Host,
