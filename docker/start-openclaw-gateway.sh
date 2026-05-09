@@ -27,12 +27,8 @@ if [ -n "$RENDER_PUBLIC_ORIGIN" ]; then
   export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL="${NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL:-$RENDER_GATEWAY_WS_URL}"
   export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL="${NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL:-${RENDER_GATEWAY_URL}/health}"
 fi
-if [ "${RENDER_SERVICE_NAME:-}" = "nexus-openclaw-gateway" ] \
-  || [ "${RENDER_EXTERNAL_HOSTNAME:-}" = "nexus-openclaw-gateway.onrender.com" ] \
-  || [ "${RENDER_EXTERNAL_URL:-}" = "https://nexus-openclaw-gateway.onrender.com" ]; then
-  export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL="wss://nexus-openclaw-gateway.onrender.com/openclaw"
-  export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL="https://nexus-openclaw-gateway.onrender.com/openclaw/health"
-fi
+export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL="wss://nexus-openclaw-gateway.onrender.com/openclaw"
+export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL="https://nexus-openclaw-gateway.onrender.com/openclaw/health"
 export NANOCLAW_CLAUDE_BIN="${NANOCLAW_CLAUDE_BIN:-claude}"
 export NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND="${NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND:-zai}"
 export NANOCLAW_ZAI_ANTHROPIC_BASE_URL="${NANOCLAW_ZAI_ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}"
