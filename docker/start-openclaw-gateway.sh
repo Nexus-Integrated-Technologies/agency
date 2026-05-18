@@ -30,6 +30,8 @@ fi
 export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL="wss://nexus-openclaw-gateway.onrender.com/openclaw"
 export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL="https://nexus-openclaw-gateway.onrender.com/openclaw/health"
 export NANOCLAW_CLAUDE_BIN="${NANOCLAW_CLAUDE_BIN:-claude}"
+export NANOCLAW_WORKER_BACKEND="${NANOCLAW_FORCE_WORKER_BACKEND:-${NANOCLAW_PRIMARY_WORKER_BACKEND:-azure-openai}}"
+export NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND="${NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND:-codex}"
 export NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND="${NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND:-azure-openai}"
 export AZURE_OPENAI_ENDPOINT="${AZURE_OPENAI_ENDPOINT:-https://nis-openai-c5e29800.openai.azure.com/}"
 export AZURE_OPENAI_DEPLOYMENT="${AZURE_OPENAI_DEPLOYMENT:-nanoclaw-gpt-4-1-mini}"
@@ -60,8 +62,8 @@ elif [ -n "$CODEX_AUTH_JSON_B64" ]; then
   chmod 600 "$CODEX_HOME/auth.json"
 fi
 
-if [ "${NANOCLAW_WORKER_BACKEND:-codex}" = "codex" ] && [ ! -s "$CODEX_HOME/auth.json" ]; then
-  echo "warning: NANOCLAW_WORKER_BACKEND=codex but CODEX_HOME/auth.json is missing" >&2
+if { [ "${NANOCLAW_WORKER_BACKEND:-}" = "codex" ] || [ "${NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND:-}" = "codex" ]; } && [ ! -s "$CODEX_HOME/auth.json" ]; then
+  echo "warning: Codex is selected as primary or backup but CODEX_HOME/auth.json is missing" >&2
 fi
 
 if [ "${NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND}" = "zai" ] \

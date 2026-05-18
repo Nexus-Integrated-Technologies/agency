@@ -1173,14 +1173,14 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 &resolved_backend,
                 execution_location.clone(),
             ),
-            WorkerBackend::AzureOpenAI => run_azure_openai_request(
+            WorkerBackend::AzureOpenAI => run_azure_openai_request_with_codex_fallback(
                 &request,
                 workspace_root.as_path(),
                 prior_turns,
                 &instruction_hint,
                 &session_state,
                 &resolved_backend,
-                None,
+                execution_location.clone(),
             ),
             WorkerBackend::GithubCopilot => run_github_copilot_request(
                 &request,
@@ -1787,6 +1787,75 @@ fn run_zai_request_with_codex_fallback(
             })
         }
     }
+}
+
+fn run_azure_openai_request_with_codex_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+) -> Result<BackendExecutionResult> {
+    match run_azure_openai_request(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        None,
+    ) {
+        Ok(result) => Ok(result),
+        Err(azure_error) => {
+            let azure_error_text = azure_error.to_string();
+            let fallback = azure_openai_fallback_backend();
+            match fallback.as_str() {
+                "off" | "none" | "disabled" => Err(azure_error),
+                "codex" | "codex-local" | "codex_local" | "openai" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_codex_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        execution_location,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and Codex fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
+                other => bail!(
+                    "unsupported NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND '{}'; expected codex or disabled",
+                    other
+                ),
+            }
+        }
+    }
+}
+
+fn azure_openai_fallback_backend() -> String {
+    normalize_azure_openai_fallback_backend(
+        non_empty_env("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND")
+            .or_else(|| non_empty_env("NANOCLAW_AZURE_FALLBACK_BACKEND")),
+    )
+}
+
+fn normalize_azure_openai_fallback_backend(value: Option<String>) -> String {
+    value
+        .unwrap_or_else(|| "codex".to_string())
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn run_zai_request(
@@ -3863,8 +3932,8 @@ mod tests {
         build_azure_openai_chat_target, build_execution_metadata, build_execution_session,
         build_github_copilot_command, connect_to_worker_socket, default_codex_sandbox_for_request,
         detect_paperclip_control_plane_blocker, execute_worker_request, extract_azure_openai_text,
-        is_codex_usage_limit_error, normalize_branch_name, normalize_github_repo_ref,
-        parse_azure_openai_usage, parse_codex_jsonl, read_json,
+        is_codex_usage_limit_error, normalize_azure_openai_fallback_backend, normalize_branch_name,
+        normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, read_json,
         run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
         should_use_remote_lane, wait_for_worker_socket, write_json, BackendExecutionMetadata,
         BackendExecutionResult, ContainerExecutor, DigitalOceanDevEnvironment, ExecutionLaneRouter,
@@ -3973,6 +4042,19 @@ mod tests {
                 cached_input_tokens: 25,
                 output_tokens: 50,
             })
+        );
+    }
+
+    #[test]
+    fn azure_openai_fallback_defaults_to_codex() {
+        assert_eq!(normalize_azure_openai_fallback_backend(None), "codex");
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some(" CODEX ".to_string())),
+            "codex"
+        );
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some("disabled".to_string())),
+            "disabled"
         );
     }
 

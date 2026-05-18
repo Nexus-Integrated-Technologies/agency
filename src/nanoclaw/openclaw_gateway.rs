@@ -1433,6 +1433,8 @@ fn paperclip_runtime_env(paperclip: Option<&GatewayPaperclipPayload>) -> BTreeMa
         "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
         "AZURE_OPENAI_API_VERSION",
         "NANOCLAW_AZURE_OPENAI_API_VERSION",
+        "NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND",
+        "NANOCLAW_AZURE_FALLBACK_BACKEND",
     ];
 
     let mut env = BTreeMap::new();
