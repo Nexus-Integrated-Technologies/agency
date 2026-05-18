@@ -255,6 +255,13 @@ struct GatewayHints {
     azure_endpoint: Option<String>,
     #[serde(alias = "azure_api_version")]
     azure_api_version: Option<String>,
+    #[serde(alias = "azure_fallback_backend", alias = "azureOpenAiFallbackBackend")]
+    azure_fallback_backend: Option<String>,
+    #[serde(
+        alias = "codex_usage_fallback_backend",
+        alias = "codexUsageFallbackBackend"
+    )]
+    codex_usage_fallback_backend: Option<String>,
     #[serde(alias = "github_copilot_repo")]
     github_copilot_repo: Option<String>,
     #[serde(alias = "github_copilot_base")]
@@ -1583,6 +1590,28 @@ fn gateway_runtime_env(params: &GatewayAgentParams) -> BTreeMap<String, String> 
                 api_version.to_string(),
             );
         }
+        if let Some(fallback_backend) = gateway
+            .azure_fallback_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            env.insert(
+                "NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND".to_string(),
+                fallback_backend.to_string(),
+            );
+        }
+        if let Some(fallback_backend) = gateway
+            .codex_usage_fallback_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            env.insert(
+                "NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND".to_string(),
+                fallback_backend.to_string(),
+            );
+        }
         if let Some(custom_agent) = gateway
             .github_copilot_custom_agent
             .as_deref()
@@ -2882,6 +2911,8 @@ mod tests {
                     model: Some("cto-deployment".to_string()),
                     azure_endpoint: Some("https://example.openai.azure.com/openai/v1/".to_string()),
                     azure_api_version: Some("v1".to_string()),
+                    azure_fallback_backend: Some("codex".to_string()),
+                    codex_usage_fallback_backend: Some("zai".to_string()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2909,7 +2940,47 @@ mod tests {
                 .map(String::as_str),
             Some("v1")
         );
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND")
+                .map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND")
+                .map(String::as_str),
+            Some("zai")
+        );
         assert!(!env.contains_key("NANOCLAW_ZAI_MODEL"));
+    }
+
+    #[test]
+    fn gateway_hints_deserialize_provider_fallback_aliases() {
+        let params: GatewayAgentParams = serde_json::from_value(serde_json::json!({
+            "paperclip": {
+                "gateway": {
+                    "workerBackend": "azure-openai",
+                    "azureFallbackBackend": "codex",
+                    "codexUsageFallbackBackend": "zai"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            gateway_backend_override(&params),
+            Some(WorkerBackend::AzureOpenAI)
+        );
+        let env = gateway_runtime_env(&params);
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND")
+                .map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND")
+                .map(String::as_str),
+            Some("zai")
+        );
     }
 
     #[test]

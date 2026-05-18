@@ -1835,8 +1835,51 @@ fn run_azure_openai_request_with_codex_fallback(
                         )
                     })
                 }
+                "zai" | "z-ai" | "glm" | "zhipu" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_zai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and ZAI fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
+                "workers-ai" | "workers_ai" | "workersai" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_workers_ai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        execution_location,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and Workers AI fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
                 other => bail!(
-                    "unsupported NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND '{}'; expected codex or disabled",
+                    "unsupported NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND '{}'; expected codex, zai, workers-ai, or disabled",
                     other
                 ),
             }
@@ -4051,6 +4094,14 @@ mod tests {
         assert_eq!(
             normalize_azure_openai_fallback_backend(Some(" CODEX ".to_string())),
             "codex"
+        );
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some(" ZAI ".to_string())),
+            "zai"
+        );
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some(" workers-ai ".to_string())),
+            "workers-ai"
         );
         assert_eq!(
             normalize_azure_openai_fallback_backend(Some("disabled".to_string())),
