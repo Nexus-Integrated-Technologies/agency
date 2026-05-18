@@ -30,7 +30,10 @@ fi
 export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL="wss://nexus-openclaw-gateway.onrender.com/openclaw"
 export NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL="https://nexus-openclaw-gateway.onrender.com/openclaw/health"
 export NANOCLAW_CLAUDE_BIN="${NANOCLAW_CLAUDE_BIN:-claude}"
-export NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND="${NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND:-zai}"
+export NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND="${NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND:-azure-openai}"
+export AZURE_OPENAI_ENDPOINT="${AZURE_OPENAI_ENDPOINT:-https://nis-openai-c5e29800.openai.azure.com/}"
+export AZURE_OPENAI_DEPLOYMENT="${AZURE_OPENAI_DEPLOYMENT:-nanoclaw-gpt-4-1-mini}"
+export AZURE_OPENAI_API_VERSION="${AZURE_OPENAI_API_VERSION:-2024-10-21}"
 export NANOCLAW_ZAI_ANTHROPIC_BASE_URL="${NANOCLAW_ZAI_ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}"
 export NANOCLAW_ZAI_MODEL="${NANOCLAW_ZAI_MODEL:-glm-4.7}"
 export NANOCLAW_OMX_RUNNER_LOCATION="${NANOCLAW_OMX_RUNNER_LOCATION:-local}"
@@ -65,6 +68,22 @@ if [ "${NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND}" = "zai" ] \
   && [ -z "${ZAI_ANTHROPIC_AUTH_TOKEN:-${NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN:-${ZAI_API_KEY:-${NANOCLAW_ZAI_API_KEY:-}}}}" ]; then
   echo "warning: Codex usage-limit fallback is set to ZAI but no ZAI token is configured" >&2
 fi
+
+AZURE_FALLBACK_BACKEND="$(printf '%s' "${NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
+AZURE_WORKER_BACKEND="$(printf '%s' "${NANOCLAW_WORKER_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
+case "$AZURE_FALLBACK_BACKEND:$AZURE_WORKER_BACKEND" in
+  *azure*openai*|*azure-ai*|*azure_ai*|*azure-foundry*|*azure_foundry*|azure:*|*:azure)
+    if [ -z "${AZURE_OPENAI_API_KEY:-${NANOCLAW_AZURE_OPENAI_API_KEY:-${AZURE_AI_API_KEY:-${NANOCLAW_AZURE_AI_API_KEY:-}}}}" ]; then
+      echo "warning: Azure OpenAI backend is selected but no Azure API key is configured" >&2
+    fi
+    if [ -z "${AZURE_OPENAI_ENDPOINT:-${NANOCLAW_AZURE_OPENAI_ENDPOINT:-${AZURE_OPENAI_BASE_URL:-${NANOCLAW_AZURE_OPENAI_BASE_URL:-}}}}" ]; then
+      echo "warning: Azure OpenAI backend is selected but no Azure endpoint is configured" >&2
+    fi
+    if [ -z "${AZURE_OPENAI_DEPLOYMENT:-${NANOCLAW_AZURE_OPENAI_DEPLOYMENT:-${AZURE_OPENAI_MODEL:-${NANOCLAW_AZURE_OPENAI_MODEL:-${AZURE_OPENAI_DEPLOYMENT_NAME:-${NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME:-}}}}}}" ]; then
+      echo "warning: Azure OpenAI backend is selected but no deployment/model is configured" >&2
+    fi
+    ;;
+esac
 
 cd "$NANOCLAW_HOME"
 exec /usr/local/bin/nanoclaw gateway serve

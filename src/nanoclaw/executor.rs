@@ -41,7 +41,7 @@ use super::security_profile::{
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 const SOURCE_CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const DEFAULT_CONTAINER_CACHE_DIR: &str = "/tmp/nanoclaw-target";
 const DEFAULT_CODEX_SANDBOX: &str = "workspace-write";
@@ -323,7 +323,12 @@ impl ExecutorBoundary for RustSubprocessExecutor {
         stream
             .shutdown(Shutdown::Write)
             .context("failed to close worker socket write side")?;
-        let outcome: WorkerOutcome = read_json(&mut stream)?;
+        let outcome: WorkerOutcome = read_json(&mut stream).with_context(|| {
+            format!(
+                "worker did not return a payload before the request timeout ({} ms); set NANOCLAW_WORKER_REQUEST_TIMEOUT_MS higher for long local jobs",
+                worker_request_timeout().as_millis()
+            )
+        })?;
         decode_worker_outcome(outcome)
     }
 }
@@ -896,6 +901,7 @@ struct BackendExecutionMetadata {
     secret_handles: Vec<String>,
     mount_summary: Vec<ExecutionMountSummaryEntry>,
     fallback_reason: Option<String>,
+    external_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -984,6 +990,13 @@ fn run_worker_daemon_with_idle_timeout(session_root: &Path, idle_timeout: Durati
                 stream
                     .set_nonblocking(false)
                     .context("failed to configure worker stream blocking mode")?;
+                let request_timeout = worker_request_timeout();
+                stream
+                    .set_read_timeout(Some(request_timeout))
+                    .context("failed to set worker stream read timeout")?;
+                stream
+                    .set_write_timeout(Some(request_timeout))
+                    .context("failed to set worker stream write timeout")?;
                 last_activity = Instant::now();
                 handle_daemon_connection(&mut stream)?;
             }
@@ -1120,6 +1133,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                     &session_state,
                     &resolved_backend,
                     execution_location.clone(),
+                    None,
                 ) {
                     Ok(res) => Ok(res),
                     Err(err) => {
@@ -1149,6 +1163,32 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 &session_state,
                 &resolved_backend,
                 execution_location.clone(),
+            ),
+            WorkerBackend::Zai => run_zai_request_with_codex_fallback(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+                execution_location.clone(),
+            ),
+            WorkerBackend::AzureOpenAI => run_azure_openai_request(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+                None,
+            ),
+            WorkerBackend::GithubCopilot => run_github_copilot_request(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
             ),
             WorkerBackend::WorkersAI => run_workers_ai_request(
                 &request,
@@ -1273,7 +1313,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
 }
 
 fn handle_daemon_connection(stream: &mut UnixStream) -> Result<()> {
-    let request: WorkerRequest = read_json(stream)?;
+    let request: WorkerRequest = read_single_json(stream)?;
     let outcome = match execute_worker_request(request) {
         Ok(response) => WorkerOutcome {
             response: Some(response),
@@ -1417,7 +1457,7 @@ fn build_execution_metadata(
         team_name: None,
         summary: None,
         artifacts: Vec::new(),
-        external_run_id: None,
+        external_run_id: result.metadata.external_run_id.clone(),
     }
 }
 
@@ -1600,6 +1640,48 @@ fn is_codex_usage_limit_error(err_text: &str) -> bool {
         || normalized.contains("status 429")
 }
 
+fn detect_paperclip_control_plane_blocker(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let mentions_approval = normalized.contains("approval restriction")
+        || normalized.contains("requires approval")
+        || normalized.contains("approval is required")
+        || normalized.contains("without approval");
+    let mentions_control_plane = normalized.contains("paperclip.api")
+        || normalized.contains("paperclip api")
+        || normalized.contains("paperclip_api")
+        || normalized.contains("api call")
+        || normalized.contains("http request")
+        || normalized.contains("network call")
+        || normalized.contains("network request")
+        || normalized.contains("checkout issue")
+        || normalized.contains("checking out issue")
+        || normalized.contains("verifying identity");
+    let mentions_sandbox = normalized.contains("sandbox") || normalized.contains("permission");
+
+    if mentions_approval && mentions_control_plane && mentions_sandbox {
+        return Some(format!(
+            "paperclip control-plane approval blocker: {}",
+            summarize_for_chat(trimmed, 600)
+        ));
+    }
+
+    if normalized.contains("sandbox requires approval")
+        && (mentions_control_plane || normalized.contains("http"))
+    {
+        return Some(format!(
+            "paperclip sandbox approval blocker: {}",
+            summarize_for_chat(trimmed, 600)
+        ));
+    }
+
+    None
+}
+
 fn run_codex_usage_limit_fallback(
     request: &WorkerRequest,
     workspace_root: &Path,
@@ -1630,48 +1712,463 @@ fn run_codex_usage_limit_fallback(
             execution_location,
             fallback_reason,
         ),
-        "zai" | "z-ai" | "glm" | "zhipu" => {
-            let token = non_empty_env("ZAI_ANTHROPIC_AUTH_TOKEN")
-                .or_else(|| non_empty_env("NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN"))
-                .or_else(|| non_empty_env("ZAI_API_KEY"))
-                .or_else(|| non_empty_env("NANOCLAW_ZAI_API_KEY"))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "codex usage limit reached and ZAI fallback is enabled, but no ZAI token is configured; set ZAI_ANTHROPIC_AUTH_TOKEN or ZAI_API_KEY"
-                    )
-                })?;
-            let base_url = non_empty_env("ZAI_ANTHROPIC_BASE_URL")
-                .or_else(|| non_empty_env("NANOCLAW_ZAI_ANTHROPIC_BASE_URL"))
-                .unwrap_or_else(|| "https://api.z.ai/api/anthropic".to_string());
-            let model = non_empty_env("NANOCLAW_ZAI_MODEL")
-                .or_else(|| non_empty_env("ZAI_ANTHROPIC_MODEL"))
-                .unwrap_or_else(|| "glm-4".to_string());
+        "zai" | "z-ai" | "glm" | "zhipu" => run_zai_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            fallback_reason,
+        ),
+        "azure"
+        | "azure-openai"
+        | "azure_openai"
+        | "azureopenai"
+        | "azure-ai"
+        | "azure_ai"
+        | "azure-foundry"
+        | "azure_foundry" => run_azure_openai_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            fallback_reason,
+        ),
+        other => bail!(
+            "unsupported NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND '{}'; expected zai, azure-openai, workers-ai, or disabled",
+            other
+        ),
+    }
+}
 
-            run_claude_request_with_options(
+fn run_zai_request_with_codex_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+) -> Result<BackendExecutionResult> {
+    match run_zai_request(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        None,
+    ) {
+        Ok(result) => Ok(result),
+        Err(zai_error) => {
+            let zai_error_text = zai_error.to_string();
+            let fallback_reason = Some(format!(
+                "zai_unavailable: {}",
+                summarize_for_chat(&zai_error_text, 600)
+            ));
+            run_codex_request(
                 request,
                 workspace_root,
                 prior_turns,
                 instruction_hint,
                 session_state,
                 resolved_backend,
-                ClaudeRequestOptions {
-                    provider: Some("zai".to_string()),
-                    biller: Some("zai".to_string()),
-                    billing_type: Some("api".to_string()),
-                    model: Some(model),
-                    env_overrides: vec![
-                        ("ANTHROPIC_AUTH_TOKEN".to_string(), token.clone()),
-                        ("ANTHROPIC_API_KEY".to_string(), token),
-                        ("ANTHROPIC_BASE_URL".to_string(), base_url),
-                    ],
-                    fallback_reason,
-                },
+                execution_location,
+                fallback_reason,
+            )
+            .with_context(|| {
+                format!(
+                    "ZAI backend failed and Codex fallback also failed; ZAI error: {}",
+                    summarize_for_chat(&zai_error_text, 600)
+                )
+            })
+        }
+    }
+}
+
+fn run_zai_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    fallback_reason: Option<String>,
+) -> Result<BackendExecutionResult> {
+    let token = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "ZAI_ANTHROPIC_AUTH_TOKEN",
+            "NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN",
+            "ZAI_API_KEY",
+            "NANOCLAW_ZAI_API_KEY",
+        ],
+    )
+    .ok_or_else(|| {
+        if fallback_reason.is_some() {
+            anyhow::anyhow!(
+                "codex usage limit reached and ZAI fallback is enabled, but no ZAI token is configured; set ZAI_ANTHROPIC_AUTH_TOKEN or ZAI_API_KEY"
+            )
+        } else {
+            anyhow::anyhow!(
+                "ZAI backend is enabled, but no ZAI token is configured; set ZAI_ANTHROPIC_AUTH_TOKEN or ZAI_API_KEY"
             )
         }
-        other => bail!(
-            "unsupported NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND '{}'; expected zai, workers-ai, or disabled",
-            other
-        ),
+    })?;
+    let base_url = first_non_empty_request_or_process_env(
+        request,
+        &["ZAI_ANTHROPIC_BASE_URL", "NANOCLAW_ZAI_ANTHROPIC_BASE_URL"],
+    )
+    .unwrap_or_else(|| "https://api.z.ai/api/anthropic".to_string());
+    let model = first_non_empty_request_or_process_env(
+        request,
+        &["NANOCLAW_ZAI_MODEL", "ZAI_ANTHROPIC_MODEL"],
+    )
+    .unwrap_or_else(|| "glm-4.7".to_string());
+
+    run_claude_request_with_options(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        ClaudeRequestOptions {
+            backend: Some(WorkerBackend::Zai),
+            provider: Some("zai".to_string()),
+            biller: Some("zai".to_string()),
+            billing_type: Some("api".to_string()),
+            model: Some(model),
+            env_overrides: vec![
+                ("ANTHROPIC_AUTH_TOKEN".to_string(), token.clone()),
+                ("ANTHROPIC_API_KEY".to_string(), token),
+                ("ANTHROPIC_BASE_URL".to_string(), base_url),
+            ],
+            fallback_reason,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AzureOpenAIChatTarget {
+    url: String,
+    include_model: bool,
+}
+
+fn run_azure_openai_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    _prior_turns: usize,
+    _instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    fallback_reason: Option<String>,
+) -> Result<BackendExecutionResult> {
+    if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
+        bail!(error);
+    }
+
+    let token = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_API_KEY",
+            "NANOCLAW_AZURE_OPENAI_API_KEY",
+            "AZURE_AI_API_KEY",
+            "NANOCLAW_AZURE_AI_API_KEY",
+        ],
+    )
+    .ok_or_else(|| {
+        if fallback_reason.is_some() {
+            anyhow::anyhow!(
+                "codex usage limit reached and Azure OpenAI fallback is enabled, but no Azure key is configured; set AZURE_OPENAI_API_KEY"
+            )
+        } else {
+            anyhow::anyhow!(
+                "Azure OpenAI backend is enabled, but no Azure key is configured; set AZURE_OPENAI_API_KEY"
+            )
+        }
+    })?;
+    let endpoint = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_ENDPOINT",
+            "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+            "AZURE_OPENAI_BASE_URL",
+            "NANOCLAW_AZURE_OPENAI_BASE_URL",
+        ],
+    )
+    .context("Azure OpenAI backend requires AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_BASE_URL")?;
+    let deployment = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_DEPLOYMENT",
+            "NANOCLAW_AZURE_OPENAI_DEPLOYMENT",
+            "AZURE_OPENAI_MODEL",
+            "NANOCLAW_AZURE_OPENAI_MODEL",
+            "AZURE_OPENAI_DEPLOYMENT_NAME",
+            "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
+        ],
+    )
+    .context("Azure OpenAI backend requires AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_MODEL")?;
+    let api_version = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_API_VERSION",
+            "NANOCLAW_AZURE_OPENAI_API_VERSION",
+        ],
+    )
+    .unwrap_or_else(|| "2024-10-21".to_string());
+    let target = build_azure_openai_chat_target(&endpoint, &deployment, &api_version)?;
+    let prompt = build_worker_prompt(request, workspace_root, session_state)?;
+    let temperature = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_TEMPERATURE",
+            "NANOCLAW_AZURE_OPENAI_TEMPERATURE",
+        ],
+    )
+    .and_then(|value| value.parse::<f64>().ok())
+    .unwrap_or(0.2);
+    let max_tokens = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_MAX_TOKENS",
+            "NANOCLAW_AZURE_OPENAI_MAX_TOKENS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(2048);
+    let timeout = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_TIMEOUT_MS",
+            "NANOCLAW_AZURE_OPENAI_TIMEOUT_MS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value >= 1000)
+    .map(Duration::from_millis)
+    .unwrap_or_else(|| Duration::from_secs(120));
+
+    let mut payload = serde_json::Map::new();
+    if target.include_model {
+        payload.insert("model".to_string(), Value::String(deployment.clone()));
+    }
+    payload.insert(
+        "messages".to_string(),
+        Value::Array(vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "You are a NanoClaw provider backend. Return only the operator-facing message that should be written back through the existing OpenClaw/OMX/Paperclip evidence path. Do not claim code, shell, PR, or deploy execution unless the prompt includes concrete evidence."
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": prompt,
+            }),
+        ]),
+    );
+    if let Some(number) = serde_json::Number::from_f64(temperature) {
+        payload.insert("temperature".to_string(), Value::Number(number));
+    }
+    payload.insert(
+        "max_tokens".to_string(),
+        Value::Number(serde_json::Number::from(max_tokens)),
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build Azure OpenAI HTTP client")?;
+    let response = client
+        .post(&target.url)
+        .header("content-type", "application/json")
+        .header("api-key", &token)
+        .bearer_auth(&token)
+        .json(&Value::Object(payload))
+        .send()
+        .context("failed to send request to Azure OpenAI")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read Azure OpenAI response body")?;
+    if !status.is_success() {
+        bail!(
+            "Azure OpenAI execution failed with status {} for endpoint {}: {}",
+            status,
+            redact_azure_openai_url(&target.url),
+            summarize_workers_ai_body(&body)
+        );
+    }
+
+    let result: Value = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "failed to parse Azure OpenAI response: {}",
+            summarize_workers_ai_body(&body)
+        )
+    })?;
+    let text = extract_azure_openai_text(&result).unwrap_or_default();
+    if text.trim().is_empty() {
+        bail!("Azure OpenAI execution produced empty output");
+    }
+    if is_paperclip_gateway_request(request) {
+        if let Some(blocker) = detect_paperclip_control_plane_blocker(&text) {
+            bail!("azure-openai execution blocked: {blocker}");
+        }
+    }
+
+    let usage = parse_azure_openai_usage(&result);
+    let capability_manifest = derive_capability_manifest(
+        &request.request_plane,
+        DeriveCapabilityManifestInput::default(),
+    );
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\nbackend=azure-openai\nprovider=azure_openai\nbiller=azure\nbilling_type=azure_credits\nmodel={}\nfallback_reason={:?}\nendpoint={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\nrequest_plane={}\nresponse=\n{}\n",
+        request.invocation_id,
+        request.session.id,
+        workspace_root.display(),
+        deployment,
+        fallback_reason,
+        redact_azure_openai_url(&target.url),
+        usage.as_ref().map(|value| value.input_tokens).unwrap_or(0),
+        usage.as_ref()
+            .map(|value| value.cached_input_tokens)
+            .unwrap_or(0),
+        usage.as_ref().map(|value| value.output_tokens).unwrap_or(0),
+        request.request_plane.as_str(),
+        text
+    );
+
+    Ok(BackendExecutionResult {
+        text,
+        log_body,
+        metadata: BackendExecutionMetadata {
+            backend: WorkerBackend::AzureOpenAI,
+            provider: Some("azure_openai".to_string()),
+            biller: Some("azure".to_string()),
+            billing_type: Some("azure_credits".to_string()),
+            model: Some(deployment),
+            usage,
+            cost_usd: None,
+            effective_capabilities: capability_manifest,
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
+            secret_handles: Vec::new(),
+            mount_summary: vec![ExecutionMountSummaryEntry {
+                host_path: Some(workspace_root.display().to_string()),
+                container_path: None,
+                readonly: false,
+                kind: ExecutionMountKind::Project,
+            }],
+            fallback_reason,
+            external_run_id: None,
+        },
+    })
+}
+
+fn build_azure_openai_chat_target(
+    endpoint: &str,
+    deployment: &str,
+    api_version: &str,
+) -> Result<AzureOpenAIChatTarget> {
+    let endpoint = endpoint.trim();
+    let deployment = deployment.trim();
+    let api_version = api_version.trim();
+    let mut parsed = reqwest::Url::parse(endpoint)
+        .context("AZURE_OPENAI_ENDPOINT must be a valid absolute URL")?;
+    let path = parsed.path().trim_end_matches('/').to_string();
+
+    if path.ends_with("/chat/completions") {
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if let Some(index) = path.find("/openai/v1") {
+        let prefix = &path[..index + "/openai/v1".len()];
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if deployment.is_empty() {
+        bail!("Azure OpenAI deployment/model is required for deployment-scoped endpoints");
+    }
+    if api_version.is_empty() {
+        bail!("Azure OpenAI API version is required for deployment-scoped endpoints");
+    }
+    parsed.set_query(None);
+    {
+        let mut segments = parsed
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("AZURE_OPENAI_ENDPOINT cannot be a base-only URL"))?;
+        segments.clear();
+        segments
+            .push("openai")
+            .push("deployments")
+            .push(deployment)
+            .push("chat")
+            .push("completions");
+    }
+    parsed
+        .query_pairs_mut()
+        .append_pair("api-version", api_version);
+    Ok(AzureOpenAIChatTarget {
+        url: parsed.to_string(),
+        include_model: false,
+    })
+}
+
+fn extract_azure_openai_text(result: &Value) -> Option<String> {
+    result
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| result.pointer("/choices/0/text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_azure_openai_usage(result: &Value) -> Option<ExecutionUsageSummary> {
+    let usage = result.get("usage")?.as_object()?;
+    let summary = ExecutionUsageSummary {
+        input_tokens: parse_json_usize_field(
+            usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens")),
+        )
+        .unwrap_or_default(),
+        cached_input_tokens: parse_json_usize_field(
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .or_else(|| usage.get("cached_input_tokens")),
+        )
+        .unwrap_or_default(),
+        output_tokens: parse_json_usize_field(
+            usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens")),
+        )
+        .unwrap_or_default(),
+    };
+    (!summary.is_empty()).then_some(summary)
+}
+
+fn redact_azure_openai_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
     }
 }
 
@@ -1774,6 +2271,11 @@ fn read_json<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     serde_json::from_slice(&bytes).context("failed to parse worker payload")
 }
 
+fn read_single_json<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    T::deserialize(&mut deserializer).context("failed to parse worker payload")
+}
+
 fn build_message_response(
     request: &WorkerRequest,
     prior_turns: usize,
@@ -1838,6 +2340,7 @@ fn build_message_response(
                 kind: ExecutionMountKind::Project,
             }],
             fallback_reason: None,
+            external_run_id: None,
         },
     }
 }
@@ -1942,6 +2445,7 @@ fn run_script_request(
                 kind: ExecutionMountKind::Project,
             }],
             fallback_reason: Some("script".to_string()),
+            external_run_id: None,
         },
     })
 }
@@ -1954,6 +2458,7 @@ fn run_codex_request(
     session_state: &SessionState,
     resolved_backend: &ResolvedWorkerBackend,
     _execution_location: ExecutionLocation,
+    fallback_reason: Option<String>,
 ) -> Result<BackendExecutionResult> {
     if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
         bail!(error);
@@ -2129,7 +2634,7 @@ fn run_codex_request(
 
     let usage = parsed.usage.clone().unwrap_or_default();
     let log_body = format!(
-        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=codex\nprovider=openai\nbiller={}\nbilling_type={}\nmodel={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
+        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=codex\nprovider=openai\nbiller={}\nbilling_type={}\nmodel={}\nfallback_reason={:?}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
         request.invocation_id,
         request.session.id,
         workspace_root.display(),
@@ -2140,6 +2645,7 @@ fn run_codex_request(
         resolve_codex_biller(),
         resolve_codex_billing_type(),
         resolved_model.as_deref().unwrap_or("-"),
+        fallback_reason,
         usage.input_tokens,
         usage.cached_input_tokens,
         usage.output_tokens,
@@ -2190,7 +2696,8 @@ fn run_codex_request(
                 .map(|state| state.secret_handles.clone())
                 .unwrap_or_default(),
             mount_summary: build_host_mount_summary(workspace_root, &cwd, &add_dirs, &sandbox),
-            fallback_reason: None,
+            fallback_reason,
+            external_run_id: None,
         },
     })
 }
@@ -2217,6 +2724,7 @@ fn run_claude_request(
 
 #[derive(Debug, Default)]
 struct ClaudeRequestOptions {
+    backend: Option<WorkerBackend>,
     provider: Option<String>,
     biller: Option<String>,
     billing_type: Option<String>,
@@ -2302,6 +2810,8 @@ fn run_claude_request_with_options(
         );
     }
 
+    let metadata_backend = options.backend.clone().unwrap_or(WorkerBackend::Claude);
+    let backend_label = metadata_backend.as_str();
     let output = command
         .output()
         .with_context(|| format!("failed to execute {}", describe_command(&command)))?;
@@ -2310,13 +2820,20 @@ fn run_claude_request_with_options(
     let text = stdout.trim().to_string();
 
     if !output.status.success() {
+        let mut details = Vec::new();
+        if !stderr.trim().is_empty() {
+            details.push(format!("stderr: {}", summarize_for_chat(&stderr, 600)));
+        }
+        if !stdout.trim().is_empty() {
+            details.push(format!("stdout: {}", summarize_for_chat(&stdout, 600)));
+        }
         bail!(
             "claude execution failed with status {}{}",
             output.status,
-            if stderr.trim().is_empty() {
+            if details.is_empty() {
                 String::new()
             } else {
-                format!(": {}", summarize_for_chat(&stderr, 600))
+                format!(": {}", details.join("; "))
             }
         );
     }
@@ -2325,8 +2842,14 @@ fn run_claude_request_with_options(
         bail!("claude execution produced empty output");
     }
 
+    if is_paperclip_gateway_request(request) {
+        if let Some(blocker) = detect_paperclip_control_plane_blocker(&text) {
+            bail!("{backend_label} execution blocked: {blocker}");
+        }
+    }
+
     let log_body = format!(
-        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=claude\nprovider={}\nbiller={}\nbilling_type={}\nmodel={}\nfallback_reason={:?}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
+        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend={}\nprovider={}\nbiller={}\nbilling_type={}\nmodel={}\nfallback_reason={:?}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
         request.invocation_id,
         request.session.id,
         workspace_root.display(),
@@ -2334,6 +2857,7 @@ fn run_claude_request_with_options(
         prior_turns + 1,
         instruction_hint,
         prompt.len(),
+        backend_label,
         options.provider.as_deref().unwrap_or("-"),
         options.biller.as_deref().unwrap_or("-"),
         options.billing_type.as_deref().unwrap_or("-"),
@@ -2364,7 +2888,7 @@ fn run_claude_request_with_options(
         text,
         log_body,
         metadata: BackendExecutionMetadata {
-            backend: WorkerBackend::Claude,
+            backend: metadata_backend,
             provider: options.provider,
             biller: options.biller,
             billing_type: options.billing_type,
@@ -2378,8 +2902,356 @@ fn run_claude_request_with_options(
                 .unwrap_or_default(),
             mount_summary: build_host_mount_summary(workspace_root, &cwd, &[], "workspace-write"),
             fallback_reason: options.fallback_reason,
+            external_run_id: None,
         },
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubCopilotTaskConfig {
+    gh_bin: String,
+    repo: String,
+    base: Option<String>,
+    custom_agent: Option<String>,
+    follow: bool,
+    cwd: PathBuf,
+}
+
+fn run_github_copilot_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+) -> Result<BackendExecutionResult> {
+    if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
+        bail!(error);
+    }
+
+    let config = resolve_github_copilot_task_config(request, workspace_root)?;
+    let prompt = build_github_copilot_task_prompt(request, workspace_root, session_state)?;
+    let capability_manifest = derive_capability_manifest(
+        &request.request_plane,
+        DeriveCapabilityManifestInput {
+            allow_host_command: true,
+            ..Default::default()
+        },
+    );
+    let mut command = build_github_copilot_command(&config);
+    remove_remote_unneeded_secret_env(&mut command);
+    let output = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", describe_command(&command)))?;
+    let output = write_and_wait_for_output(output, prompt.as_bytes(), &command)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        bail!(
+            "GitHub Copilot task delegation failed with status {}{}{}",
+            output.status,
+            if stderr.is_empty() { "" } else { ": " },
+            if stderr.is_empty() {
+                summarize_for_chat(&stdout, 600)
+            } else {
+                summarize_for_chat(&stderr, 600)
+            }
+        );
+    }
+
+    let external_run_id = extract_first_url(&stdout).or_else(|| extract_first_url(&stderr));
+    let text =
+        render_github_copilot_delegation_result(&config, external_run_id.as_deref(), &stdout);
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=github-copilot\nprovider=github\nrepo={}\nbase={}\ncustom_agent={}\nfollow={}\nexternal_run_id={}\nstatus={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
+        request.invocation_id,
+        request.session.id,
+        workspace_root.display(),
+        config.cwd.display(),
+        prior_turns + 1,
+        instruction_hint,
+        prompt.len(),
+        config.repo,
+        config.base.as_deref().unwrap_or("-"),
+        config.custom_agent.as_deref().unwrap_or("-"),
+        config.follow,
+        external_run_id.as_deref().unwrap_or("-"),
+        output.status,
+        stdout,
+        stderr,
+        text
+    );
+
+    Ok(BackendExecutionResult {
+        text,
+        log_body,
+        metadata: BackendExecutionMetadata {
+            backend: WorkerBackend::GithubCopilot,
+            provider: Some("github".to_string()),
+            biller: Some("github-copilot".to_string()),
+            billing_type: Some("copilot-cloud-agent".to_string()),
+            model: None,
+            usage: None,
+            cost_usd: None,
+            effective_capabilities: capability_manifest,
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
+            secret_handles: Vec::new(),
+            mount_summary: build_host_mount_summary(
+                workspace_root,
+                &config.cwd,
+                &[],
+                "github-copilot",
+            ),
+            fallback_reason: None,
+            external_run_id,
+        },
+    })
+}
+
+fn resolve_github_copilot_task_config(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+) -> Result<GithubCopilotTaskConfig> {
+    let gh_bin = first_non_empty_request_or_process_env(
+        request,
+        &["NANOCLAW_GITHUB_COPILOT_GH_BIN", "NANOCLAW_GH_BIN"],
+    )
+    .unwrap_or_else(|| "gh".to_string());
+    let repo = resolve_github_copilot_repo(request, workspace_root)?;
+    let base = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_GITHUB_COPILOT_BASE",
+            "GITHUB_COPILOT_BASE",
+            "NANOCLAW_GITHUB_BASE",
+        ],
+    )
+    .and_then(|value| normalize_branch_name(&value));
+    let custom_agent = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_GITHUB_COPILOT_CUSTOM_AGENT",
+            "GITHUB_COPILOT_CUSTOM_AGENT",
+        ],
+    );
+    let follow = first_bool_request_or_process_env(
+        request,
+        &["NANOCLAW_GITHUB_COPILOT_FOLLOW", "GITHUB_COPILOT_FOLLOW"],
+    )
+    .unwrap_or(false);
+    let cwd = first_non_empty_request_or_process_env(
+        request,
+        &["NANOCLAW_GITHUB_COPILOT_CWD", "GITHUB_COPILOT_CWD"],
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| workspace_root.to_path_buf());
+    if !cwd.is_dir() {
+        bail!("GitHub Copilot cwd is not a directory: {}", cwd.display());
+    }
+
+    Ok(GithubCopilotTaskConfig {
+        gh_bin,
+        repo,
+        base,
+        custom_agent,
+        follow,
+        cwd,
+    })
+}
+
+fn build_github_copilot_command(config: &GithubCopilotTaskConfig) -> Command {
+    let mut command = Command::new(&config.gh_bin);
+    command
+        .current_dir(&config.cwd)
+        .arg("agent-task")
+        .arg("create")
+        .arg("-F")
+        .arg("-")
+        .arg("--repo")
+        .arg(&config.repo);
+    if let Some(base) = config.base.as_deref() {
+        command.arg("--base").arg(base);
+    }
+    if let Some(custom_agent) = config.custom_agent.as_deref() {
+        command.arg("--custom-agent").arg(custom_agent);
+    }
+    if config.follow {
+        command.arg("--follow");
+    }
+    command
+}
+
+fn remove_remote_unneeded_secret_env(command: &mut Command) {
+    for key in [
+        "PAPERCLIP_API_KEY",
+        "PAPERCLIP_API_URL",
+        "ZAI_ANTHROPIC_AUTH_TOKEN",
+        "NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN",
+        "ZAI_API_KEY",
+        "NANOCLAW_ZAI_API_KEY",
+        "ZAI_ANTHROPIC_BASE_URL",
+        "NANOCLAW_ZAI_ANTHROPIC_BASE_URL",
+        "ZAI_ANTHROPIC_MODEL",
+        "NANOCLAW_ZAI_MODEL",
+        "AZURE_OPENAI_API_KEY",
+        "NANOCLAW_AZURE_OPENAI_API_KEY",
+        "AZURE_AI_API_KEY",
+        "NANOCLAW_AZURE_AI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_BASE_URL",
+        "NANOCLAW_AZURE_OPENAI_BASE_URL",
+        "AZURE_OPENAI_DEPLOYMENT",
+        "NANOCLAW_AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_OPENAI_MODEL",
+        "NANOCLAW_AZURE_OPENAI_MODEL",
+        "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
+        "AZURE_OPENAI_API_VERSION",
+        "NANOCLAW_AZURE_OPENAI_API_VERSION",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+fn build_github_copilot_task_prompt(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    session_state: &SessionState,
+) -> Result<String> {
+    let worker_prompt = build_worker_prompt(request, workspace_root, session_state)?;
+    Ok(format!(
+        "Paperclip delegated repo task for GitHub Copilot cloud agent.\n\n\
+         Work only in the target GitHub repository. Open one pull request for the requested change. \
+         Keep the PR focused, include verification evidence, and do not claim local Paperclip completion. \
+         Paperclip/NEX remains the control plane and will track your PR externally.\n\n{}",
+        worker_prompt
+    ))
+}
+
+fn resolve_github_copilot_repo(request: &WorkerRequest, workspace_root: &Path) -> Result<String> {
+    if let Some(repo) = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_GITHUB_COPILOT_REPO",
+            "GITHUB_COPILOT_REPO",
+            "GITHUB_REPOSITORY",
+        ],
+    )
+    .and_then(|value| normalize_github_repo_ref(&value))
+    {
+        return Ok(repo);
+    }
+
+    if let Some(repo) =
+        git_origin_repo(workspace_root).and_then(|value| normalize_github_repo_ref(&value))
+    {
+        return Ok(repo);
+    }
+
+    bail!(
+        "GitHub Copilot backend requires a GitHub repository; set NANOCLAW_GITHUB_COPILOT_REPO or run from a checkout with a GitHub origin"
+    )
+}
+
+fn git_origin_repo(workspace_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn normalize_github_repo_ref(raw: &str) -> Option<String> {
+    let mut value = raw
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix("git@github.com:") {
+        value = rest.to_string();
+    } else if let Some(index) = value.find("github.com/") {
+        value = value[index + "github.com/".len()..].to_string();
+    }
+    let parts = value
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(format!("{}/{}", parts[0], parts[1]))
+}
+
+fn normalize_branch_name(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() || value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(value.trim_start_matches("refs/heads/").trim().to_string())
+}
+
+fn first_bool_request_or_process_env(request: &WorkerRequest, keys: &[&str]) -> Option<bool> {
+    first_non_empty_request_or_process_env(request, keys).map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn extract_first_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|part| part.starts_with("https://") || part.starts_with("http://"))
+        .map(|part| {
+            part.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | ']' | ',' | '.' | ';'))
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn render_github_copilot_delegation_result(
+    config: &GithubCopilotTaskConfig,
+    external_run_id: Option<&str>,
+    stdout: &str,
+) -> String {
+    let mut lines = vec![format!(
+        "Delegated to GitHub Copilot cloud agent for `{}`.",
+        config.repo
+    )];
+    if let Some(base) = config.base.as_deref() {
+        lines.push(format!("Base branch: `{base}`."));
+    }
+    if let Some(custom_agent) = config.custom_agent.as_deref() {
+        lines.push(format!("Custom agent: `{custom_agent}`."));
+    }
+    if let Some(url) = external_run_id {
+        lines.push(format!("GitHub session/PR: {url}"));
+    }
+    if !stdout.trim().is_empty() {
+        lines.push(format!(
+            "\nGitHub CLI output:\n{}",
+            summarize_for_chat(stdout, 1200)
+        ));
+    }
+    lines.join("\n")
 }
 
 fn run_workers_ai_request(
@@ -2493,6 +3365,7 @@ fn run_workers_ai_request(
             secret_handles: Vec::new(),
             mount_summary: Vec::new(),
             fallback_reason,
+            external_run_id: None,
         },
     })
 }
@@ -2502,6 +3375,22 @@ fn non_empty_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn non_empty_request_env(request: &WorkerRequest, key: &str) -> Option<String> {
+    request
+        .env
+        .get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn first_non_empty_request_or_process_env(
+    request: &WorkerRequest,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| non_empty_request_env(request, key).or_else(|| non_empty_env(key)))
 }
 
 fn resolve_openai_compatible_biller() -> String {
@@ -2581,6 +3470,9 @@ fn run_kind_for_backend(backend: &WorkerBackend, is_script: bool) -> ExecutionRu
         WorkerBackend::Summary => ExecutionRunKind::Summary,
         WorkerBackend::Codex => ExecutionRunKind::Codex,
         WorkerBackend::Claude => ExecutionRunKind::Claude,
+        WorkerBackend::Zai => ExecutionRunKind::Custom("zai".to_string()),
+        WorkerBackend::AzureOpenAI => ExecutionRunKind::Custom("azure-openai".to_string()),
+        WorkerBackend::GithubCopilot => ExecutionRunKind::Custom("github-copilot".to_string()),
         WorkerBackend::WorkersAI => ExecutionRunKind::WorkersAI,
         WorkerBackend::Custom(value) => ExecutionRunKind::Custom(value.clone()),
     }
@@ -2951,8 +3843,10 @@ fn compact_session_state(state: &SessionState, max_turns: usize) -> SessionState
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::net::Shutdown;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
     use std::thread;
@@ -2961,19 +3855,22 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::foundation::CapabilityManifest;
-    use crate::foundation::{ExecutionLane, MessageRecord, RemoteWorkerMode, RequestPlane};
+    use crate::foundation::{ExecutionLane, Group, MessageRecord, RemoteWorkerMode, RequestPlane};
     use crate::nanoclaw::config::NanoclawConfig;
     use crate::nanoclaw::model_router::WorkerBackend;
 
     use super::{
-        build_execution_metadata, build_execution_session, connect_to_worker_socket,
-        default_codex_sandbox_for_request, is_codex_usage_limit_error, parse_codex_jsonl,
-        read_json, run_worker_daemon_with_idle_timeout, run_worker_from_paths,
-        should_use_container_lane, should_use_remote_lane, wait_for_worker_socket, write_json,
-        BackendExecutionMetadata, BackendExecutionResult, ContainerExecutor,
-        DigitalOceanDevEnvironment, ExecutionLaneRouter, ExecutionRequest, ExecutionSession,
-        ExecutionUsageSummary, ExecutorBoundary, InProcessEchoExecutor, OmxExecutor,
-        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        build_azure_openai_chat_target, build_execution_metadata, build_execution_session,
+        build_github_copilot_command, connect_to_worker_socket, default_codex_sandbox_for_request,
+        detect_paperclip_control_plane_blocker, execute_worker_request, extract_azure_openai_text,
+        is_codex_usage_limit_error, normalize_branch_name, normalize_github_repo_ref,
+        parse_azure_openai_usage, parse_codex_jsonl, read_json,
+        run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
+        should_use_remote_lane, wait_for_worker_socket, write_json, BackendExecutionMetadata,
+        BackendExecutionResult, ContainerExecutor, DigitalOceanDevEnvironment, ExecutionLaneRouter,
+        ExecutionRequest, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
+        GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor,
+        RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
     };
 
     #[test]
@@ -3021,6 +3918,239 @@ mod tests {
     }
 
     #[test]
+    fn builds_azure_openai_v1_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.openai.azure.com/openai/v1/",
+            "gpt-4.1",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.openai.azure.com/openai/v1/chat/completions"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_azure_openai_deployment_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.openai.azure.com",
+            "cto-deployment",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.openai.azure.com/openai/deployments/cto-deployment/chat/completions?api-version=2024-10-21"
+        );
+        assert!(!target.include_model);
+    }
+
+    #[test]
+    fn parses_azure_openai_text_and_usage() {
+        let payload = serde_json::json!({
+            "choices": [
+                { "message": { "content": "Azure response" } }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "prompt_tokens_details": { "cached_tokens": 25 },
+                "completion_tokens": 50
+            }
+        });
+
+        assert_eq!(
+            extract_azure_openai_text(&payload).as_deref(),
+            Some("Azure response")
+        );
+        assert_eq!(
+            parse_azure_openai_usage(&payload),
+            Some(ExecutionUsageSummary {
+                input_tokens: 100,
+                cached_input_tokens: 25,
+                output_tokens: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn github_copilot_backend_aliases_parse() {
+        assert_eq!(
+            WorkerBackend::parse("github-copilot"),
+            WorkerBackend::GithubCopilot
+        );
+        assert_eq!(
+            WorkerBackend::parse("github_copilot"),
+            WorkerBackend::GithubCopilot
+        );
+        assert_eq!(
+            WorkerBackend::parse("copilot"),
+            WorkerBackend::GithubCopilot
+        );
+        assert_eq!(WorkerBackend::GithubCopilot.as_str(), "github-copilot");
+    }
+
+    #[test]
+    fn normalizes_github_copilot_repo_refs() {
+        assert_eq!(
+            normalize_github_repo_ref(
+                "https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare.git"
+            )
+            .as_deref(),
+            Some("Nexus-Integrated-Technologies/paperclip-cloudflare")
+        );
+        assert_eq!(
+            normalize_github_repo_ref(
+                "git@github.com:Nexus-Integrated-Technologies/paperclip-cloudflare.git"
+            )
+            .as_deref(),
+            Some("Nexus-Integrated-Technologies/paperclip-cloudflare")
+        );
+        assert_eq!(
+            normalize_github_repo_ref("Nexus-Integrated-Technologies/paperclip-cloudflare")
+                .as_deref(),
+            Some("Nexus-Integrated-Technologies/paperclip-cloudflare")
+        );
+        assert_eq!(normalize_github_repo_ref("not-enough"), None);
+    }
+
+    #[test]
+    fn github_copilot_command_uses_stdin_and_repo_flags() {
+        let cwd = tempdir().unwrap();
+        let config = GithubCopilotTaskConfig {
+            gh_bin: "gh".to_string(),
+            repo: "Nexus-Integrated-Technologies/paperclip-cloudflare".to_string(),
+            base: Some("main".to_string()),
+            custom_agent: Some("cto".to_string()),
+            follow: true,
+            cwd: cwd.path().to_path_buf(),
+        };
+        let command = build_github_copilot_command(&config);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "agent-task",
+                "create",
+                "-F",
+                "-",
+                "--repo",
+                "Nexus-Integrated-Technologies/paperclip-cloudflare",
+                "--base",
+                "main",
+                "--custom-agent",
+                "cto",
+                "--follow",
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(cwd.path()));
+    }
+
+    #[test]
+    fn github_copilot_ignores_sha_like_base_refs() {
+        assert_eq!(
+            normalize_branch_name("refs/heads/main").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            normalize_branch_name("0123456789abcdef0123456789abcdef01234567"),
+            None
+        );
+    }
+
+    #[test]
+    fn github_copilot_backend_delegates_with_fake_gh() {
+        let root = tempdir().unwrap();
+        let fake_gh = root.path().join("fake-gh");
+        let stdin_path = root.path().join("fake-gh-stdin.txt");
+        let stdin_path_quoted = stdin_path.display().to_string().replace('\'', "'\\''");
+        fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' 'Created task https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare/pull/123'\n",
+                stdin_path_quoted
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_gh, perms).unwrap();
+
+        let session = build_execution_session(root.path(), "copilot", "session-1", root.path());
+        let request = WorkerRequest {
+            invocation_id: "invoke-1".to_string(),
+            requested_at: "2026-05-07T00:00:00Z".to_string(),
+            group: Group {
+                jid: "copilot".to_string(),
+                name: "Copilot".to_string(),
+                folder: "copilot".to_string(),
+                trigger: "@copilot".to_string(),
+                added_at: "2026-05-07T00:00:00Z".to_string(),
+                requires_trigger: false,
+                is_main: false,
+            },
+            prompt: "Add one focused test for the gateway adapter.".to_string(),
+            paperclip_overlay_context: Some(
+                "Paperclip issue packet:\n- issue: NEX-1 Test".to_string(),
+            ),
+            messages: vec![MessageRecord {
+                id: "m1".to_string(),
+                chat_jid: "copilot".to_string(),
+                sender: "paperclip".to_string(),
+                sender_name: Some("Paperclip".to_string()),
+                content: "Add one focused test for the gateway adapter.".to_string(),
+                timestamp: "2026-05-07T00:00:00Z".to_string(),
+                is_from_me: false,
+                is_bot_message: true,
+            }],
+            task_id: None,
+            script: None,
+            omx: None,
+            assistant_name: "NanoClaw".to_string(),
+            request_plane: RequestPlane::Web,
+            env: BTreeMap::from([
+                (
+                    "NANOCLAW_GITHUB_COPILOT_GH_BIN".to_string(),
+                    fake_gh.display().to_string(),
+                ),
+                (
+                    "NANOCLAW_GITHUB_COPILOT_REPO".to_string(),
+                    "Nexus-Integrated-Technologies/paperclip-cloudflare".to_string(),
+                ),
+            ]),
+            session,
+            backend_override: Some(WorkerBackend::GithubCopilot),
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = execute_worker_request(request).unwrap();
+        let metadata = response.metadata.unwrap();
+
+        assert!(response
+            .text
+            .contains("Delegated to GitHub Copilot cloud agent"));
+        assert_eq!(
+            metadata.external_run_id.as_deref(),
+            Some("https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare/pull/123")
+        );
+        let delegated_prompt = fs::read_to_string(stdin_path).unwrap();
+        assert!(delegated_prompt.contains("Open one pull request"));
+        assert!(delegated_prompt.contains("Paperclip issue packet"));
+    }
+
+    #[test]
     fn codex_fallback_only_accepts_usage_limit_errors() {
         assert!(is_codex_usage_limit_error("Codex usage limit reached"));
         assert!(is_codex_usage_limit_error("usage_limit exceeded"));
@@ -3029,6 +4159,19 @@ mod tests {
         assert!(!is_codex_usage_limit_error(
             "codex execution failed with exit status: 1"
         ));
+    }
+
+    #[test]
+    fn paperclip_control_plane_blockers_are_detected_without_flagging_issue_blockers() {
+        assert!(detect_paperclip_control_plane_blocker(
+            "I'm encountering an approval restriction for network calls. The sandbox requires approval for HTTP requests to http://paperclip.api, which prevents verifying identity and checking out issue work.",
+        )
+        .is_some());
+
+        assert!(detect_paperclip_control_plane_blocker(
+            "Work is blocked because the issue mentions multiple projects. I left a comment with the required split.",
+        )
+        .is_none());
     }
 
     #[test]
@@ -3185,6 +4328,62 @@ mod tests {
         daemon.join().unwrap();
         assert!(!session.socket_path().exists());
         assert!(!session.pid_path().exists());
+    }
+
+    #[test]
+    fn worker_daemon_parses_one_json_request_without_client_eof() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("CLAUDE.md"), "# Andy\n").unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+
+        let session_root = PathBuf::from(&session.session_root);
+        let daemon = thread::spawn(move || {
+            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(150)).unwrap();
+        });
+
+        let mut stream = wait_for_worker_socket(&session).unwrap();
+        let request = WorkerRequest {
+            invocation_id: "exec-no-eof".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<messages />".to_string(),
+            paperclip_overlay_context: None,
+            messages: vec![MessageRecord {
+                id: "m1".to_string(),
+                chat_jid: "main".to_string(),
+                sender: "user".to_string(),
+                sender_name: Some("User".to_string()),
+                content: "without eof".to_string(),
+                timestamp: "2026-04-05T00:00:00Z".to_string(),
+                is_from_me: false,
+                is_bot_message: false,
+            }],
+            task_id: None,
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        write_json(&mut stream, &request).unwrap();
+        let outcome: WorkerOutcome = read_json(&mut stream).unwrap();
+        let response = outcome.response.unwrap();
+        assert!(response.text.contains("Session turn: 1"));
+
+        thread::sleep(Duration::from_millis(250));
+        daemon.join().unwrap();
     }
 
     #[test]
@@ -3613,6 +4812,7 @@ mod tests {
                     secret_handles: Vec::new(),
                     mount_summary: Vec::new(),
                     fallback_reason: None,
+                    external_run_id: None,
                 },
             },
             None,

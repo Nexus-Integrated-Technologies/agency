@@ -24,6 +24,7 @@ const STATE_READ_RETRY_DELAY_MS = parseInteger(
   process.env.NANOCLAW_OMX_STATE_READ_RETRY_DELAY_MS,
   25
 );
+const CODEX_MODEL = String(process.env.NANOCLAW_OMX_CODEX_MODEL || "gpt-5.2").trim();
 const ALLOWED_RUN_ENV_KEYS = new Set([
   "PAPERCLIP_RUN_ID",
   "PAPERCLIP_AGENT_ID",
@@ -37,6 +38,30 @@ const ALLOWED_RUN_ENV_KEYS = new Set([
   "PAPERCLIP_APPROVAL_ID",
   "PAPERCLIP_APPROVAL_STATUS",
   "PAPERCLIP_LINKED_ISSUE_IDS",
+  "ZAI_ANTHROPIC_AUTH_TOKEN",
+  "NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN",
+  "ZAI_API_KEY",
+  "NANOCLAW_ZAI_API_KEY",
+  "ZAI_ANTHROPIC_BASE_URL",
+  "NANOCLAW_ZAI_ANTHROPIC_BASE_URL",
+  "ZAI_ANTHROPIC_MODEL",
+  "NANOCLAW_ZAI_MODEL",
+  "AZURE_OPENAI_API_KEY",
+  "NANOCLAW_AZURE_OPENAI_API_KEY",
+  "AZURE_AI_API_KEY",
+  "NANOCLAW_AZURE_AI_API_KEY",
+  "AZURE_OPENAI_ENDPOINT",
+  "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+  "AZURE_OPENAI_BASE_URL",
+  "NANOCLAW_AZURE_OPENAI_BASE_URL",
+  "AZURE_OPENAI_DEPLOYMENT",
+  "NANOCLAW_AZURE_OPENAI_DEPLOYMENT",
+  "AZURE_OPENAI_MODEL",
+  "NANOCLAW_AZURE_OPENAI_MODEL",
+  "AZURE_OPENAI_DEPLOYMENT_NAME",
+  "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
+  "AZURE_OPENAI_API_VERSION",
+  "NANOCLAW_AZURE_OPENAI_API_VERSION",
 ]);
 
 const [subcommand, ...rest] = process.argv.slice(2);
@@ -424,6 +449,7 @@ function buildCodexExecPrefix(cwd) {
   return [
     "omx",
     "exec",
+    ...codexExecModelArgs(),
     ...codexExecSandboxArgs(),
     "--json",
     "--skip-git-repo-check",
@@ -432,6 +458,10 @@ function buildCodexExecPrefix(cwd) {
   ]
     .map(shellQuote)
     .join(" ");
+}
+
+function codexExecModelArgs() {
+  return CODEX_MODEL ? ["--model", CODEX_MODEL] : [];
 }
 
 function codexExecSandboxArgs() {
