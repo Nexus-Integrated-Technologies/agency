@@ -37,7 +37,7 @@ RUN apt-get update \
     ripgrep \
     tmux \
   && rm -rf /var/lib/apt/lists/* \
-  && npm install --global --omit=dev @openai/codex@latest @anthropic-ai/claude-code@latest oh-my-codex@0.15.0
+  && npm install --global --omit=dev @openai/codex@latest @anthropic-ai/claude-code@latest oh-my-codex@0.18.0
 
 ENV HOME=/nanoclaw
 ENV NANOCLAW_HOME=/nanoclaw
