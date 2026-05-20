@@ -26,6 +26,7 @@ pub mod scope;
 pub mod service;
 pub mod session;
 pub mod signature;
+pub mod tool_contract;
 
 pub use assurance::{AssuranceTuple, CongruenceLevel, Formality};
 pub use boundary::{classify_boundary_text, BoundaryClaim, BoundaryClaimSource, BoundaryQuadrant};
@@ -65,3 +66,7 @@ pub use scope::{ScopeSet, ScopeSlice};
 pub use service::{ServiceClause, ServiceStatus};
 pub use session::{SessionRole, SessionState, SessionStore, SessionTurn};
 pub use signature::{TaskBudget, TaskDataShape, TaskKind, TaskSignature};
+pub use tool_contract::{
+    validate_tool_adapter_contract, ToolAdapterApprovalPolicy, ToolAdapterContract,
+    ToolAdapterContractViolation, ToolAdapterMode,
+};

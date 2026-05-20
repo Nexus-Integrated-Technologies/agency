@@ -287,14 +287,20 @@ Already active:
   Legacy Linear CLI and webhook paths are disabled by default and require
   `NANOCLAW_LINEAR_LEGACY_ENABLED=true` only for controlled migration/reference
   use.
+- Future tool/adapter re-entry now has a native Rust contract:
+  `ToolAdapterContract` requires request-plane capability coherence, explicit
+  host OS control approval, operator-visible evidence, structured artifacts for
+  completion-capable adapters, structured verification for every adapter, and
+  blockers on failure. Old Agency tool material remains source material until a
+  runtime adapter satisfies this contract.
 
 Remaining work:
 
 - If a new active Nexus/Paperclip/GitHub writeback surface needs to transition
   work states, route it through the app completion APIs instead of adding raw
   status mutation callsites.
-- Extend this transport/error normalization to future external adapter plugins
-  as they are registered.
+- Register concrete external adapter plugins against `ToolAdapterContract`
+  before making them active runtime hands.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 
