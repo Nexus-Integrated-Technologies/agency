@@ -298,14 +298,16 @@ Already active:
   host shell, HTTP request, Workers AI advisory, and host OS control. The
   registry keeps Workers AI advisory-only and makes host OS control
   explicit-approval-only.
+- External tool adapter manifests now load through the same registry path and
+  fail closed when a contract is invalid or two adapters claim the same id.
 
 Remaining work:
 
 - If a new active Nexus/Paperclip/GitHub writeback surface needs to transition
   work states, route it through the app completion APIs instead of adding raw
   status mutation callsites.
-- Load future external adapter plugin manifests through `ToolAdapterContract`
-  validation before making them active runtime hands.
+- Wire configured external plugin manifests into runtime startup/inspect once a
+  concrete plugin directory is introduced.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 
