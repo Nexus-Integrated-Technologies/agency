@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::foundation::{
     ExecutionLane, Group, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
@@ -51,7 +51,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|health|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -196,16 +196,13 @@ fn runtime_pid_path(config: &NanoclawConfig, profile: RuntimeServeProfile) -> Pa
 fn runtime_pid_status_json(config: &NanoclawConfig) -> serde_json::Value {
     let mut profiles = serde_json::Map::new();
     for profile in RuntimeServeProfile::all() {
-        let pid_file = runtime_pid_path(config, profile);
-        let pid = fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok());
+        let profile_state = runtime_pid_profile_state_json(config, profile);
         profiles.insert(
             profile.as_str().to_string(),
             json!({
-                "pidFile": pid_file.display().to_string(),
-                "pid": pid,
-                "pidFileExists": pid_file.exists(),
+                "pidFile": profile_state["pidFile"],
+                "pid": profile_state["pid"],
+                "pidFileExists": profile_state["pidFileExists"],
             }),
         );
     }
@@ -283,6 +280,345 @@ fn signal_runtime_profile(
         }))?
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeHealthCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl RuntimeHealthCheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+
+    fn severity(self) -> &'static str {
+        match self {
+            Self::Pass => "info",
+            Self::Warn => "warning",
+            Self::Fail => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeHealthCheck {
+    id: &'static str,
+    status: RuntimeHealthCheckStatus,
+    message: String,
+    evidence: Value,
+}
+
+fn runtime_health_check(
+    id: &'static str,
+    status: RuntimeHealthCheckStatus,
+    message: impl Into<String>,
+    evidence: Value,
+) -> RuntimeHealthCheck {
+    RuntimeHealthCheck {
+        id,
+        status,
+        message: message.into(),
+        evidence,
+    }
+}
+
+fn runtime_health_check_json(check: &RuntimeHealthCheck) -> Value {
+    json!({
+        "id": check.id,
+        "status": check.status.as_str(),
+        "severity": check.status.severity(),
+        "message": check.message,
+        "evidence": check.evidence,
+    })
+}
+
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn runtime_pid_profile_state_json(config: &NanoclawConfig, profile: RuntimeServeProfile) -> Value {
+    let pid_file = runtime_pid_path(config, profile);
+    if !pid_file.exists() {
+        return json!({
+            "profile": profile.as_str(),
+            "pidFile": pid_file.display().to_string(),
+            "pidFileExists": false,
+            "pid": null,
+            "state": "absent",
+            "running": false,
+        });
+    }
+
+    match fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        Some(pid) => {
+            let running = process_is_running(pid);
+            json!({
+                "profile": profile.as_str(),
+                "pidFile": pid_file.display().to_string(),
+                "pidFileExists": true,
+                "pid": pid,
+                "state": if running { "running" } else { "stale" },
+                "running": running,
+            })
+        }
+        None => json!({
+            "profile": profile.as_str(),
+            "pidFile": pid_file.display().to_string(),
+            "pidFileExists": true,
+            "pid": null,
+            "state": "invalid",
+            "running": false,
+        }),
+    }
+}
+
+fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
+    let counts = app.db.counts()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_provenance = app.db.list_execution_provenance(None, limit)?;
+    let recent_evidence = app.db.list_execution_evidence(None, limit)?;
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Failed)
+        .count();
+    let active_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Active)
+        .count();
+    let failed_evidence = recent_evidence
+        .iter()
+        .filter(|record| record.status == "failed")
+        .count();
+    let mut checks = Vec::<RuntimeHealthCheck>::new();
+
+    checks.push(runtime_health_check(
+        "data_dir",
+        if app.config.data_dir.is_dir() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if app.config.data_dir.is_dir() {
+            "data directory is present"
+        } else {
+            "data directory is missing"
+        },
+        json!({ "path": app.config.data_dir.display().to_string() }),
+    ));
+
+    checks.push(runtime_health_check(
+        "store_dir",
+        if app.config.store_dir.is_dir() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if app.config.store_dir.is_dir() {
+            "store directory is present"
+        } else {
+            "store directory is missing"
+        },
+        json!({ "path": app.config.store_dir.display().to_string() }),
+    ));
+
+    let profile_states = RuntimeServeProfile::all()
+        .iter()
+        .map(|profile| runtime_pid_profile_state_json(&app.config, *profile))
+        .collect::<Vec<_>>();
+    let stale_or_invalid_profiles = profile_states
+        .iter()
+        .filter(|profile| {
+            matches!(
+                profile.get("state").and_then(Value::as_str),
+                Some("stale" | "invalid")
+            )
+        })
+        .count();
+    checks.push(runtime_health_check(
+        "runtime_pid_files",
+        if stale_or_invalid_profiles == 0 {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if stale_or_invalid_profiles == 0 {
+            "runtime PID files are clean"
+        } else {
+            "one or more runtime PID files are stale or invalid"
+        },
+        json!({
+            "controlDir": runtime_control_dir(&app.config).display().to_string(),
+            "profiles": profile_states,
+            "staleOrInvalid": stale_or_invalid_profiles,
+        }),
+    ));
+
+    let gateway_token_configured = !app.config.openclaw_gateway_token.trim().is_empty();
+    let gateway_check = if app.config.openclaw_gateway_port > 0 && !gateway_token_configured {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Fail,
+            "gateway port is enabled without a gateway token",
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    } else if app.config.openclaw_gateway_port == 0 && gateway_token_configured {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Warn,
+            "gateway token is configured but the gateway port is disabled",
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    } else {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Pass,
+            if gateway_token_configured {
+                "gateway configuration is complete"
+            } else {
+                "gateway is disabled"
+            },
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    };
+    checks.push(gateway_check);
+
+    let webhook_missing_auth = app.config.linear_webhook_port > 0
+        && app.config.linear_webhook_secret.trim().is_empty()
+        && app.config.github_webhook_secret.trim().is_empty()
+        && app.config.observability_webhook_token.trim().is_empty();
+    checks.push(runtime_health_check(
+        "webhook_auth",
+        if webhook_missing_auth {
+            RuntimeHealthCheckStatus::Fail
+        } else {
+            RuntimeHealthCheckStatus::Pass
+        },
+        if app.config.linear_webhook_port == 0 {
+            "webhook server is disabled"
+        } else if webhook_missing_auth {
+            "webhook server is enabled without any configured webhook auth material"
+        } else {
+            "webhook auth material is configured"
+        },
+        json!({
+            "port": app.config.linear_webhook_port,
+            "linearSignatureRequired": !app.config.linear_webhook_secret.trim().is_empty(),
+            "githubSignatureRequired": !app.config.github_webhook_secret.trim().is_empty(),
+            "observabilityTokenConfigured": !app.config.observability_webhook_token.trim().is_empty(),
+        }),
+    ));
+
+    checks.push(runtime_health_check(
+        "scheduled_task_backlog",
+        if due_tasks.is_empty() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if due_tasks.is_empty() {
+            "no scheduled tasks are currently due"
+        } else {
+            "scheduled tasks are due and need a runtime poll"
+        },
+        json!({
+            "total": tasks.len(),
+            "active": active_tasks,
+            "due": due_tasks.len(),
+            "failed": failed_tasks,
+        }),
+    ));
+
+    checks.push(runtime_health_check(
+        "failed_tasks",
+        if failed_tasks == 0 {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if failed_tasks == 0 {
+            "no failed scheduled tasks are recorded"
+        } else {
+            "failed scheduled tasks are recorded"
+        },
+        json!({ "failed": failed_tasks, "total": tasks.len() }),
+    ));
+
+    let evidence_status = if !recent_provenance.is_empty() && recent_evidence.is_empty() {
+        RuntimeHealthCheckStatus::Warn
+    } else if failed_evidence > 0 {
+        RuntimeHealthCheckStatus::Warn
+    } else {
+        RuntimeHealthCheckStatus::Pass
+    };
+    checks.push(runtime_health_check(
+        "execution_evidence",
+        evidence_status,
+        match evidence_status {
+            RuntimeHealthCheckStatus::Pass => "recent execution evidence is consistent",
+            RuntimeHealthCheckStatus::Warn => {
+                "recent execution history needs operator review for missing or failed evidence"
+            }
+            RuntimeHealthCheckStatus::Fail => "recent execution evidence is invalid",
+        },
+        json!({
+            "recentProvenance": recent_provenance.len(),
+            "recentEvidence": recent_evidence.len(),
+            "failedEvidence": failed_evidence,
+        }),
+    ));
+
+    let failing = checks
+        .iter()
+        .filter(|check| check.status == RuntimeHealthCheckStatus::Fail)
+        .count();
+    let warning = checks
+        .iter()
+        .filter(|check| check.status == RuntimeHealthCheckStatus::Warn)
+        .count();
+    let status = if failing > 0 {
+        "unhealthy"
+    } else if warning > 0 {
+        "degraded"
+    } else {
+        "healthy"
+    };
+
+    Ok(json!({
+        "ok": failing == 0,
+        "status": status,
+        "summary": {
+            "checks": checks.len(),
+            "passing": checks.len().saturating_sub(failing + warning),
+            "warnings": warning,
+            "failing": failing,
+        },
+        "runtime": runtime_status_json(&app.config),
+        "counts": {
+            "chats": counts.chats,
+            "messages": counts.messages,
+            "scheduledTasks": counts.scheduled_tasks,
+            "registeredGroups": counts.registered_groups,
+        },
+        "checks": checks.iter().map(runtime_health_check_json).collect::<Vec<_>>(),
+    }))
 }
 
 fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
@@ -377,9 +713,20 @@ fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
     Ok(())
 }
 
+fn print_runtime_health(config: NanoclawConfig, limit: usize) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_health_json(&app, limit)?)?
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_default_runtime_serve_profile() {
@@ -443,6 +790,46 @@ mod tests {
             parse_limit_args(&mut args, 10, "runtime inspect").unwrap(),
             5
         );
+    }
+
+    #[test]
+    fn detects_stale_runtime_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        fs::write(
+            runtime_pid_path(&config, RuntimeServeProfile::Full),
+            "999999999\n",
+        )?;
+
+        let state = runtime_pid_profile_state_json(&config, RuntimeServeProfile::Full);
+
+        assert_eq!(state["state"], "stale");
+        assert_eq!(state["pid"], 999999999);
+        assert_eq!(state["running"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_invalid_runtime_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        fs::write(
+            runtime_pid_path(&config, RuntimeServeProfile::Pm),
+            "not-a-pid\n",
+        )?;
+
+        let state = runtime_pid_profile_state_json(&config, RuntimeServeProfile::Pm);
+
+        assert_eq!(state["state"], "invalid");
+        assert_eq!(state["pid"], Value::Null);
+        assert_eq!(state["running"], false);
+        Ok(())
     }
 }
 
@@ -1030,6 +1417,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                 "inspect" => {
                     let limit = parse_limit_args(&mut args, 10, "runtime inspect")?;
                     print_runtime_inspect(config, limit)?;
+                }
+                "health" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime health")?;
+                    print_runtime_health(config, limit)?;
                 }
                 "poll" => {
                     let lane_override = parse_lane_override(&mut args)?;

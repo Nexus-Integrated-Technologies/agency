@@ -79,6 +79,13 @@ Inspect runtime state, recent tasks, and recent execution provenance:
 cargo run --quiet --bin nanoclaw -- runtime inspect --limit 5
 ```
 
+Get a deterministic health report over runtime directories, PID files,
+gateway/webhook auth posture, task backlog, and recent execution evidence:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime health --limit 5
+```
+
 Execution lanes now return and persist a structured `ExecutionEvidence`
 envelope alongside their operator-facing text. The envelope records adapter
 type, execution mode, workspace, git state, artifacts, verification, blockers,

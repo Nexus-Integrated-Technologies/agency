@@ -162,7 +162,8 @@ Exit criterion:
 
 ### 4. Finish Runtime Channel Ownership
 
-Status: started, with a unified CLI facade in place.
+Status: active, with a unified CLI facade and deterministic health report in
+place.
 
 Already active:
 
@@ -175,6 +176,9 @@ Already active:
 - runtime PID files under the active `data/runtime/` directory
 - `runtime stop` and `runtime reload` operator controls for profiled runtime
   processes
+- `runtime health` for deterministic checks over directories, PID file state,
+  gateway/webhook auth posture, scheduled-task backlog, and recent execution
+  evidence
 
 Remaining work:
 
@@ -193,6 +197,8 @@ Current unified entrypoint:
   OpenClaw gateway readiness from one configuration model.
 - `nanoclaw runtime inspect` reports runtime counts, task distribution, recent
   tasks, and recent execution provenance for lifecycle inspection.
+- `nanoclaw runtime health --limit <n>` reports operator health checks without
+  invoking model inference or legacy supervisor code.
 - `nanoclaw runtime poll` runs one local control-plane pump.
 - `nanoclaw runtime serve --profile full|gateway|webhook|pm|slack` starts the
   selected runtime profile without legacy Agency startup scripts.
