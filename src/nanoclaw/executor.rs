@@ -25,6 +25,7 @@ use crate::foundation::{
     SessionStore, TaskKind, TaskSignature,
 };
 
+use super::command_safety::first_blocking_command_safety_violation;
 use super::config::NanoclawConfig;
 use super::dev_environment::DigitalOceanDevEnvironment;
 use super::fpf_bridge::{
@@ -2037,12 +2038,17 @@ fn build_blocked_worker_response(
     session_state: Option<SessionState>,
     execution_location: ExecutionLocation,
 ) -> WorkerResponse {
+    let blocker_kind = if is_command_safety_policy_error(message) {
+        "command_safety_policy"
+    } else {
+        "adapter_error"
+    };
     build_blocked_worker_response_with_context(
         request,
         backend.as_str(),
         execution_mode_for_backend(backend, request.script.is_some()),
         run_kind_for_backend(backend, request.script.is_some()),
-        "adapter_error",
+        blocker_kind,
         message,
         log_path,
         log_body,
@@ -2050,6 +2056,10 @@ fn build_blocked_worker_response(
         execution_location,
         ExecutionBoundaryKind::Host,
     )
+}
+
+fn is_command_safety_policy_error(message: &str) -> bool {
+    message.contains("command safety policy")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3614,6 +3624,13 @@ fn run_script_request(
     instruction_hint: &str,
     execution_location: ExecutionLocation,
 ) -> Result<BackendExecutionResult> {
+    if let Some(violation) = first_blocking_command_safety_violation(script) {
+        bail!(
+            "script command blocked by command safety policy: {}",
+            violation.message
+        );
+    }
+
     let output = Command::new("/bin/sh")
         .arg("-lc")
         .arg(script)
@@ -5733,6 +5750,56 @@ mod tests {
         assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
         assert_eq!(evidence.status, ExecutionEvidenceStatus::Succeeded);
         assert_eq!(evidence.provenance_id.as_deref(), Some("exec-1"));
+    }
+
+    #[test]
+    fn worker_blocks_destructive_script_before_shell_execution() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("CLAUDE.md"), "# Andy\n").unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+
+        let marker_path = workspace_root.join("SHOULD_NOT_EXIST");
+        let request = WorkerRequest {
+            invocation_id: "exec-safety-blocked".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: Some("rm -rf ./*; printf should-not-run > SHOULD_NOT_EXIST".to_string()),
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = execute_worker_request(request).unwrap();
+        assert!(
+            !marker_path.exists(),
+            "blocked script must not run after the safety violation"
+        );
+        assert!(response
+            .text
+            .contains("script command blocked by command safety policy"));
+        let evidence = response.evidence.as_ref().expect("worker emits evidence");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "command_safety_policy");
+        assert!(evidence.blockers[0]
+            .message
+            .contains("recursive forced removal"));
     }
 
     #[test]

@@ -304,6 +304,13 @@ Already active:
   adapter registry and external manifest validation state. The external
   manifest path defaults to `tool-adapters.json` under the project root and can
   be overridden with `NANOCLAW_TOOL_ADAPTERS_PATH`.
+- Scheduled script execution now passes through a deterministic command-safety
+  gate before `/bin/sh -lc`. The first active slice blocks high-risk destructive
+  commands such as broad `rm -rf`, raw device writes, filesystem formatting,
+  destructive `diskutil`, host power-control, and recursive permission changes
+  against broad targets. Blocked scripts return failed shell evidence with a
+  `command_safety_policy` blocker, while scoped cleanup commands remain
+  allowed.
 
 Remaining work:
 
@@ -314,6 +321,8 @@ Remaining work:
   manifests when external plugins are introduced.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
+- Extend the same command-safety classifier to any future active shell-capable
+  adapter before it is allowed to satisfy completion evidence.
 
 Exit criterion:
 
