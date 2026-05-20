@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod command_safety;
 pub mod config;
 pub mod db;
 pub mod dev_environment;

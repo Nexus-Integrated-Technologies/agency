@@ -122,7 +122,13 @@ or clean-roomed into the active runtime.
    metadata. This replaces the useful shape of legacy episodic compaction
    without model calls or the old memory dependency graph.
 5. Safety hardening: map command/content/process/rate-limit checks into
-   existing host OS control, executor, and request-plane gates.
+   existing host OS control, executor, and request-plane gates. The first
+   command-safety slice is active: `src/nanoclaw/command_safety.rs`
+   deterministically blocks high-risk destructive shell commands before
+   scheduled scripts reach `/bin/sh -lc`, while preserving scoped cleanup such
+   as `rm -rf target node_modules`. Blocked scripts emit failed shell evidence
+   with a `command_safety_policy` blocker instead of running and then relying on
+   prose logs.
 
 ## Parking Rules
 
