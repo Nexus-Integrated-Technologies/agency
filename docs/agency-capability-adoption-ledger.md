@@ -30,7 +30,7 @@ or clean-roomed into the active runtime.
 | `src/fpf/holon.rs`, `src/fpf/mereology.rs`, `src/fpf/aggregation.rs`, `src/fpf/kernel.rs` | `park-reference` then maybe `graveyard-holonic` | none until a concrete runtime contract needs them | Valuable conceptual source, but too broad for the immediate runtime. |
 | `src/fpf/cg_*`, `src/fpf/*_cal.rs`, `src/fpf/*_chr.rs`, `src/fpf/mvpk.rs`, `src/fpf/sota_pack.rs`, `src/fpf/tga.rs`, `src/fpf/uts.rs` | `park-reference` | none yet | Research/governance-rich material should not re-enter active code without a narrow runtime use. |
 | `src/orchestrator/planner.rs`, `src/orchestrator/router.rs`, `src/orchestrator/objective.rs`, `src/orchestrator/scheduler.rs`, `src/orchestrator/session.rs` | `assimilate-runtime` | `src/nanoclaw/{router,scheduler,runtime}.rs` plus `src/foundation/{planning,session}.rs` | These map directly to active NanoClaw operations. |
-| `src/orchestrator/supervisor.rs`, `src/orchestrator/healing.rs`, `src/orchestrator/homeostasis.rs`, `src/orchestrator/sensory.rs` | `assimilate-runtime` | `nanoclaw runtime status|inspect|health|cleanup|poll|serve|stop|reload` plus future alerting hooks | Keep the harness idea of a supervisor, not the old supervisor type. |
+| `src/orchestrator/supervisor.rs`, `src/orchestrator/healing.rs`, `src/orchestrator/homeostasis.rs`, `src/orchestrator/sensory.rs` | `assimilate-runtime` | `nanoclaw runtime status|inspect|health|cleanup|poll|serve|stop|reload` plus local health notifications | Keep the harness idea of a supervisor, not the old supervisor type. |
 | `src/orchestrator/budget.rs`, `src/orchestrator/optimal_info.rs`, `src/orchestrator/drr.rs`, `src/orchestrator/event_bus.rs` | `assimilate-runtime` | compute budgets, decision logs, event/audit stream | These support trustworthy autonomous execution and cost discipline. |
 | `src/orchestrator/a2a.rs`, `src/orchestrator/arti_a2a.rs`, `src/orchestrator/uap_grpc.rs`, `src/orchestrator/sns.rs` | `park-reference` | future inter-agent protocol lane | Useful later, but not on the critical path to Rust NanoClaw production. |
 | `src/orchestrator/metabolism.rs`, `src/orchestrator/sovereignty.rs`, `src/orchestrator/vault.rs` | `park-reference` | finance/identity/vault integrations only after explicit product need | Too broad to pull into runtime during collapse. |
@@ -69,8 +69,9 @@ or clean-roomed into the active runtime.
 2. Runtime supervisor:
    `nanoclaw runtime status|inspect|health|cleanup|poll|serve|stop|reload` now
    owns the basic lifecycle surface with NanoClaw PID files, deterministic
-   health checks, and explicit stale-PID cleanup. Remaining work is to connect
-   the health output to operator alerting.
+   health checks, local health notifications, and explicit stale-PID cleanup.
+   Remaining work is to connect health alerts to remote/operator channels when
+   those channels are configured.
 3. Tool contract: convert useful tools into typed runtime adapters with
    request-plane policy, approval gates, artifacts, and verification.
 4. Session memory: adopt episodic/history/compaction into session sidecars or

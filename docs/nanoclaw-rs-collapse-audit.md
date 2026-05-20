@@ -179,6 +179,9 @@ Already active:
 - `runtime health` for deterministic checks over directories, PID file state,
   gateway/webhook auth posture, scheduled-task backlog, and recent execution
   evidence
+- `runtime health --notify-local <chat>` for local operator alerts when health
+  is degraded or unhealthy, with `--notify-always` available for explicit
+  heartbeat reporting
 - `runtime cleanup` for report-only stale/invalid PID-file cleanup, with
   mutation gated behind `--apply`
 
@@ -199,9 +202,11 @@ Current unified entrypoint:
   OpenClaw gateway readiness from one configuration model.
 - `nanoclaw runtime inspect` reports runtime counts, task distribution, recent
   tasks, and recent execution provenance for lifecycle inspection.
-- `nanoclaw runtime health --limit <n> [--strict]` reports operator health
-  checks without invoking model inference or legacy supervisor code; strict mode
-  exits nonzero when the report is unhealthy.
+- `nanoclaw runtime health --limit <n> [--strict] [--notify-local <chat>]`
+  reports operator health checks without invoking model inference or legacy
+  supervisor code; strict mode exits nonzero when the report is unhealthy, and
+  local notifications write to the NanoClaw local outbox only when attention is
+  needed unless `--notify-always` is set.
 - `nanoclaw runtime cleanup [--apply]` reports stale or invalid runtime PID
   files and removes only those files when explicitly applied.
 - `nanoclaw runtime poll` runs one local control-plane pump.

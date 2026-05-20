@@ -29,7 +29,7 @@ use super::linear::{
     LinearIssueCommentUpsertTaskInput, LinearIssueQualityTaskInput, LinearIssueTransitionTaskInput,
     LinearPmMemoryTaskInput, LinearTeamsTaskInput,
 };
-use super::local_channel::LocalInboundEnvelope;
+use super::local_channel::{LocalChannel, LocalInboundEnvelope};
 use super::observability::{
     ingest_observability_event, ObservabilityEventStatus, ObservabilitySeverity,
 };
@@ -109,10 +109,12 @@ struct RuntimeCleanupArgs {
     apply: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeHealthArgs {
     limit: usize,
     strict: bool,
+    notify_local: Option<String>,
+    notify_always: bool,
 }
 
 fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
@@ -196,6 +198,8 @@ where
 {
     let mut limit = 10;
     let mut strict = false;
+    let mut notify_local = None::<String>;
+    let mut notify_always = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -210,11 +214,28 @@ where
                     .max(1);
             }
             "--strict" => strict = true,
+            "--notify-local" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    anyhow::bail!("runtime health --notify-local requires a non-empty chat id");
+                }
+                notify_local = Some(value);
+            }
+            "--notify-always" => notify_always = true,
             other => anyhow::bail!("unexpected runtime health argument '{}'", other),
         }
     }
 
-    Ok(RuntimeHealthArgs { limit, strict })
+    Ok(RuntimeHealthArgs {
+        limit,
+        strict,
+        notify_local,
+        notify_always,
+    })
 }
 
 fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
@@ -817,6 +838,90 @@ fn runtime_inspect_json(app: &NanoclawApp, limit: usize) -> Result<serde_json::V
     }))
 }
 
+fn runtime_health_alert_text(health: &Value) -> String {
+    let status = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let summary = health.get("summary").unwrap_or(&Value::Null);
+    let passing = summary
+        .get("passing")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let warnings = summary
+        .get("warnings")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let failing = summary
+        .get("failing")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let mut lines = vec![
+        format!("NanoClaw runtime health: {status}"),
+        format!("checks: {passing} passing, {warnings} warnings, {failing} failing"),
+    ];
+
+    let mut surfaced = 0usize;
+    if let Some(checks) = health.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let check_status = check
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if check_status == "pass" {
+                continue;
+            }
+            surfaced += 1;
+            let id = check.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            let message = check
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            lines.push(format!("- {id}: {check_status} - {message}"));
+        }
+    }
+
+    if surfaced == 0 {
+        lines.push("- all checks passing".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn maybe_send_runtime_health_notification(
+    config: &NanoclawConfig,
+    args: &RuntimeHealthArgs,
+    health: &Value,
+) -> Result<Value> {
+    let Some(chat_jid) = args.notify_local.as_deref() else {
+        return Ok(json!({
+            "sent": false,
+            "reason": "not_configured",
+        }));
+    };
+
+    let status = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if status == "healthy" && !args.notify_always {
+        return Ok(json!({
+            "sent": false,
+            "reason": "healthy",
+            "chatJid": chat_jid,
+        }));
+    }
+
+    let channel = LocalChannel::new(&config.data_dir)?;
+    let envelope = channel.send_message(chat_jid, &runtime_health_alert_text(health))?;
+    Ok(json!({
+        "sent": true,
+        "chatJid": chat_jid,
+        "outboxId": envelope.id,
+        "timestamp": envelope.timestamp,
+    }))
+}
+
 fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
     let app = NanoclawApp::open(config)?;
     println!(
@@ -828,7 +933,11 @@ fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
 
 fn print_runtime_health(config: NanoclawConfig, args: RuntimeHealthArgs) -> Result<()> {
     let app = NanoclawApp::open(config)?;
-    let health = runtime_health_json(&app, args.limit)?;
+    let mut health = runtime_health_json(&app, args.limit)?;
+    let notification = maybe_send_runtime_health_notification(&app.config, &args, &health)?;
+    if let Value::Object(fields) = &mut health {
+        fields.insert("notification".to_string(), notification);
+    }
     println!("{}", serde_json::to_string_pretty(&health)?);
     if args.strict && health.get("ok").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!("runtime health strict check failed");
@@ -935,7 +1044,28 @@ mod tests {
             parse_runtime_health_args(&mut args).unwrap(),
             RuntimeHealthArgs {
                 limit: 3,
-                strict: true
+                strict: true,
+                notify_local: None,
+                notify_always: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_health_notification_target() {
+        let mut args = vec![
+            "--notify-local".to_string(),
+            "ops".to_string(),
+            "--notify-always".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_health_args(&mut args).unwrap(),
+            RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: true,
             }
         );
     }
@@ -1015,6 +1145,81 @@ mod tests {
         assert_eq!(report["applied"], true);
         assert_eq!(report["summary"]["removed"], 1);
         assert!(!pid_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_notification_skips_healthy_report_by_default() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        let health = json!({
+            "ok": true,
+            "status": "healthy",
+            "summary": {
+                "passing": 1,
+                "warnings": 0,
+                "failing": 0,
+            },
+            "checks": [],
+        });
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+
+        assert_eq!(notification["sent"], false);
+        assert_eq!(notification["reason"], "healthy");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_notification_writes_local_outbox_when_requested() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        let health = json!({
+            "ok": false,
+            "status": "unhealthy",
+            "summary": {
+                "passing": 0,
+                "warnings": 0,
+                "failing": 1,
+            },
+            "checks": [{
+                "id": "webhook_auth",
+                "status": "fail",
+                "message": "webhook server is enabled without auth",
+            }],
+        });
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+        let channel = LocalChannel::new(&config.data_dir)?;
+        let outbox = channel.read_outbox()?;
+
+        assert_eq!(notification["sent"], true);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].chat_jid, "ops");
+        assert!(outbox[0]
+            .text
+            .contains("NanoClaw runtime health: unhealthy"));
+        assert!(outbox[0].text.contains("webhook_auth"));
         Ok(())
     }
 }
