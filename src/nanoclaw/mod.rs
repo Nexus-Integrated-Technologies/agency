@@ -6,6 +6,7 @@ pub mod dev_environment;
 pub mod executor;
 pub mod fpf_bridge;
 pub mod github_webhook;
+pub mod group_runtime_config;
 pub mod host_os_control;
 pub mod ingress_policy;
 pub mod linear;
