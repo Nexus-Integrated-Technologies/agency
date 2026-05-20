@@ -178,6 +178,10 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
         if !has_authorized_trigger(&group, &messages, &allowlist)? && !omx_trigger_allowed {
             return Ok(false);
         }
+        let runtime_config = self.app.group_runtime_config(&group.folder)?;
+        let assistant_name = runtime_config
+            .assistant_name(&self.app.config.assistant_name)
+            .to_string();
         let session = self.ensure_execution_session(&group)?;
         let mut execution_messages = messages.clone();
         let omx_options = omx_trigger.as_ref().map(|trigger| trigger.options.clone());
@@ -189,7 +193,7 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
         let prompt = format_agent_prompt(
             &execution_messages,
             &self.app.config.timezone,
-            &self.app.config.assistant_name,
+            &assistant_name,
             &destinations,
         )?;
         let request_plane = default_request_plane();
@@ -212,11 +216,11 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             task_id: None,
             script: None,
             omx: omx_options,
-            assistant_name: self.app.config.assistant_name.clone(),
+            assistant_name,
             request_plane,
-            env: Default::default(),
+            env: runtime_config.execution_env(),
             session: session.clone(),
-            backend_override: None,
+            backend_override: runtime_config.backend_override(),
             task_signature: Some(task_signature),
             routing_decision: None,
             objective: None,
@@ -309,12 +313,16 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
         };
         let groups = self.app.groups()?;
         let destinations = destinations_from_groups(&groups);
+        let runtime_config = self.app.group_runtime_config(&group.folder)?;
+        let assistant_name = runtime_config
+            .assistant_name(&self.app.config.assistant_name)
+            .to_string();
         let prompt = format_task_request_with_destinations(
             task,
             &context_messages,
             &self.app.config.timezone,
             &destinations,
-            &self.app.config.assistant_name,
+            &assistant_name,
         )?;
         let request_plane = task
             .request_plane
@@ -344,11 +352,11 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             task_id: Some(task.id.clone()),
             script: task.script.clone(),
             omx: None,
-            assistant_name: self.app.config.assistant_name.clone(),
+            assistant_name,
             request_plane,
-            env: Default::default(),
+            env: runtime_config.execution_env(),
             session: session.clone(),
-            backend_override: None,
+            backend_override: runtime_config.backend_override(),
             task_signature: Some(task_signature),
             routing_decision: None,
             objective: None,
@@ -464,6 +472,10 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
         if deliveries.is_empty() {
             return Ok(false);
         }
+        let runtime_config = self.app.group_runtime_config(&group.folder)?;
+        let assistant_name = runtime_config
+            .assistant_name(&self.app.config.assistant_name)
+            .to_string();
 
         let mut sent_any = false;
         for delivery in deliveries {
@@ -481,8 +493,8 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             let bot_message = MessageRecord {
                 id: outbound.id.clone(),
                 chat_jid: outbound.chat_jid.clone(),
-                sender: self.app.config.assistant_name.clone(),
-                sender_name: Some(self.app.config.assistant_name.clone()),
+                sender: assistant_name.clone(),
+                sender_name: Some(assistant_name.clone()),
                 content: delivery.text.clone(),
                 timestamp: outbound.timestamp.clone(),
                 is_from_me: true,

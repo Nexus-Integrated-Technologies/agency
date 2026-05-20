@@ -72,15 +72,28 @@ The first `v2.0.64` slice ported into Rust is destination-aware message routing:
 - plain text output still falls back to the current group so existing local
   harness behavior remains compatible.
 
+The second `v2.0.64` slice ported into Rust is DB-backed per-group runtime
+configuration:
+
+- registered groups persist a JSON runtime config in SQLite, matching the
+  upstream direction of group-specific provider/model behavior without copying
+  the TypeScript implementation;
+- `nanoclaw group-runtime show|set` gives operators a narrow CLI for provider,
+  backend, model, effort, assistant-name, and prompt-window overrides;
+- local and Slack execution paths resolve these overrides before building
+  prompts, execution env, and backend overrides;
+- Azure, ZAI, Codex, Claude, Workers AI, GitHub Copilot, and custom backend
+  selection still flow through the existing executor/provider contract.
+
 ## Remaining Upstream Parity Ledger
 
 - Split session storage toward upstream `inbound.db` / `outbound.db` semantics
   once the Rust DB boundary can absorb the migration safely.
 - Add the upstream `on_wake` compatibility behavior so missing wake handlers
   degrade gracefully instead of failing startup.
-- Move container and per-group runtime configuration toward DB-backed state,
-  including model and effort overrides, while preserving the local-first
-  production controller.
+- Split image tag and CLI scope overrides out of the upstream container config
+  surface once the Rust container lane needs them; provider/model/effort
+  overrides are now DB-backed.
 - Refresh destination maps immediately after approval or registration changes
   so receiver routing does not depend on stale process memory.
 - Preserve provider routing through the existing OpenClaw/OMX/Nexus contracts;

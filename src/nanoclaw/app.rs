@@ -13,6 +13,7 @@ use crate::foundation::{
 use super::config::NanoclawConfig;
 use super::db::{NanoclawDb, NanoclawDbCounts};
 use super::dev_environment::DigitalOceanDevEnvironment;
+use super::group_runtime_config::GroupRuntimeConfig;
 use super::queue::GroupQueue;
 use super::scheduler::{build_run_log, build_scheduled_task, compute_next_run, TaskScheduleInput};
 
@@ -198,6 +199,18 @@ impl NanoclawApp {
 
     pub fn groups(&self) -> Result<Vec<Group>> {
         self.db.list_groups()
+    }
+
+    pub fn group_runtime_config(&self, group_folder: &str) -> Result<GroupRuntimeConfig> {
+        self.db.group_runtime_config(group_folder)
+    }
+
+    pub fn set_group_runtime_config(
+        &self,
+        group_folder: &str,
+        config: &GroupRuntimeConfig,
+    ) -> Result<()> {
+        self.db.set_group_runtime_config(group_folder, config)
     }
 
     pub fn register_group(&mut self, group: Group) -> Result<Group> {

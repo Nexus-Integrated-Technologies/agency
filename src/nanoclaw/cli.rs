@@ -13,6 +13,7 @@ use super::executor::{
     run_worker_daemon, run_worker_from_paths, run_worker_stdio, ExecutionLaneRouter,
 };
 use super::github_webhook::{handle_github_webhook, GithubWebhookPayload};
+use super::group_runtime_config::GroupRuntimeConfig;
 use super::host_os_control::{
     approval_notification_text, build_default_context, replay_approved_host_os_control_request,
     resolution_notification_text, resolve_host_os_control_request, run_host_os_control_task,
@@ -45,7 +46,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|group-runtime <show|set>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -69,6 +70,80 @@ fn parse_request_plane(value: Option<String>) -> RequestPlane {
     value
         .map(|value| RequestPlane::parse(&value))
         .unwrap_or(RequestPlane::None)
+}
+
+fn parse_group_runtime_set_args<I>(
+    existing: GroupRuntimeConfig,
+    args: &mut I,
+) -> Result<GroupRuntimeConfig>
+where
+    I: Iterator<Item = String>,
+{
+    let mut config = existing;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--provider" => {
+                config.provider = Some(
+                    args.next()
+                        .context("missing value after --provider")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--backend" => {
+                config.backend = Some(
+                    args.next()
+                        .context("missing value after --backend")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--model" => {
+                config.model = Some(
+                    args.next()
+                        .context("missing value after --model")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--effort" => {
+                config.effort = Some(
+                    args.next()
+                        .context("missing value after --effort")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--assistant-name" => {
+                config.assistant_name = Some(
+                    args.next()
+                        .context("missing value after --assistant-name")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--max-messages-per-prompt" => {
+                let value = args
+                    .next()
+                    .context("missing value after --max-messages-per-prompt")?;
+                let parsed = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --max-messages-per-prompt value {value}"))?;
+                if parsed == 0 {
+                    anyhow::bail!("--max-messages-per-prompt must be greater than zero");
+                }
+                config.max_messages_per_prompt = Some(parsed);
+            }
+            "--clear-provider" => config.provider = None,
+            "--clear-backend" => config.backend = None,
+            "--clear-model" => config.model = None,
+            "--clear-effort" => config.effort = None,
+            "--clear-assistant-name" => config.assistant_name = None,
+            "--clear-max-messages-per-prompt" => config.max_messages_per_prompt = None,
+            other => anyhow::bail!("unexpected group-runtime set argument '{}'", other),
+        }
+    }
+    Ok(config)
 }
 
 fn parse_host_os_action(action_kind: &str, args: &[String]) -> Result<HostOsControlAction> {
@@ -418,6 +493,30 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     .as_deref()
                     .unwrap_or("-")
             );
+        }
+        "group-runtime" => {
+            let Some(group_command) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let Some(group_folder) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let app = NanoclawApp::open(config)?;
+            match group_command.as_str() {
+                "show" => {
+                    let runtime_config = app.group_runtime_config(&group_folder)?;
+                    println!("{}", serde_json::to_string_pretty(&runtime_config)?);
+                }
+                "set" => {
+                    let existing = app.group_runtime_config(&group_folder)?;
+                    let runtime_config = parse_group_runtime_set_args(existing, &mut args)?;
+                    app.set_group_runtime_config(&group_folder, &runtime_config)?;
+                    println!("{}", serde_json::to_string_pretty(&runtime_config)?);
+                }
+                other => anyhow::bail!("unsupported group-runtime command '{}'", other),
+            }
         }
         "gateway" => {
             let subcommand = args.next().unwrap_or_else(|| "show-config".to_string());

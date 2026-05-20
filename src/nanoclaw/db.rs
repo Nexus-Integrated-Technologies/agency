@@ -12,6 +12,7 @@ use crate::foundation::{
     SwarmTaskDependency, SwarmTaskStatus, TaskContextMode, TaskRunLog, TaskScheduleType,
     TaskStatus,
 };
+use crate::nanoclaw::group_runtime_config::GroupRuntimeConfig;
 use crate::nanoclaw::observability::{
     ObservabilityEvent, ObservabilityEventStatus, ObservabilitySchemaAdapterDefinition,
     ObservabilitySeverity, UpsertObservabilityEventInput,
@@ -471,6 +472,7 @@ impl NanoclawDb {
         self.ensure_column("scheduled_tasks", "script", "TEXT")?;
         self.ensure_column("scheduled_tasks", "request_plane", "TEXT")?;
         self.ensure_column("scheduled_tasks", "context_mode", "TEXT DEFAULT 'isolated'")?;
+        self.ensure_column("registered_groups", "container_config", "TEXT")?;
         self.ensure_column("linear_issue_threads", "closed_at", "TEXT")?;
         self.ensure_column("linear_issue_threads", "issue_identifier", "TEXT")?;
         self.ensure_column("execution_provenance", "task_signature_json", "TEXT")?;
@@ -2077,6 +2079,42 @@ impl NanoclawDb {
             groups.push(row.context("failed to decode registered group row")?);
         }
         Ok(groups)
+    }
+
+    pub fn group_runtime_config(&self, group_folder: &str) -> Result<GroupRuntimeConfig> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT container_config FROM registered_groups WHERE folder = ?1")
+            .with_context(|| {
+                format!("failed to prepare runtime config lookup for {group_folder}")
+            })?;
+        let row = stmt.query_row(params![group_folder], |row| row.get::<_, Option<String>>(0));
+        match row {
+            Ok(config_json) => GroupRuntimeConfig::from_json(config_json.as_deref())
+                .with_context(|| format!("failed to read runtime config for {group_folder}")),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(GroupRuntimeConfig::default()),
+            Err(err) => Err(err)
+                .with_context(|| format!("failed to read runtime config for {group_folder}")),
+        }
+    }
+
+    pub fn set_group_runtime_config(
+        &self,
+        group_folder: &str,
+        config: &GroupRuntimeConfig,
+    ) -> Result<()> {
+        let config_json = config.to_json()?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE registered_groups SET container_config = ?1 WHERE folder = ?2",
+                params![config_json, group_folder],
+            )
+            .with_context(|| format!("failed to update runtime config for {group_folder}"))?;
+        if changed == 0 {
+            anyhow::bail!("registered group not found: {group_folder}");
+        }
+        Ok(())
     }
 
     pub fn store_chat_metadata(
@@ -3845,6 +3883,7 @@ mod tests {
         SwarmRequestedLane, SwarmResolvedLane, SwarmRun, SwarmRunStatus, SwarmTask,
         SwarmTaskDependency, SwarmTaskStatus, TaskContextMode, TaskScheduleType, TaskStatus,
     };
+    use crate::nanoclaw::group_runtime_config::GroupRuntimeConfig;
     use crate::nanoclaw::observability::{
         ObservabilityEventStatus, ObservabilitySchemaAdapterDefinition, ObservabilitySeverity,
         UpsertObservabilityEventInput,
@@ -3864,6 +3903,34 @@ mod tests {
         assert_eq!(db.list_registered_groups()?, vec![group]);
         assert_eq!(db.counts()?.registered_groups, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn stores_and_reads_group_runtime_config() -> Result<()> {
+        let dir = tempdir()?;
+        let db = NanoclawDb::open(dir.path().join("messages.db"))?;
+        let group = Group::main("Andy", "2026-04-04T00:00:00Z");
+        db.upsert_registered_group(&group)?;
+
+        assert_eq!(
+            db.group_runtime_config(&group.folder)?,
+            GroupRuntimeConfig::default()
+        );
+
+        let config = GroupRuntimeConfig {
+            provider: Some("azure-openai".to_string()),
+            model: Some("nanoclaw-gpt-4-1-mini".to_string()),
+            effort: Some("medium".to_string()),
+            assistant_name: Some("CTO".to_string()),
+            max_messages_per_prompt: Some(12),
+            ..Default::default()
+        };
+        db.set_group_runtime_config(&group.folder, &config)?;
+
+        assert_eq!(db.group_runtime_config(&group.folder)?, config);
+        let missing = db.set_group_runtime_config("missing", &GroupRuntimeConfig::default());
+        assert!(missing.is_err());
         Ok(())
     }
 
