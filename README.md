@@ -86,6 +86,14 @@ gateway/webhook auth posture, task backlog, and recent execution evidence:
 cargo run --quiet --bin nanoclaw -- runtime health --limit 5
 ```
 
+Report stale or invalid runtime PID files, then remove them only when explicitly
+applied:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime cleanup
+cargo run --quiet --bin nanoclaw -- runtime cleanup --apply
+```
+
 Execution lanes now return and persist a structured `ExecutionEvidence`
 envelope alongside their operator-facing text. The envelope records adapter
 type, execution mode, workspace, git state, artifacts, verification, blockers,

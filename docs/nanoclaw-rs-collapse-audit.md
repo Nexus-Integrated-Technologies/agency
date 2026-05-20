@@ -179,6 +179,8 @@ Already active:
 - `runtime health` for deterministic checks over directories, PID file state,
   gateway/webhook auth posture, scheduled-task backlog, and recent execution
   evidence
+- `runtime cleanup` for report-only stale/invalid PID-file cleanup, with
+  mutation gated behind `--apply`
 
 Remaining work:
 
@@ -199,6 +201,8 @@ Current unified entrypoint:
   tasks, and recent execution provenance for lifecycle inspection.
 - `nanoclaw runtime health --limit <n>` reports operator health checks without
   invoking model inference or legacy supervisor code.
+- `nanoclaw runtime cleanup [--apply]` reports stale or invalid runtime PID
+  files and removes only those files when explicitly applied.
 - `nanoclaw runtime poll` runs one local control-plane pump.
 - `nanoclaw runtime serve --profile full|gateway|webhook|pm|slack` starts the
   selected runtime profile without legacy Agency startup scripts.

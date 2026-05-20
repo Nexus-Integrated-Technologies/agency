@@ -51,7 +51,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|health|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -102,6 +102,11 @@ struct RuntimeServeArgs {
     profile: RuntimeServeProfile,
     lane_override: Option<ExecutionLane>,
     read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeCleanupArgs {
+    apply: bool,
 }
 
 fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
@@ -160,6 +165,23 @@ where
     }
 
     Ok(profile)
+}
+
+fn parse_runtime_cleanup_args<I>(args: &mut I) -> Result<RuntimeCleanupArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut apply = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            other => anyhow::bail!("unexpected runtime cleanup argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeCleanupArgs { apply })
 }
 
 fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
@@ -387,6 +409,64 @@ fn runtime_pid_profile_state_json(config: &NanoclawConfig, profile: RuntimeServe
             "running": false,
         }),
     }
+}
+
+fn runtime_cleanup_json(config: &NanoclawConfig, args: RuntimeCleanupArgs) -> Value {
+    let mut candidates = Vec::<Value>::new();
+    let mut removed = Vec::<Value>::new();
+    let mut errors = Vec::<Value>::new();
+
+    for profile in RuntimeServeProfile::all() {
+        let state = runtime_pid_profile_state_json(config, profile);
+        let state_name = state
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if !matches!(state_name, "stale" | "invalid") {
+            continue;
+        }
+
+        let pid_file = runtime_pid_path(config, profile);
+        let mut candidate = json!({
+            "profile": profile.as_str(),
+            "state": state_name,
+            "pid": state.get("pid").cloned().unwrap_or(Value::Null),
+            "pidFile": pid_file.display().to_string(),
+            "removed": false,
+        });
+
+        if args.apply {
+            match fs::remove_file(&pid_file) {
+                Ok(()) => {
+                    candidate["removed"] = Value::Bool(true);
+                    removed.push(candidate.clone());
+                }
+                Err(error) => {
+                    errors.push(json!({
+                        "profile": profile.as_str(),
+                        "pidFile": pid_file.display().to_string(),
+                        "error": error.to_string(),
+                    }));
+                }
+            }
+        }
+
+        candidates.push(candidate);
+    }
+
+    json!({
+        "ok": errors.is_empty(),
+        "applied": args.apply,
+        "summary": {
+            "candidates": candidates.len(),
+            "removed": removed.len(),
+            "errors": errors.len(),
+        },
+        "controlDir": runtime_control_dir(config).display().to_string(),
+        "candidates": candidates,
+        "removed": removed,
+        "errors": errors,
+    })
 }
 
 fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
@@ -722,6 +802,14 @@ fn print_runtime_health(config: NanoclawConfig, limit: usize) -> Result<()> {
     Ok(())
 }
 
+fn print_runtime_cleanup(config: NanoclawConfig, args: RuntimeCleanupArgs) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_cleanup_json(&config, args))?
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +881,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_runtime_cleanup_apply() {
+        let mut args = vec!["--apply".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_cleanup_args(&mut args).unwrap(),
+            RuntimeCleanupArgs { apply: true }
+        );
+    }
+
+    #[test]
     fn detects_stale_runtime_pid_file() -> Result<()> {
         let temp = tempdir()?;
         let mut config = NanoclawConfig::from_env();
@@ -829,6 +926,44 @@ mod tests {
         assert_eq!(state["state"], "invalid");
         assert_eq!(state["pid"], Value::Null);
         assert_eq!(state["running"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_dry_run_keeps_invalid_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Slack);
+        fs::write(&pid_path, "not-a-pid\n")?;
+
+        let report = runtime_cleanup_json(&config, RuntimeCleanupArgs { apply: false });
+
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], false);
+        assert_eq!(report["summary"]["candidates"], 1);
+        assert!(pid_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_apply_removes_invalid_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Webhook);
+        fs::write(&pid_path, "not-a-pid\n")?;
+
+        let report = runtime_cleanup_json(&config, RuntimeCleanupArgs { apply: true });
+
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], true);
+        assert_eq!(report["summary"]["removed"], 1);
+        assert!(!pid_path.exists());
         Ok(())
     }
 }
@@ -1421,6 +1556,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                 "health" => {
                     let limit = parse_limit_args(&mut args, 10, "runtime health")?;
                     print_runtime_health(config, limit)?;
+                }
+                "cleanup" => {
+                    let cleanup_args = parse_runtime_cleanup_args(&mut args)?;
+                    print_runtime_cleanup(config, cleanup_args)?;
                 }
                 "poll" => {
                     let lane_override = parse_lane_override(&mut args)?;
