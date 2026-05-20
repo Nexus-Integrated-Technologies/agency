@@ -70,9 +70,11 @@ or clean-roomed into the active runtime.
    process failures now emit `worker_process` evidence with stdout/stderr
    artifacts instead of opaque process errors, and remote-worker sync/command
    failures now emit `remote_worker_process` evidence with remote boundaries.
-   Remaining work is to extend the same contract to future external adapter
-   plugins as they are registered and to catch timeout/cancellation exits before
-   a worker outcome exists.
+   Host worker daemon startup, socket write/shutdown, timeout, empty outcome,
+   and cancellation-before-evidence paths now emit `worker_transport`
+   evidence with the correct failed/timed-out/cancelled status. Remaining work
+   is to extend the same contract to future external adapter plugins as they
+   are registered.
 2. Runtime supervisor:
    `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
    now owns the basic lifecycle surface with NanoClaw PID files, deterministic

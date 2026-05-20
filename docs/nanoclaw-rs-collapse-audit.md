@@ -261,6 +261,10 @@ Already active:
 - Remote-worker project sync, workspace sync, command failure, and invalid
   worker response paths now return `remote_worker_process` shell-mode failed
   evidence with the remote boundary preserved.
+- Host worker daemon startup, socket write/shutdown, request timeout, empty
+  outcome, and cancellation-before-evidence paths now return structured
+  `worker_transport` evidence with `failed`, `timed_out`, or `cancelled`
+  status before the run reaches closure validation.
 
 Remaining work:
 
@@ -268,8 +272,8 @@ Remaining work:
   local scheduled-task path.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
-- Extend timeout and cancellation paths so they return structured blockers even
-  when the adapter exits before producing a worker outcome.
+- Extend this transport/error normalization to future external adapter plugins
+  as they are registered.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 
