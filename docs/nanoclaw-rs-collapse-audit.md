@@ -316,6 +316,13 @@ Already active:
   failed shell evidence with a `command_safety_policy` blocker and is marked
   non-retryable instead of creating remote side effects or relying on summary
   prose.
+- Execution evidence and runtime artifact bodies now pass through deterministic
+  output-safety redaction before persistence. Secret-shaped assignments,
+  bearer credentials, provider secret keys, and GitHub tokens are redacted in
+  durable evidence/artifact JSON, and matching records receive an
+  `output_safety_report` artifact. Raw local log files remain available for
+  operator debugging; the redaction boundary is the durable, queryable evidence
+  stream.
 
 Remaining work:
 
