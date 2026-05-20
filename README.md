@@ -73,7 +73,8 @@ The status report includes a typed `runtimeChannels` registry covering local,
 scheduler, Slack, webhook, OpenClaw gateway, and discontinued legacy PM
 automation ownership. It also includes runtime PID files under `data/runtime/`,
 so local production profiles can be inspected and controlled without the old
-Agency service scripts.
+Agency service scripts. Startup and preflight events are appended to
+`data/runtime/startup-events.jsonl` for durable operator evidence.
 
 Inspect runtime state, recent tasks, and recent execution provenance:
 
@@ -135,7 +136,9 @@ cargo run --quiet --bin nanoclaw -- runtime serve --profile gateway
 
 Startup uses the same `runtimeChannels` registry reported by status and health.
 Misconfigured profile channels fail before PID-file creation with
-`runtime_channel_misconfigured` and the missing config/auth fields.
+`runtime_channel_misconfigured` and the missing config/auth fields. Those
+preflight failures, startup attempts, running transitions, and startup failures
+are recorded in `runtime state` under `runtime.startupEvents`.
 
 Stop or signal a running profile through the NanoClaw entrypoint:
 

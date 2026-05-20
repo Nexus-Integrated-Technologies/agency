@@ -222,6 +222,9 @@ Current unified entrypoint:
   preflights the same `runtimeChannels` registry used by status and health, so
   misconfigured channels fail before PID-file creation with
   `runtime_channel_misconfigured` and the exact missing config/auth fields.
+  Preflight failures, startup attempts, running transitions, and startup
+  failures append to `data/runtime/startup-events.jsonl` and are reported by
+  `runtime state` under `runtime.startupEvents`.
 - `nanoclaw runtime stop --profile <profile>` terminates a profiled runtime
   from its NanoClaw PID file.
 - `nanoclaw runtime reload --profile <profile>` sends a reload signal to the
@@ -366,8 +369,8 @@ Already active:
 - destination projection records
 - `nanoclaw runtime state --limit <n>` reports the active central DB, runtime
   roots, local inbox/outbox/processed directories, linked session sidecars,
-  orphan session directories, group roots, and queued task counts without
-  deleting or migrating anything.
+  orphan session directories, group roots, recent startup/preflight events, and
+  queued task counts without deleting or migrating anything.
 - Session state compaction now clean-room adopts the useful part of legacy
   episodic memory: when a compact runtime metadata snapshot is needed, the
   active `SessionState` preserves the original objective, inserts a

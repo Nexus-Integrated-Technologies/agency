@@ -101,6 +101,8 @@ or clean-roomed into the active runtime.
    health output instead of leaving those responsibilities as scattered CLI
    branches. `runtime serve` now preflights that registry before startup, so
    channel misconfiguration fails deterministically before PID-file creation.
+   Startup/preflight events now append to `data/runtime/startup-events.jsonl`
+   and surface in `runtime state` as durable operational evidence.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring
