@@ -15,6 +15,7 @@ use crate::foundation::{
 };
 
 use super::app::NanoclawApp;
+use super::command_safety::first_blocking_command_safety_violation;
 use super::db::NanoclawDb;
 use super::dev_environment::DigitalOceanDevEnvironment;
 use super::executor::{
@@ -1017,6 +1018,7 @@ struct DirectSwarmEvidenceInput<'a> {
     stdout: Option<&'a str>,
     error: Option<&'a str>,
     status: ExecutionEvidenceStatus,
+    blocker_kind: Option<&'a str>,
 }
 
 fn build_direct_swarm_execution_evidence(input: DirectSwarmEvidenceInput<'_>) -> ExecutionEvidence {
@@ -1041,16 +1043,17 @@ fn build_direct_swarm_execution_evidence(input: DirectSwarmEvidenceInput<'_>) ->
         input.stdout.unwrap_or(""),
         input.error.unwrap_or("")
     );
-    let blockers = input
-        .error
-        .map(|message| {
-            vec![ExecutionBlockerRef {
-                kind: format!("{}_command_failed", input.adapter_type),
-                source: Some(input.adapter_type.to_string()),
-                message: message.to_string(),
-            }]
-        })
-        .unwrap_or_default();
+    let blockers = input.error.map(|message| {
+        vec![ExecutionBlockerRef {
+            kind: input
+                .blocker_kind
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}_command_failed", input.adapter_type)),
+            source: Some(input.adapter_type.to_string()),
+            message: message.to_string(),
+        }]
+    });
+    let blockers = blockers.unwrap_or_default();
     build_execution_evidence(BuildExecutionEvidenceInput {
         adapter_type: input.adapter_type,
         mode: ExecutionEvidenceMode::Shell,
@@ -1075,6 +1078,43 @@ fn build_direct_swarm_execution_evidence(input: DirectSwarmEvidenceInput<'_>) ->
         }],
         blockers,
     })
+}
+
+fn blocked_direct_swarm_command_result(
+    adapter_type: &str,
+    run: &SwarmRun,
+    task: &SwarmTask,
+    command: &str,
+    remote_cwd: &str,
+    violation_message: &str,
+) -> SwarmTaskExecutionResult {
+    let message = format!("swarm command blocked by command safety policy: {violation_message}");
+    let evidence = build_direct_swarm_execution_evidence(DirectSwarmEvidenceInput {
+        adapter_type,
+        run,
+        task,
+        command,
+        remote_cwd,
+        remote_target: None,
+        stdout: None,
+        error: Some(message.as_str()),
+        status: ExecutionEvidenceStatus::Failed,
+        blocker_kind: Some("command_safety_policy"),
+    });
+
+    SwarmTaskExecutionResult {
+        ok: false,
+        summary: message.clone(),
+        output: None,
+        error: Some(message),
+        metadata: Some(json!({
+            "remote_repo_path": remote_cwd,
+            "mode": adapter_type,
+            "execution_evidence": evidence.clone(),
+        })),
+        evidence: Some(evidence),
+        non_retryable: true,
+    }
 }
 
 fn run_swarm_repo_mirror_lane(
@@ -1106,23 +1146,36 @@ fn run_swarm_repo_mirror_lane(
         });
     }
     let environment = DigitalOceanDevEnvironment::from_config(&app.config);
-    let remote_root = if runnable.task.sync {
-        let _ = environment.sync_project()?;
-        environment.remote_repo_path()?
-    } else if let Some(repo) = runnable
+    let repo = runnable
         .task
         .repo
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let remote_root = build_remote_repo_mirror_path(&app.config.droplet_repo_root, repo)?;
-        ensure_remote_repo_mirror(&environment, repo, &remote_root)?;
-        remote_root
+        .filter(|value| !value.trim().is_empty());
+    let remote_root_for_safety = if runnable.task.sync {
+        environment.remote_repo_path()?
+    } else if let Some(repo) = repo {
+        build_remote_repo_mirror_path(&app.config.droplet_repo_root, repo)?
     } else {
         environment.remote_repo_path()?
     };
-    let remote_cwd = resolve_remote_cwd(&remote_root, runnable.task.repo_path.as_deref());
+    let remote_cwd =
+        resolve_remote_cwd(&remote_root_for_safety, runnable.task.repo_path.as_deref());
     let remote_command = format!("cd {} && {}", shell_quote(&remote_cwd), command);
+    if let Some(violation) = first_blocking_command_safety_violation(command) {
+        return Ok(blocked_direct_swarm_command_result(
+            "repo_mirror",
+            &runnable.run,
+            &runnable.task,
+            remote_command.as_str(),
+            remote_cwd.as_str(),
+            violation.message.as_str(),
+        ));
+    }
+    if runnable.task.sync {
+        let _ = environment.sync_project()?;
+    } else if let Some(repo) = repo {
+        ensure_remote_repo_mirror(&environment, repo, &remote_root_for_safety)?;
+    }
     let result = environment.exec(&remote_command);
     match result {
         Ok(exec) => {
@@ -1136,6 +1189,7 @@ fn run_swarm_repo_mirror_lane(
                 stdout: Some(exec.stdout.as_str()),
                 error: None,
                 status: ExecutionEvidenceStatus::Succeeded,
+                blocker_kind: None,
             });
             Ok(SwarmTaskExecutionResult {
                 ok: true,
@@ -1164,6 +1218,7 @@ fn run_swarm_repo_mirror_lane(
                 stdout: None,
                 error: Some(error_message.as_str()),
                 status: ExecutionEvidenceStatus::Failed,
+                blocker_kind: None,
             });
             Ok(SwarmTaskExecutionResult {
                 ok: false,
@@ -1201,6 +1256,16 @@ fn run_swarm_symphony_lane(
     let remote_root = environment.remote_repo_path()?;
     let remote_cwd = resolve_remote_cwd(&remote_root, runnable.task.cwd.as_deref());
     let remote_command = format!("cd {} && {}", shell_quote(&remote_cwd), command);
+    if let Some(violation) = first_blocking_command_safety_violation(command) {
+        return Ok(blocked_direct_swarm_command_result(
+            "symphony",
+            &runnable.run,
+            &runnable.task,
+            remote_command.as_str(),
+            remote_cwd.as_str(),
+            violation.message.as_str(),
+        ));
+    }
     let result = environment.exec(&remote_command);
     match result {
         Ok(exec) => {
@@ -1214,6 +1279,7 @@ fn run_swarm_symphony_lane(
                 stdout: Some(exec.stdout.as_str()),
                 error: None,
                 status: ExecutionEvidenceStatus::Succeeded,
+                blocker_kind: None,
             });
             Ok(SwarmTaskExecutionResult {
                 ok: true,
@@ -1242,6 +1308,7 @@ fn run_swarm_symphony_lane(
                 stdout: None,
                 error: Some(error_message.as_str()),
                 status: ExecutionEvidenceStatus::Failed,
+                blocker_kind: None,
             });
             Ok(SwarmTaskExecutionResult {
                 ok: false,
@@ -2230,6 +2297,7 @@ mod tests {
             stdout: Some("clean"),
             error: None,
             status: ExecutionEvidenceStatus::Succeeded,
+            blocker_kind: None,
         });
         assert_eq!(evidence.adapter_type, "repo_mirror");
         assert_eq!(evidence.mode.as_str(), "shell");
@@ -2251,6 +2319,52 @@ mod tests {
                 non_retryable: false,
             },
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn direct_swarm_command_safety_blocks_with_structured_evidence() -> Result<()> {
+        let dir = tempdir()?;
+        let mut app = NanoclawApp::open(test_config(dir.path()))?;
+        let created = create_swarm_objective_run(
+            &mut app,
+            CreateSwarmObjectiveRunInput {
+                objective: "Mirror repo and verify status".to_string(),
+                group_folder: "main".to_string(),
+                chat_jid: "main".to_string(),
+                created_by: "tester".to_string(),
+                requested_lane: None,
+                tasks: Vec::new(),
+                max_concurrency: Some(1),
+            },
+        )?;
+        let task = created.tasks.first().unwrap();
+        let result = super::blocked_direct_swarm_command_result(
+            "repo_mirror",
+            &created.run,
+            task,
+            "cd /srv/code-mirror/example && rm -rf ./*",
+            "/srv/code-mirror/example",
+            "blocked recursive forced removal of high-risk target `./*`",
+        );
+
+        assert!(!result.ok);
+        assert!(result.non_retryable);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("command safety policy"));
+        let evidence = result
+            .evidence
+            .as_ref()
+            .expect("blocked result emits evidence");
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "command_safety_policy");
+        assert_eq!(
+            evidence.verification[0].command.as_deref(),
+            Some("cd /srv/code-mirror/example && rm -rf ./*")
+        );
         Ok(())
     }
 }
