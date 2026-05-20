@@ -117,6 +117,8 @@ The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
 
 ## Near-Term Next Cuts
 
+- The current collapse audit and ordered backlog live in
+  `docs/nanoclaw-rs-collapse-audit.md`.
 - Strip `src/fpf/` and governance-dependent orchestration modules after their
   remaining call sites are removed or replaced.
 - Collapse the workspace toward the small, operator-oriented NanoClaw surface:

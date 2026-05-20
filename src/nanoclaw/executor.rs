@@ -13,6 +13,7 @@ use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::foundation::{
@@ -126,7 +127,7 @@ impl ExecutionSession {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("ncl-{}.sock", compact_session_suffix(&self.id)))
+        worker_socket_path(Path::new(&self.session_root), &self.id)
     }
 
     pub fn pid_path(&self) -> PathBuf {
@@ -153,6 +154,22 @@ fn compact_session_suffix(session_id: &str) -> String {
     } else {
         compact[compact.len() - 12..].to_string()
     }
+}
+
+fn worker_socket_path(session_root: &Path, session_id: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(session_root.display().to_string().as_bytes());
+    let digest = hasher.finalize();
+    let root_hash = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::env::temp_dir().join(format!(
+        "ncl-{}-{}.sock",
+        compact_session_suffix(session_id),
+        root_hash
+    ))
 }
 
 pub fn build_execution_session(
@@ -974,8 +991,7 @@ fn run_worker_daemon_with_idle_timeout(session_root: &Path, idle_timeout: Durati
         .file_name()
         .and_then(|value| value.to_str())
         .context("failed to derive session id from session root")?;
-    let socket_path =
-        std::env::temp_dir().join(format!("ncl-{}.sock", compact_session_suffix(session_id)));
+    let socket_path = worker_socket_path(&session_root, session_id);
     let pid_path = state_root.join("worker.pid");
 
     fs::create_dir_all(&ipc_root)
