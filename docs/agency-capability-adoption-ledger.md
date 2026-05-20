@@ -130,7 +130,12 @@ or clean-roomed into the active runtime.
    with a `command_safety_policy` blocker instead of running and then relying on
    prose logs. Direct swarm shell lanes now reuse the same gate for repo mirror
    and Symphony remote commands before remote side effects or completion
-   evidence.
+   evidence. The first output-safety slice is also active:
+   `src/nanoclaw/output_safety.rs` deterministically detects secret-shaped
+   stdout/stderr/log content before it enters durable execution evidence or
+   runtime artifact bodies. It redacts those persisted bodies and emits an
+   `output_safety_report` artifact without blocking the execution or applying
+   brittle prompt/content filters.
 
 ## Parking Rules
 

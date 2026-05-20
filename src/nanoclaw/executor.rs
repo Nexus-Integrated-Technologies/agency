@@ -34,6 +34,7 @@ use super::fpf_bridge::{
 };
 use super::model_router::{resolve_worker_backend, ResolvedWorkerBackend, WorkerBackend};
 use super::omx::{OmxExecutionOptions, OmxRunnerClient};
+use super::output_safety::{output_safety_report_body, redact_sensitive_output};
 use super::request_plane::{get_request_plane_env, get_request_plane_text_error};
 use super::security_profile::{
     build_execution_provenance_record, derive_capability_manifest, get_capability_manifest_env,
@@ -517,31 +518,68 @@ fn collect_execution_artifacts(
     log_body: Option<&str>,
     metadata: Option<&ExecutionMetadata>,
 ) -> Vec<ExecutionArtifactRef> {
-    let mut artifacts = metadata
+    let raw_metadata_artifacts = metadata
         .map(|metadata| metadata.artifacts.clone())
         .unwrap_or_default();
+    let mut artifacts = Vec::new();
+    for artifact in raw_metadata_artifacts {
+        append_output_safety_report(
+            &mut artifacts,
+            adapter_type,
+            artifact.title.as_str(),
+            artifact.body.as_deref(),
+        );
+        artifacts.push(redact_execution_artifact_body(artifact));
+    }
     if let Some(log_path) = log_path {
         let already_present = artifacts
             .iter()
             .any(|artifact| artifact.location.as_deref() == Some(log_path));
         if !already_present {
+            append_output_safety_report(&mut artifacts, adapter_type, "execution_log", log_body);
             artifacts.push(ExecutionArtifactRef {
                 kind: "execution_log".to_string(),
                 title: format!("{adapter_type} execution log"),
                 location: Some(log_path.to_string()),
-                body: log_body.map(str::to_string),
+                body: log_body.map(redact_sensitive_output),
             });
         }
     }
     if log_path.is_none() && log_body.is_some() {
+        append_output_safety_report(&mut artifacts, adapter_type, "execution_log", log_body);
         artifacts.push(ExecutionArtifactRef {
             kind: "execution_log".to_string(),
             title: format!("{adapter_type} execution log"),
             location: None,
-            body: log_body.map(str::to_string),
+            body: log_body.map(redact_sensitive_output),
         });
     }
     artifacts
+}
+
+fn redact_execution_artifact_body(mut artifact: ExecutionArtifactRef) -> ExecutionArtifactRef {
+    artifact.body = artifact.body.as_deref().map(redact_sensitive_output);
+    artifact
+}
+
+fn append_output_safety_report(
+    artifacts: &mut Vec<ExecutionArtifactRef>,
+    adapter_type: &str,
+    source: &str,
+    body: Option<&str>,
+) {
+    let Some(body) = body else {
+        return;
+    };
+    let Some(report_body) = output_safety_report_body(source, body) else {
+        return;
+    };
+    artifacts.push(ExecutionArtifactRef {
+        kind: "output_safety_report".to_string(),
+        title: format!("{adapter_type} output safety report"),
+        location: None,
+        body: Some(report_body),
+    });
 }
 
 fn collect_git_evidence(workspace_root: Option<&str>) -> ExecutionGitEvidence {
@@ -5303,6 +5341,55 @@ mod tests {
             evidence.artifacts[0].location.as_deref(),
             Some("/tmp/exec.log")
         );
+    }
+
+    #[test]
+    fn execution_evidence_redacts_sensitive_log_bodies() {
+        let temp = tempdir().unwrap();
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some(temp.path().display().to_string()),
+            isolated: true,
+        };
+
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-redaction",
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: "session-redaction",
+            group_folder: Some("main"),
+            workspace_root: temp.path().to_str(),
+            boundary: &boundary,
+            log_path: Some("/tmp/redaction.log"),
+            log_body: Some(
+                "stdout=ok\nsecret=abcdefghijkl\nAuthorization: Bearer zyxwvutsrqponmlk\n",
+            ),
+            metadata: None,
+            provenance_id: None,
+            verification: vec![ExecutionVerificationRef {
+                kind: "test_verification".to_string(),
+                command: None,
+                status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+                summary: Some("test verification supplied".to_string()),
+            }],
+            blockers: Vec::new(),
+        });
+
+        let combined_body = evidence
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.body.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!combined_body.contains("abcdefghijkl"));
+        assert!(!combined_body.contains("zyxwvutsrqponmlk"));
+        assert!(combined_body.contains("[redacted:secret_assignment]"));
+        assert!(combined_body.contains("[redacted:authorization_bearer]"));
+        assert!(evidence
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "output_safety_report"));
     }
 
     #[test]

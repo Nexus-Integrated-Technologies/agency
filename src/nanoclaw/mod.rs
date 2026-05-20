@@ -16,6 +16,7 @@ pub mod model_router;
 pub mod observability;
 pub mod omx;
 pub mod openclaw_gateway;
+pub mod output_safety;
 pub mod pm;
 pub mod pm_automation;
 pub mod project_environments;

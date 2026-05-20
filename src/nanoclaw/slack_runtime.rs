@@ -19,6 +19,7 @@ use super::executor::{
 use super::fpf_bridge::{build_boundary_claims, derive_task_signature};
 use super::ingress_policy::{has_authorized_trigger, should_drop_inbound_message};
 use super::omx::{maybe_inject_slack_reply, OmxExecutionOptions, OmxMode};
+use super::output_safety::redact_sensitive_output;
 use super::request_plane::default_request_plane;
 use super::router::{
     destination_for_group, destinations_from_groups, format_agent_prompt,
@@ -449,9 +450,9 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             return Ok(());
         };
         let body = if let Some(log_body) = execution.log_body.as_deref() {
-            log_body.to_string()
+            redact_sensitive_output(log_body)
         } else {
-            std::fs::read_to_string(log_path)?
+            redact_sensitive_output(&std::fs::read_to_string(log_path)?)
         };
         let created_at = Utc::now().to_rfc3339();
         let artifact = ArtifactRecord {
