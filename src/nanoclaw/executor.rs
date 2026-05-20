@@ -987,13 +987,36 @@ impl RemoteWorkerExecutor {
 impl ExecutorBoundary for RemoteWorkerExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
-        self.dev_environment.sync_project()?;
-        self.dev_environment.sync_group_workspace(
-            Path::new(&request.session.workspace_root),
-            &request.group.folder,
-        )?;
-
+        let local_workspace_root = request.session.workspace_root.clone();
+        let group_folder = request.group.folder.clone();
         let payload = build_worker_request(remoteize_request(&self.remote_worker_root, request));
+        if let Err(error) = self.dev_environment.sync_project() {
+            return Ok(build_worker_process_failure_response(
+                &payload,
+                "remote_worker_process",
+                "remote worker project sync",
+                &format!("failed to sync project to remote worker: {error}"),
+                "",
+                "",
+                ExecutionLocation::RemoteWorker,
+                ExecutionBoundaryKind::RemoteWorker,
+            ));
+        }
+        if let Err(error) = self
+            .dev_environment
+            .sync_group_workspace(Path::new(&local_workspace_root), &group_folder)
+        {
+            return Ok(build_worker_process_failure_response(
+                &payload,
+                "remote_worker_process",
+                "remote worker workspace sync",
+                &format!("failed to sync group workspace to remote worker: {error}"),
+                "",
+                "",
+                ExecutionLocation::RemoteWorker,
+                ExecutionBoundaryKind::RemoteWorker,
+            ));
+        }
         let command = format!(
             "if [ -x {binary} ]; then NANOCLAW_EXECUTION_LOCATION=remote_worker {binary} exec-worker-stdio; else NANOCLAW_EXECUTION_LOCATION=remote_worker cargo run --quiet --manifest-path {manifest} --bin nanoclaw -- exec-worker-stdio; fi",
             binary = shell_quote(&self.remote_worker_binary),
@@ -1001,9 +1024,36 @@ impl ExecutorBoundary for RemoteWorkerExecutor {
         );
         let stdin =
             serde_json::to_vec(&payload).context("failed to encode remote worker request")?;
-        let result = self.dev_environment.exec_with_stdin(&command, &stdin)?;
-        let outcome: WorkerOutcome = serde_json::from_str(&result.stdout)
-            .context("failed to parse remote worker response")?;
+        let result = match self.dev_environment.exec_with_stdin(&command, &stdin) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(build_worker_process_failure_response(
+                    &payload,
+                    "remote_worker_process",
+                    &command,
+                    &format!("remote worker command failed: {error}"),
+                    "",
+                    "",
+                    ExecutionLocation::RemoteWorker,
+                    ExecutionBoundaryKind::RemoteWorker,
+                ));
+            }
+        };
+        let outcome: WorkerOutcome = match serde_json::from_str(&result.stdout) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(build_worker_process_failure_response(
+                    &payload,
+                    "remote_worker_process",
+                    &command,
+                    &format!("failed to parse remote worker response: {error}"),
+                    result.stdout.trim(),
+                    "",
+                    ExecutionLocation::RemoteWorker,
+                    ExecutionBoundaryKind::RemoteWorker,
+                ));
+            }
+        };
         let mut response = decode_worker_outcome(outcome)?;
         response.boundary = ExecutionBoundary {
             kind: ExecutionBoundaryKind::RemoteWorker,
@@ -2080,10 +2130,13 @@ fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<
         Err(error) => {
             return Ok(build_worker_process_failure_response(
                 payload,
+                "worker_process",
                 &command_description,
                 &format!("failed to spawn {command_description}: {error}"),
                 "",
                 "",
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
             ));
         }
     };
@@ -2092,10 +2145,13 @@ fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<
         Err(error) => {
             return Ok(build_worker_process_failure_response(
                 payload,
+                "worker_process",
                 &command_description,
                 &error.to_string(),
                 "",
                 "",
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
             ));
         }
     };
@@ -2104,6 +2160,7 @@ fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         return Ok(build_worker_process_failure_response(
             payload,
+            "worker_process",
             &command_description,
             &format!(
                 "{} exited with status {}{}",
@@ -2117,6 +2174,8 @@ fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<
             ),
             &stdout,
             &stderr,
+            ExecutionLocation::LocalContainer,
+            ExecutionBoundaryKind::Container,
         ));
     }
     let outcome: WorkerOutcome =
@@ -2126,10 +2185,13 @@ fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<
 
 fn build_worker_process_failure_response(
     payload: &WorkerRequest,
+    adapter_type: &str,
     command_description: &str,
     message: &str,
     stdout: &str,
     stderr: &str,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
 ) -> ExecutionResponse {
     let log_path = Path::new(&payload.session.logs_root)
         .join(format!("{}.process.log", payload.invocation_id));
@@ -2147,16 +2209,16 @@ fn build_worker_process_failure_response(
     let _ = fs::write(&log_path, &log_body);
     let response = build_blocked_worker_response_with_context(
         payload,
-        "worker_process",
+        adapter_type,
         ExecutionEvidenceMode::Shell,
-        ExecutionRunKind::Custom("worker_process".to_string()),
+        ExecutionRunKind::Custom(adapter_type.to_string()),
         "worker_process_error",
         message,
         log_path.as_path(),
         log_body,
         None,
-        ExecutionLocation::LocalContainer,
-        ExecutionBoundaryKind::Container,
+        execution_location,
+        boundary_kind,
     );
     blocked_worker_response_into_execution_response(response)
 }
@@ -4756,19 +4818,20 @@ mod tests {
 
     use crate::foundation::CapabilityManifest;
     use crate::foundation::{
-        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, ExecutionStatus, Group,
-        MessageRecord, RemoteWorkerMode, RequestPlane,
+        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, ExecutionLocation,
+        ExecutionStatus, Group, MessageRecord, RemoteWorkerMode, RequestPlane,
     };
     use crate::nanoclaw::config::NanoclawConfig;
     use crate::nanoclaw::model_router::WorkerBackend;
 
     use super::{
         build_azure_openai_chat_target, build_execution_evidence, build_execution_metadata,
-        build_execution_session, build_github_copilot_command, collect_git_evidence,
-        connect_to_worker_socket, default_codex_sandbox_for_request,
-        detect_paperclip_control_plane_blocker, execute_worker_request, extract_azure_openai_text,
-        is_codex_usage_limit_error, normalize_azure_openai_fallback_backend, normalize_branch_name,
-        normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
+        build_execution_session, build_github_copilot_command,
+        build_worker_process_failure_response, collect_git_evidence, connect_to_worker_socket,
+        default_codex_sandbox_for_request, detect_paperclip_control_plane_blocker,
+        execute_worker_request, extract_azure_openai_text, is_codex_usage_limit_error,
+        normalize_azure_openai_fallback_backend, normalize_branch_name, normalize_github_repo_ref,
+        parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
         parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
         run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
         should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
@@ -5464,6 +5527,63 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("stderr=stderr"));
+    }
+
+    #[test]
+    fn remote_worker_process_failures_return_remote_structured_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-remote-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session,
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = build_worker_process_failure_response(
+            &payload,
+            "remote_worker_process",
+            "remote command",
+            "failed to parse remote worker response",
+            "not json",
+            "",
+            ExecutionLocation::RemoteWorker,
+            ExecutionBoundaryKind::RemoteWorker,
+        );
+        let evidence = response.evidence.as_ref().expect("remote process evidence");
+        assert_eq!(response.boundary.kind, ExecutionBoundaryKind::RemoteWorker);
+        assert_eq!(evidence.boundary.kind, ExecutionBoundaryKind::RemoteWorker);
+        assert_eq!(evidence.adapter_type, "remote_worker_process");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(
+            evidence.blockers[0].source.as_deref(),
+            Some("remote_worker_process")
+        );
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stdout=not json"));
     }
 
     #[test]

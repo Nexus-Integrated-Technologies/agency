@@ -258,6 +258,9 @@ Already active:
 - Container worker process failures now return `worker_process` shell-mode
   failed evidence with stdout/stderr in the log artifact and a
   `worker_process_error` blocker before completion is rejected.
+- Remote-worker project sync, workspace sync, command failure, and invalid
+  worker response paths now return `remote_worker_process` shell-mode failed
+  evidence with the remote boundary preserved.
 
 Remaining work:
 
@@ -265,9 +268,8 @@ Remaining work:
   local scheduled-task path.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
-- Extend lower-level process failure paths so remote worker sync/startup
-  failures, timeouts, and cancelled runs return structured blockers even when
-  the adapter exits before producing a worker outcome.
+- Extend timeout and cancellation paths so they return structured blockers even
+  when the adapter exits before producing a worker outcome.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 
