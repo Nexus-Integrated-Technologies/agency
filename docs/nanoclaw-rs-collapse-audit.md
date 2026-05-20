@@ -269,11 +269,15 @@ Already active:
   `--manual-override` and records a manual completion override, while
   execution-driven completion remains gated through structured execution
   evidence.
+- Linear is no longer an active issue/writeback surface for this instance.
+  Legacy Linear CLI and webhook paths are disabled by default and require
+  `NANOCLAW_LINEAR_LEGACY_ENABLED=true` only for controlled migration/reference
+  use.
 
 Remaining work:
 
-- Thread the same closure gate into external issue/writeback surfaces that can
-  transition third-party work states.
+- Thread the same closure gate into active Nexus/Paperclip/GitHub issue and
+  writeback surfaces that can transition work states.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
 - Extend this transport/error normalization to future external adapter plugins

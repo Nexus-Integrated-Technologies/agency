@@ -54,7 +54,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -682,7 +682,8 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
     checks.push(gateway_check);
 
     let webhook_missing_auth = app.config.linear_webhook_port > 0
-        && app.config.linear_webhook_secret.trim().is_empty()
+        && (!app.config.linear_legacy_enabled
+            || app.config.linear_webhook_secret.trim().is_empty())
         && app.config.github_webhook_secret.trim().is_empty()
         && app.config.observability_webhook_token.trim().is_empty();
     checks.push(runtime_health_check(
@@ -701,7 +702,8 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
         },
         json!({
             "port": app.config.linear_webhook_port,
-            "linearSignatureRequired": !app.config.linear_webhook_secret.trim().is_empty(),
+            "linearLegacyEnabled": app.config.linear_legacy_enabled,
+            "linearSignatureRequired": app.config.linear_legacy_enabled && !app.config.linear_webhook_secret.trim().is_empty(),
             "githubSignatureRequired": !app.config.github_webhook_secret.trim().is_empty(),
             "observabilityTokenConfigured": !app.config.observability_webhook_token.trim().is_empty(),
         }),
@@ -825,12 +827,14 @@ fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
         "webhook": {
             "enabled": config.linear_webhook_port > 0,
             "port": config.linear_webhook_port,
-            "linearSignatureRequired": !config.linear_webhook_secret.trim().is_empty(),
+            "linearLegacyEnabled": config.linear_legacy_enabled,
+            "linearSignatureRequired": config.linear_legacy_enabled && !config.linear_webhook_secret.trim().is_empty(),
             "githubSignatureRequired": !config.github_webhook_secret.trim().is_empty(),
             "observabilityTokenConfigured": !config.observability_webhook_token.trim().is_empty(),
         },
         "pmAutomation": {
-            "enabled": !config.linear_chat_jid.trim().is_empty(),
+            "enabled": config.linear_legacy_enabled && !config.linear_chat_jid.trim().is_empty(),
+            "status": if config.linear_legacy_enabled { "legacy-enabled" } else { "discontinued" },
             "linearChatJidConfigured": !config.linear_chat_jid.trim().is_empty(),
             "teamKeysConfigured": !config.linear_pm_team_keys.is_empty(),
         },
@@ -1717,6 +1721,11 @@ fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Re
             park_runtime(RuntimeServeProfile::Webhook);
         }
         RuntimeServeProfile::Pm => {
+            if !config.linear_legacy_enabled {
+                anyhow::bail!(
+                    "runtime pm profile is discontinued with Linear; set NANOCLAW_LINEAR_LEGACY_ENABLED=true only for controlled legacy migration"
+                );
+            }
             if config.linear_chat_jid.trim().is_empty() {
                 anyhow::bail!("runtime pm profile is disabled: set LINEAR_CHAT_JID");
             }
@@ -2158,6 +2167,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     .unwrap_or_else(|| "-".to_string())
             );
             println!("slack_poll_interval_ms: {}", config.slack_poll_interval_ms);
+            println!("linear_legacy_enabled: {}", config.linear_legacy_enabled);
             println!("linear_webhook_port: {}", config.linear_webhook_port);
             println!(
                 "observability_chat_jid: {}",
@@ -3129,6 +3139,11 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
             }
         }
         "linear" => {
+            if !config.linear_legacy_enabled {
+                anyhow::bail!(
+                    "Linear integration is discontinued for this Nexus runtime; set NANOCLAW_LINEAR_LEGACY_ENABLED=true only for controlled legacy migration"
+                );
+            }
             let Some(linear_command) = args.next() else {
                 print_usage();
                 std::process::exit(2);

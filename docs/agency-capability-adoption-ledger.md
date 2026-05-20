@@ -74,8 +74,10 @@ or clean-roomed into the active runtime.
    and cancellation-before-evidence paths now emit `worker_transport`
    evidence with the correct failed/timed-out/cancelled status. Manual CLI task
    completion now requires an explicit `--manual-override`, keeping
-   execution-driven closure on the structured evidence path. Remaining work is
-   to extend the same contract to future external adapter plugins as they are
+   execution-driven closure on the structured evidence path. Linear is parked
+   as a discontinued legacy integration and is disabled by default. Remaining
+   work is to extend the same contract to active Nexus/Paperclip/GitHub
+   writeback surfaces and future external adapter plugins as they are
    registered.
 2. Runtime supervisor:
    `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
