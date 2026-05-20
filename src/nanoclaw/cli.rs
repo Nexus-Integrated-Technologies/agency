@@ -979,6 +979,60 @@ fn runtime_state_residue_item_json(
     })
 }
 
+fn runtime_state_residue_operator_action_json(item: &Value) -> Value {
+    let key = item.get("key").and_then(Value::as_str).unwrap_or("unknown");
+    let classification = item
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let path = item
+        .get("state")
+        .and_then(|state| state.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let exists = item
+        .get("state")
+        .and_then(|state| state.get("exists"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let (action, destructive, next_step) = match classification {
+        "legacy_vector_cache" => (
+            "purge_candidate",
+            true,
+            "confirm no active runtime contract references this cache before any separate operator-approved purge",
+        ),
+        "legacy_vector_store" | "legacy_embedding_db" | "legacy_history_jsonl" => (
+            "migration_candidate",
+            false,
+            "migrate only through an explicit runtime contract, then archive or purge in a separate operator-approved step",
+        ),
+        "legacy_source_reference" => (
+            "preserve_reference",
+            false,
+            "keep parked as source/reference material; do not delete through runtime cleanup",
+        ),
+        _ => (
+            "review_candidate",
+            false,
+            "review manually before deciding whether this belongs to active runtime state",
+        ),
+    };
+
+    json!({
+        "key": key,
+        "classification": classification,
+        "path": path,
+        "exists": exists,
+        "status": if exists { "needs_operator_decision" } else { "not_present" },
+        "action": action,
+        "approvalRequired": true,
+        "destructive": destructive,
+        "safeDefault": "leave_in_place",
+        "nextStep": next_step,
+    })
+}
+
 fn runtime_state_residue_json(config: &NanoclawConfig) -> Value {
     let active_roots = vec![
         runtime_state_residue_item_json(
@@ -1103,20 +1157,27 @@ fn runtime_state_residue_json(config: &NanoclawConfig) -> Value {
                 == Some(true)
         })
         .count();
+    let operator_actions = legacy_candidates
+        .iter()
+        .map(runtime_state_residue_operator_action_json)
+        .collect::<Vec<_>>();
 
     json!({
         "policy": {
             "destructiveCleanup": "manual-only",
             "cleanupCommandDeletesState": false,
+            "operatorActionRequired": true,
             "note": "This inventory is report-only; runtime cleanup only removes stale or invalid PID files.",
         },
         "summary": {
             "activeRoots": active_roots.len(),
             "legacyCandidates": legacy_candidates.len(),
             "presentLegacyCandidates": present_legacy_candidates,
+            "operatorActions": operator_actions.len(),
         },
         "activeRoots": active_roots,
         "legacyCandidates": legacy_candidates,
+        "operatorActions": operator_actions,
     })
 }
 
@@ -1761,7 +1822,9 @@ mod tests {
         let report = runtime_state_residue_json(&config);
 
         assert_eq!(report["policy"]["cleanupCommandDeletesState"], false);
+        assert_eq!(report["policy"]["operatorActionRequired"], true);
         assert_eq!(report["summary"]["presentLegacyCandidates"], 2);
+        assert_eq!(report["summary"]["operatorActions"], 8);
         let legacy_keys = report["legacyCandidates"]
             .as_array()
             .unwrap()
@@ -1770,6 +1833,30 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(legacy_keys.contains("fastembed_cache"));
         assert!(legacy_keys.contains("agency_history_jsonl"));
+        let actions = report["operatorActions"].as_array().unwrap();
+        let fastembed_action = actions
+            .iter()
+            .find(|item| item["key"] == "fastembed_cache")
+            .expect("fastembed cache action should exist");
+        assert_eq!(fastembed_action["action"], "purge_candidate");
+        assert_eq!(fastembed_action["destructive"], true);
+        assert_eq!(fastembed_action["approvalRequired"], true);
+        assert_eq!(fastembed_action["exists"], true);
+
+        let history_action = actions
+            .iter()
+            .find(|item| item["key"] == "agency_history_jsonl")
+            .expect("history action should exist");
+        assert_eq!(history_action["action"], "migration_candidate");
+        assert_eq!(history_action["destructive"], false);
+        assert_eq!(history_action["exists"], true);
+
+        let source_action = actions
+            .iter()
+            .find(|item| item["key"] == "src_memory")
+            .expect("source reference action should exist");
+        assert_eq!(source_action["action"], "preserve_reference");
+        assert_eq!(source_action["destructive"], false);
         assert!(temp.path().join(".fastembed_cache").exists());
         assert!(config.data_dir.join("agency_history.jsonl").exists());
         Ok(())

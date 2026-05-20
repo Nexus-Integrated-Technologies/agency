@@ -86,8 +86,9 @@ cargo run --quiet --bin nanoclaw -- runtime state --limit 5
 ```
 
 That report includes `stateResidue`, which separates active runtime roots from
-legacy memory/vector/cache candidates. To include the same report beside
-stale-PID cleanup output without deleting state:
+legacy memory/vector/cache candidates and an `operatorActions` plan for each
+legacy candidate. To include the same report beside stale-PID cleanup output
+without deleting state:
 
 ```bash
 cargo run --quiet --bin nanoclaw -- runtime cleanup --state-residue

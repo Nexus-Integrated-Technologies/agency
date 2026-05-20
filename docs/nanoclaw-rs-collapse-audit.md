@@ -327,11 +327,15 @@ Already active:
   inventory beside stale-PID cleanup output, but the inventory is report-only:
   cleanup still deletes only stale or invalid PID files, never runtime state or
   legacy stores.
+- The residue inventory now includes explicit `operatorActions` for each legacy
+  candidate, classifying the safe default as leave-in-place and separating
+  migration candidates, purge candidates, and source references without
+  mutating any state.
 
 Remaining work:
 
-- Convert the report-only residue inventory into explicit operator-approved
-  migration or purge actions for candidates that are safe to remove.
+- Add separate operator-approved apply commands only after a specific migration
+  or purge action has a runtime contract and rollback path.
 - Decide which legacy memory source references should be clean-roomed further,
   moved to graveyard, or deleted after capability adoption is complete.
 
