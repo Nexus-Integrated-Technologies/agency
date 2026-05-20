@@ -335,17 +335,25 @@ Exit criterion:
 
 ### 7. Rewrite Public Repo Documentation
 
-Status: started.
+Status: mostly done.
+
+Already active:
+
+- Root README is focused on the current Nexus/Rust NanoClaw runtime and points
+  old Agency material to `graveyard/agency-harness/`.
+- `Makefile` and the Rust NanoClaw GitHub Actions gate now run
+  `nanoclaw runtime state --limit 5` in addition to show-config, status, and
+  inspect so state-boundary inventory remains part of active verification.
+- `.github/copilot-instructions.md` now points contributors and AI agents at
+  NanoClaw runtime status/state/inspect/health/cleanup commands instead of old
+  gateway/local entrypoint examples.
 
 Remaining work:
 
-- Keep the root README focused on the current Nexus/Rust NanoClaw runtime only.
 - Keep the old Agency README body parked as
   `graveyard/agency-harness/LEGACY_README.md`.
 - Keep the old `src/bin/README.md` parked with the legacy bins under
   `graveyard/agency-harness/src-bin/`.
-- Keep `.github/copilot-instructions.md`, `.github/CONTRIBUTING.md`, the PR
-  template, and `Makefile` aligned to the active NanoClaw gates.
 - Update docs that still describe old FPF/governance/SOTA microservice posture
   as active runtime behavior.
 

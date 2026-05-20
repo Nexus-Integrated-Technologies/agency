@@ -85,6 +85,14 @@ Inventory the active runtime state roots without deleting or migrating anything:
 cargo run --quiet --bin nanoclaw -- runtime state --limit 5
 ```
 
+That report includes `stateResidue`, which separates active runtime roots from
+legacy memory/vector/cache candidates. To include the same report beside
+stale-PID cleanup output without deleting state:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime cleanup --state-residue
+```
+
 Get a deterministic health report over runtime directories, PID files,
 gateway/webhook auth posture, task backlog, and recent execution evidence:
 
