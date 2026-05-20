@@ -397,6 +397,9 @@ Already active:
 
 - Root README is focused on the current Nexus/Rust NanoClaw runtime and points
   old Agency material to `graveyard/agency-harness/`.
+- Legacy governance docs under `docs/governance/` now identify themselves as
+  parked reference material, not active runtime authority for FPF, World Chain,
+  constitutional appeals, or old governance services.
 - `Makefile` and the Rust NanoClaw GitHub Actions gate now run
   `nanoclaw runtime state --limit 5` in addition to show-config, status, and
   inspect so state-boundary inventory remains part of active verification.
@@ -410,8 +413,8 @@ Remaining work:
   `graveyard/agency-harness/LEGACY_README.md`.
 - Keep the old `src/bin/README.md` parked with the legacy bins under
   `graveyard/agency-harness/src-bin/`.
-- Update docs that still describe old FPF/governance/SOTA microservice posture
-  as active runtime behavior.
+- Continue scanning for docs that still describe old FPF/SOTA microservice
+  posture as active runtime behavior.
 
 Exit criterion:
 
