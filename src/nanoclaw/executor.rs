@@ -5095,11 +5095,7 @@ fn derive_request_session_turn(
 }
 
 fn compact_session_state(state: &SessionState, max_turns: usize) -> SessionState {
-    let mut compact = state.clone();
-    if compact.turns.len() > max_turns {
-        compact.turns = compact.turns[compact.turns.len() - max_turns..].to_vec();
-    }
-    compact
+    state.compact_with_summary(max_turns, 600)
 }
 
 #[cfg(test)]

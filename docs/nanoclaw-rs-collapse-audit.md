@@ -265,6 +265,11 @@ Already active:
   outcome, and cancellation-before-evidence paths now return structured
   `worker_transport` evidence with `failed`, `timed_out`, or `cancelled`
   status before the run reaches closure validation.
+- Successful host/script, backend response, OMX gateway, in-process advisory,
+  blocked-execution, and worker-blocked paths now emit explicit verification
+  records. The old generic `adapter_status` verification sentinel has been
+  removed from the evidence builder, so adapters must provide their own
+  verification evidence.
 - The `nanoclaw task complete` operator command now requires
   `--manual-override` and records a manual completion override, while
   execution-driven completion remains gated through structured execution
@@ -278,8 +283,6 @@ Remaining work:
 
 - Thread the same closure gate into active Nexus/Paperclip/GitHub issue and
   writeback surfaces that can transition work states.
-- Add explicit verification command records instead of the current adapter
-  status sentinel.
 - Extend this transport/error normalization to future external adapter plugins
   as they are registered.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
@@ -303,6 +306,11 @@ Already active:
   roots, local inbox/outbox/processed directories, linked session sidecars,
   orphan session directories, group roots, and queued task counts without
   deleting or migrating anything.
+- Session state compaction now clean-room adopts the useful part of legacy
+  episodic memory: when a compact runtime metadata snapshot is needed, the
+  active `SessionState` preserves the original objective, inserts a
+  deterministic omitted-turn summary, and keeps recent turns without calling an
+  LLM or reintroducing the old memory module dependency graph.
 
 Remaining work:
 
