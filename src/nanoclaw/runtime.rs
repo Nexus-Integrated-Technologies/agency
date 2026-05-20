@@ -19,7 +19,10 @@ use super::fpf_bridge::{build_boundary_claims, derive_task_signature};
 use super::ingress_policy::{has_authorized_trigger, should_drop_inbound_message};
 use super::local_channel::{LocalChannel, LocalInboundEnvelope, LocalOutboundEnvelope};
 use super::request_plane::default_request_plane;
-use super::router::{format_messages, format_outbound, format_task_request};
+use super::router::{
+    destination_for_group, destinations_from_groups, format_agent_prompt,
+    format_outbound_deliveries, format_task_request_with_destinations,
+};
 use super::sender_allowlist::load_sender_allowlist;
 use super::swarm::pump_swarm_once;
 
@@ -121,9 +124,9 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             return Ok(false);
         }
 
-        let group = self
-            .app
-            .groups()?
+        let groups = self.app.groups()?;
+        let destinations = destinations_from_groups(&groups);
+        let group = groups
             .into_iter()
             .find(|group| group.jid == chat_jid)
             .expect("group should exist before processing messages");
@@ -132,7 +135,12 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             return Ok(false);
         }
         let session = self.ensure_execution_session(&group)?;
-        let prompt = format_messages(&messages, &self.app.config.timezone)?;
+        let prompt = format_agent_prompt(
+            &messages,
+            &self.app.config.timezone,
+            &self.app.config.assistant_name,
+            &destinations,
+        )?;
         let request_plane = default_request_plane();
         let created_at = Utc::now().to_rfc3339();
         let task_signature =
@@ -230,7 +238,15 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             TaskContextMode::Group => self.app.db.messages_since(&task.chat_jid, "", 50, true)?,
             _ => Vec::new(),
         };
-        let prompt = format_task_request(task, &context_messages, &self.app.config.timezone)?;
+        let groups = self.app.groups()?;
+        let destinations = destinations_from_groups(&groups);
+        let prompt = format_task_request_with_destinations(
+            task,
+            &context_messages,
+            &self.app.config.timezone,
+            &destinations,
+            &self.app.config.assistant_name,
+        )?;
         let request_plane = task
             .request_plane
             .clone()
@@ -372,61 +388,72 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
         title: String,
         boundary: crate::foundation::ExecutionBoundary,
     ) -> Result<bool> {
-        let text = format_outbound(raw_text);
-        if text.is_empty() {
+        let groups = self.app.groups()?;
+        let destinations = destinations_from_groups(&groups);
+        let default_destination = destination_for_group(&destinations, group);
+        let deliveries = format_outbound_deliveries(raw_text, &default_destination, &destinations)?;
+        if deliveries.is_empty() {
             return Ok(false);
         }
 
-        let outbound = self.channel.send_message(&group.jid, &text)?;
-        let bot_message = MessageRecord {
-            id: outbound.id.clone(),
-            chat_jid: outbound.chat_jid.clone(),
-            sender: self.app.config.assistant_name.clone(),
-            sender_name: Some(self.app.config.assistant_name.clone()),
-            content: text.clone(),
-            timestamp: outbound.timestamp.clone(),
-            is_from_me: true,
-            is_bot_message: true,
-        };
-        self.app.db.store_chat_metadata(
-            &group.jid,
-            &outbound.timestamp,
-            Some(&group.name),
-            Some("local"),
-            Some(false),
-        )?;
-        self.app.db.store_message(&bot_message)?;
-        self.app.record_event(FoundationEvent::MessageRecorded {
-            message: bot_message.clone(),
-        });
-        let artifact = ArtifactRecord {
-            id: format!("artifact:{}", outbound.id),
-            group_id: group.jid.clone(),
-            task_id: task_id.map(str::to_string),
-            kind,
-            title,
-            body: text,
-            location: Some(self.channel.outbox_path().display().to_string()),
-            created_at: outbound.timestamp.clone(),
-        };
-        self.app.record_artifact(artifact.clone());
-        self.app.record_event(FoundationEvent::ArtifactEmitted {
-            artifact,
-            context: Some(ExecutionContext {
-                group_id: group.jid.clone(),
-                chat_id: Some(group.jid.clone()),
+        for delivery in deliveries {
+            let target_group = groups
+                .iter()
+                .find(|candidate| candidate.jid == delivery.chat_jid)
+                .unwrap_or(group);
+            let outbound = self
+                .channel
+                .send_message(&delivery.chat_jid, &delivery.text)?;
+            let bot_message = MessageRecord {
+                id: outbound.id.clone(),
+                chat_jid: outbound.chat_jid.clone(),
+                sender: self.app.config.assistant_name.clone(),
+                sender_name: Some(self.app.config.assistant_name.clone()),
+                content: delivery.text.clone(),
+                timestamp: outbound.timestamp.clone(),
+                is_from_me: true,
+                is_bot_message: true,
+            };
+            self.app.db.store_chat_metadata(
+                &delivery.chat_jid,
+                &outbound.timestamp,
+                Some(&target_group.name),
+                Some("local"),
+                Some(false),
+            )?;
+            self.app.db.store_message(&bot_message)?;
+            self.app.record_event(FoundationEvent::MessageRecorded {
+                message: bot_message.clone(),
+            });
+            let artifact = ArtifactRecord {
+                id: format!("artifact:{}", outbound.id),
+                group_id: delivery.chat_jid.clone(),
                 task_id: task_id.map(str::to_string),
-                boundary,
-                workspace_root: Some(
-                    self.app
-                        .config
-                        .groups_dir
-                        .join(&group.folder)
-                        .display()
-                        .to_string(),
-                ),
-            }),
-        });
+                kind: kind.clone(),
+                title: format!("{} -> {}", title, delivery.to),
+                body: delivery.text,
+                location: Some(self.channel.outbox_path().display().to_string()),
+                created_at: outbound.timestamp.clone(),
+            };
+            self.app.record_artifact(artifact.clone());
+            self.app.record_event(FoundationEvent::ArtifactEmitted {
+                artifact,
+                context: Some(ExecutionContext {
+                    group_id: delivery.chat_jid.clone(),
+                    chat_id: Some(delivery.chat_jid),
+                    task_id: task_id.map(str::to_string),
+                    boundary: boundary.clone(),
+                    workspace_root: Some(
+                        self.app
+                            .config
+                            .groups_dir
+                            .join(&target_group.folder)
+                            .display()
+                            .to_string(),
+                    ),
+                }),
+            });
+        }
         Ok(true)
     }
 }
