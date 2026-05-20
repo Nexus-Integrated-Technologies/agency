@@ -21,7 +21,7 @@ Steps to reproduce the behavior:
 A clear and concise description of what you expected to happen.
 
 **Screenshots/Logs**
-If applicable, add screenshots or paste relevant logs (e.g., from `make test` or `cargo run`).
+If applicable, add screenshots or paste relevant logs (e.g., from `make verify` or `cargo run --quiet --bin nanoclaw -- show-config`).
 
 **Environment (please complete the following information):**
  - OS: [e.g. macOS, Linux]

@@ -97,9 +97,10 @@ Remaining work:
 - Decide whether `src/main.rs` should be deleted or kept only as a thin parked
   reference. The runtime should not depend on it once `nanoclaw` is the explicit
   binary.
-- Add CI that runs the same active-target gates:
+- Keep CI aligned with the same active-target gates in
+  `.github/workflows/rust-nanoclaw.yml`:
   - `cargo check --all-targets`
-  - `cargo test --lib`
+  - `cargo test --all-targets`
   - `cargo run --quiet --bin nanoclaw -- show-config`
 
 Exit criterion:
@@ -246,6 +247,8 @@ Remaining work:
   `graveyard/agency-harness/LEGACY_README.md`.
 - Keep the old `src/bin/README.md` parked with the legacy bins under
   `graveyard/agency-harness/src-bin/`.
+- Keep `.github/copilot-instructions.md`, `.github/CONTRIBUTING.md`, the PR
+  template, and `Makefile` aligned to the active NanoClaw gates.
 - Update docs that still describe old FPF/governance/SOTA microservice posture
   as active runtime behavior.
 

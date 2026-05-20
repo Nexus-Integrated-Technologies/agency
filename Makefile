@@ -1,38 +1,21 @@
-# Makefile - Sovereign Organism Management
-#
-# Use this to build, test, and maintain the agency.
+# Makefile - Nexus Rust NanoClaw runtime gates
 
-.PHONY: build test proof bundle clean setup
+.PHONY: build check test verify show-config clean
 
-# Build the agency core
 build:
-	cargo build --bin rust_agency
+	cargo build --bin nanoclaw
 
-# Run all verification suites (Logic + Integration + Architecture + Load)
+check:
+	cargo check --all-targets
+
 test:
-	@echo "🧪 Running Comprehensive Test Suite..."
-	cargo test --test comprehensive_features
-	@echo "\n🏛️ Running Architecture Tests..."
-	cargo test --test architecture
-	@echo "\n🧬 Running Unit Tests..."
-	cargo test --lib
+	cargo test --all-targets
 
-# Execute the live Proof of Life demonstration
-proof: bundle
-	ORT_STRATEGY=download cargo run --bin proof_of_life
+show-config:
+	cargo run --quiet --bin nanoclaw -- show-config
 
-# Bundle finicky dependencies (ONNX) for portability
-bundle:
-	./scripts/bundle_onnx.sh
+verify: check test show-config
+	git diff --check
 
-# Initial setup: Install deps and fetch models
-setup:
-	cargo build
-	./scripts/bundle_onnx.sh
-	ORT_STRATEGY=download cargo run --bin proof_of_life
-
-# Clean build artifacts
 clean:
 	cargo clean
-	rm -f libonnxruntime.dylib
-	rm -rf artifacts/bin
