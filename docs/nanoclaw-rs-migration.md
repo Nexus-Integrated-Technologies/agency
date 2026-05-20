@@ -85,17 +85,23 @@ configuration:
 - Azure, ZAI, Codex, Claude, Workers AI, GitHub Copilot, and custom backend
   selection still flow through the existing executor/provider contract.
 
+The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
+
+- per-session sidecar storage creates upstream-shaped `inbound.db` and
+  `outbound.db` files under each execution session while the central SQLite DB
+  remains the source of truth for control-plane state;
+- session sidecars store `on_wake` rows for fresh sessions and explicit
+  operator wake events so missing wake handlers degrade into durable records
+  instead of startup failures;
+- per-group runtime config now carries container image and CLI-scope overrides
+  alongside provider/model/effort, and the container lane resolves the image
+  from that config before falling back to the instance default;
+- destination projections are refreshed into the session sidecar on each
+  runtime session use and invalidated centrally after group registration or
+  approval resolution.
+
 ## Remaining Upstream Parity Ledger
 
-- Split session storage toward upstream `inbound.db` / `outbound.db` semantics
-  once the Rust DB boundary can absorb the migration safely.
-- Add the upstream `on_wake` compatibility behavior so missing wake handlers
-  degrade gracefully instead of failing startup.
-- Split image tag and CLI scope overrides out of the upstream container config
-  surface once the Rust container lane needs them; provider/model/effort
-  overrides are now DB-backed.
-- Refresh destination maps immediately after approval or registration changes
-  so receiver routing does not depend on stale process memory.
 - Preserve provider routing through the existing OpenClaw/OMX/Nexus contracts;
   Azure can be the active inference lane, but provider calls should not bypass
   the runtime evidence and adapter boundaries.

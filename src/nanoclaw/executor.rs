@@ -505,6 +505,16 @@ impl ContainerExecutor {
     }
 }
 
+fn resolve_container_image(default_image: &str, env: &BTreeMap<String, String>) -> String {
+    env.get("NANOCLAW_CONTAINER_IMAGE")
+        .or_else(|| env.get("NANOCLAW_CONTAINER_IMAGE_TAG"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_image)
+        .to_string()
+}
+
 impl ExecutorBoundary for ContainerExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
@@ -516,6 +526,7 @@ impl ExecutorBoundary for ContainerExecutor {
         })?;
 
         let payload = build_worker_request(request);
+        let container_image = resolve_container_image(&self.container_image, &payload.env);
         let runtime = resolve_container_runtime(self.container_runtime.as_deref())?;
         let mut command = Command::new(&runtime);
         command
@@ -550,7 +561,7 @@ impl ExecutorBoundary for ContainerExecutor {
             .arg(self.source_crate_root.display().to_string())
             .arg("-e")
             .arg("NANOCLAW_EXECUTION_LOCATION=local_container")
-            .arg(&self.container_image)
+            .arg(&container_image)
             .arg("cargo")
             .arg("run")
             .arg("--quiet")
@@ -3977,12 +3988,13 @@ mod tests {
         detect_paperclip_control_plane_blocker, execute_worker_request, extract_azure_openai_text,
         is_codex_usage_limit_error, normalize_azure_openai_fallback_backend, normalize_branch_name,
         normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, read_json,
-        run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
-        should_use_remote_lane, wait_for_worker_socket, write_json, BackendExecutionMetadata,
-        BackendExecutionResult, ContainerExecutor, DigitalOceanDevEnvironment, ExecutionLaneRouter,
-        ExecutionRequest, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
-        GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor,
-        RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        resolve_container_image, run_worker_daemon_with_idle_timeout, run_worker_from_paths,
+        should_use_container_lane, should_use_remote_lane, wait_for_worker_socket, write_json,
+        BackendExecutionMetadata, BackendExecutionResult, ContainerExecutor,
+        DigitalOceanDevEnvironment, ExecutionLaneRouter, ExecutionRequest, ExecutionSession,
+        ExecutionUsageSummary, ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor,
+        OmxExecutor, RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest,
+        WorkerResponse,
     };
 
     #[test]
@@ -4027,6 +4039,31 @@ mod tests {
                 "input {input} should normalize to {expected}"
             );
         }
+    }
+
+    #[test]
+    fn container_image_honors_group_runtime_override() {
+        let mut env = BTreeMap::new();
+        assert_eq!(
+            resolve_container_image("rust:1.75-slim", &env),
+            "rust:1.75-slim"
+        );
+        env.insert(
+            "NANOCLAW_CONTAINER_IMAGE_TAG".to_string(),
+            "ghcr.io/nexus/nanoclaw:runtime".to_string(),
+        );
+        assert_eq!(
+            resolve_container_image("rust:1.75-slim", &env),
+            "ghcr.io/nexus/nanoclaw:runtime"
+        );
+        env.insert(
+            "NANOCLAW_CONTAINER_IMAGE".to_string(),
+            "ghcr.io/nexus/nanoclaw:operator".to_string(),
+        );
+        assert_eq!(
+            resolve_container_image("rust:1.75-slim", &env),
+            "ghcr.io/nexus/nanoclaw:operator"
+        );
     }
 
     #[test]

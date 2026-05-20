@@ -27,6 +27,7 @@ pub mod scheduler;
 pub mod security_profile;
 pub mod sender_allowlist;
 pub mod service_slack;
+pub mod session_storage;
 pub mod slack;
 pub mod slack_runtime;
 pub mod slack_threading;
