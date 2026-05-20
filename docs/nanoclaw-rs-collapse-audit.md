@@ -218,7 +218,10 @@ Current unified entrypoint:
   files and removes only those files when explicitly applied.
 - `nanoclaw runtime poll` runs one local control-plane pump.
 - `nanoclaw runtime serve --profile full|gateway|webhook|pm|slack` starts the
-  selected runtime profile without legacy Agency startup scripts.
+  selected runtime profile without legacy Agency startup scripts. Startup now
+  preflights the same `runtimeChannels` registry used by status and health, so
+  misconfigured channels fail before PID-file creation with
+  `runtime_channel_misconfigured` and the exact missing config/auth fields.
 - `nanoclaw runtime stop --profile <profile>` terminates a profiled runtime
   from its NanoClaw PID file.
 - `nanoclaw runtime reload --profile <profile>` sends a reload signal to the

@@ -99,7 +99,8 @@ or clean-roomed into the active runtime.
    typed `runtimeChannels` registry now makes local, scheduler, Slack, webhook,
    OpenClaw gateway, and legacy PM ownership visible in status, inspect, and
    health output instead of leaving those responsibilities as scattered CLI
-   branches.
+   branches. `runtime serve` now preflights that registry before startup, so
+   channel misconfiguration fails deterministically before PID-file creation.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring

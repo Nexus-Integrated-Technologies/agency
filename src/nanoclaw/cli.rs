@@ -38,7 +38,10 @@ use super::openclaw_gateway::{describe_openclaw_gateway_readiness, start_opencla
 use super::pm_automation::start_pm_automation_loop;
 use super::remote_control::{build_remote_control_context, describe_remote_control};
 use super::runtime::LocalRuntime;
-use super::runtime_channels::runtime_channel_registry;
+use super::runtime_channels::{
+    runtime_channel_registry, RuntimeChannelDescriptor, RuntimeChannelRegistry,
+    RuntimeChannelStatus,
+};
 use super::scheduler::TaskScheduleInput;
 use super::service_slack::{ensure_registered_group, send_recorded_slack_message};
 use super::session_storage::{
@@ -1976,6 +1979,141 @@ mod tests {
     }
 
     #[test]
+    fn runtime_serve_preflight_blocks_gateway_without_token() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+
+        let error = runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Gateway,
+                lane_override: None,
+                read_only: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("runtime_channel_misconfigured"));
+        assert!(error.contains("profile=gateway"));
+        assert!(error.contains("channel=openclaw_gateway"));
+        assert!(error.contains("NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_blocks_slack_without_required_env_keys() -> Result<()> {
+        let temp = tempdir()?;
+        let env_file = temp.path().join(".env");
+        fs::write(&env_file, "SLACK_BOT_TOKEN=xoxb-test\n")?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = Some(env_file);
+
+        let error = runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Slack,
+                lane_override: None,
+                read_only: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("runtime_channel_misconfigured"));
+        assert!(error.contains("profile=slack"));
+        assert!(error.contains("channel=slack"));
+        assert!(error.contains("SLACK_APP_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_blocks_full_for_enabled_misconfigured_channel() -> Result<()> {
+        let temp = tempdir()?;
+        let env_file = temp.path().join(".env");
+        fs::write(
+            &env_file,
+            "SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\n",
+        )?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = Some(env_file);
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+
+        let error = runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Full,
+                lane_override: None,
+                read_only: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("profile=full"));
+        assert!(error.contains("channel=openclaw_gateway"));
+        assert!(error.contains("NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_allows_full_read_only_to_ignore_optional_servers() -> Result<()> {
+        let temp = tempdir()?;
+        let env_file = temp.path().join(".env");
+        fs::write(
+            &env_file,
+            "SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\n",
+        )?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = Some(env_file);
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+
+        runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Full,
+                lane_override: None,
+                read_only: true,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_allows_ready_gateway() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token = "gateway-token".to_string();
+
+        runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Gateway,
+                lane_override: None,
+                read_only: false,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn runtime_tool_adapter_registry_reports_invalid_external_manifest() -> Result<()> {
         let temp = tempdir()?;
         let mut config = NanoclawConfig::from_env();
@@ -2266,7 +2404,95 @@ fn park_runtime(profile: RuntimeServeProfile) -> ! {
     }
 }
 
+fn runtime_serve_required_channel_ids(profile: RuntimeServeProfile) -> &'static [&'static str] {
+    match profile {
+        RuntimeServeProfile::Full => &["slack"],
+        RuntimeServeProfile::Gateway => &["openclaw_gateway"],
+        RuntimeServeProfile::Webhook => &["webhook"],
+        RuntimeServeProfile::Pm => &["pm_automation", "slack"],
+        RuntimeServeProfile::Slack => &["slack"],
+    }
+}
+
+fn runtime_serve_preflight(config: &NanoclawConfig, serve_args: &RuntimeServeArgs) -> Result<()> {
+    let registry = runtime_channel_registry(config);
+    let failures = runtime_serve_preflight_failures(&registry, serve_args);
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{}",
+        format_runtime_channel_preflight_error(serve_args.profile, &failures)
+    )
+}
+
+fn runtime_serve_preflight_failures<'a>(
+    registry: &'a RuntimeChannelRegistry,
+    serve_args: &RuntimeServeArgs,
+) -> Vec<&'a RuntimeChannelDescriptor> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut failures = Vec::<&RuntimeChannelDescriptor>::new();
+
+    for id in runtime_serve_required_channel_ids(serve_args.profile) {
+        if let Some(channel) = registry.channels.iter().find(|channel| channel.id == *id) {
+            if channel.status != RuntimeChannelStatus::Ready && seen.insert(channel.id.clone()) {
+                failures.push(channel);
+            }
+        }
+    }
+
+    if !serve_args.read_only {
+        let profile = serve_args.profile.as_str();
+        for channel in registry.channels.iter().filter(|channel| {
+            channel
+                .serve_profiles
+                .iter()
+                .any(|candidate| candidate == profile)
+                && channel.status == RuntimeChannelStatus::Misconfigured
+        }) {
+            if seen.insert(channel.id.clone()) {
+                failures.push(channel);
+            }
+        }
+    }
+
+    failures
+}
+
+fn format_runtime_channel_preflight_error(
+    profile: RuntimeServeProfile,
+    failures: &[&RuntimeChannelDescriptor],
+) -> String {
+    let details = failures
+        .iter()
+        .map(|channel| {
+            let missing = if channel.missing_config.is_empty() {
+                "none".to_string()
+            } else {
+                channel.missing_config.join(",")
+            };
+            format!(
+                "channel={} status={} missing=[{}] configSource={} authRequired={} authConfigured={}",
+                channel.id,
+                channel.status_message,
+                missing,
+                channel.config_source,
+                channel.auth.required,
+                channel.auth.configured
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "runtime_channel_misconfigured profile={} {}",
+        profile.as_str(),
+        details
+    )
+}
+
 fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
+    runtime_serve_preflight(&config, &serve_args)?;
     let _pid_guard = write_runtime_pid_file(&config, serve_args.profile)?;
     match serve_args.profile {
         RuntimeServeProfile::Full => {
@@ -2282,36 +2508,15 @@ fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Re
             runtime.run_forever()?;
         }
         RuntimeServeProfile::Gateway => {
-            if config.openclaw_gateway_port == 0 {
-                anyhow::bail!(
-                    "runtime gateway profile is disabled: set NANOCLAW_OPENCLAW_GATEWAY_PORT"
-                );
-            }
-            if config.openclaw_gateway_token.trim().is_empty() {
-                anyhow::bail!(
-                    "runtime gateway profile is disabled: set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"
-                );
-            }
             let _app = NanoclawApp::open(config.clone())?;
             start_openclaw_gateway_server(config)?;
             park_runtime(RuntimeServeProfile::Gateway);
         }
         RuntimeServeProfile::Webhook => {
-            if config.linear_webhook_port == 0 {
-                anyhow::bail!("runtime webhook profile is disabled: set LINEAR_WEBHOOK_PORT");
-            }
             start_webhook_server(config)?;
             park_runtime(RuntimeServeProfile::Webhook);
         }
         RuntimeServeProfile::Pm => {
-            if !config.linear_legacy_enabled {
-                anyhow::bail!(
-                    "runtime pm profile is discontinued with Linear; set NANOCLAW_LINEAR_LEGACY_ENABLED=true only for controlled legacy migration"
-                );
-            }
-            if config.linear_chat_jid.trim().is_empty() {
-                anyhow::bail!("runtime pm profile is disabled: set LINEAR_CHAT_JID");
-            }
             start_pm_automation_loop(config)?;
             park_runtime(RuntimeServeProfile::Pm);
         }
