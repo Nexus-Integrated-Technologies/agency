@@ -172,6 +172,9 @@ Already active:
 - scheduled tasks
 - gateway/OMX/provider routing
 - session sidecars
+- runtime PID files under the active `data/runtime/` directory
+- `runtime stop` and `runtime reload` operator controls for profiled runtime
+  processes
 
 Remaining work:
 
@@ -193,6 +196,10 @@ Current unified entrypoint:
 - `nanoclaw runtime poll` runs one local control-plane pump.
 - `nanoclaw runtime serve --profile full|gateway|webhook|pm|slack` starts the
   selected runtime profile without legacy Agency startup scripts.
+- `nanoclaw runtime stop --profile <profile>` terminates a profiled runtime
+  from its NanoClaw PID file.
+- `nanoclaw runtime reload --profile <profile>` sends a reload signal to the
+  profiled runtime from the same control surface.
 
 ### 5. Normalize Execution Evidence Across Lanes
 

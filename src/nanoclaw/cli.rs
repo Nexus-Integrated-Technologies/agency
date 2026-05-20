@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -50,7 +51,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|poll|serve>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -83,6 +84,16 @@ impl RuntimeServeProfile {
             Self::Pm => "pm",
             Self::Slack => "slack",
         }
+    }
+
+    fn all() -> [Self; 5] {
+        [
+            Self::Full,
+            Self::Gateway,
+            Self::Webhook,
+            Self::Pm,
+            Self::Slack,
+        ]
     }
 }
 
@@ -129,6 +140,28 @@ where
     })
 }
 
+fn parse_runtime_control_args<I>(args: &mut I, label: &str) -> Result<RuntimeServeProfile>
+where
+    I: Iterator<Item = String>,
+{
+    let mut profile = RuntimeServeProfile::Full;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                profile = RuntimeServeProfile::parse(&value)?;
+            }
+            other => anyhow::bail!("unexpected runtime {label} argument '{}'", other),
+        }
+    }
+
+    Ok(profile)
+}
+
 fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
 where
     I: Iterator<Item = String>,
@@ -152,12 +185,113 @@ where
     Ok(limit)
 }
 
+fn runtime_control_dir(config: &NanoclawConfig) -> PathBuf {
+    config.data_dir.join("runtime")
+}
+
+fn runtime_pid_path(config: &NanoclawConfig, profile: RuntimeServeProfile) -> PathBuf {
+    runtime_control_dir(config).join(format!("{}.pid", profile.as_str()))
+}
+
+fn runtime_pid_status_json(config: &NanoclawConfig) -> serde_json::Value {
+    let mut profiles = serde_json::Map::new();
+    for profile in RuntimeServeProfile::all() {
+        let pid_file = runtime_pid_path(config, profile);
+        let pid = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        profiles.insert(
+            profile.as_str().to_string(),
+            json!({
+                "pidFile": pid_file.display().to_string(),
+                "pid": pid,
+                "pidFileExists": pid_file.exists(),
+            }),
+        );
+    }
+    json!({
+        "controlDir": runtime_control_dir(config).display().to_string(),
+        "profiles": profiles,
+    })
+}
+
+struct RuntimePidFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for RuntimePidFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn write_runtime_pid_file(
+    config: &NanoclawConfig,
+    profile: RuntimeServeProfile,
+) -> Result<RuntimePidFileGuard> {
+    let control_dir = runtime_control_dir(config);
+    fs::create_dir_all(&control_dir)
+        .with_context(|| format!("failed to create {}", control_dir.display()))?;
+    let path = runtime_pid_path(config, profile);
+    fs::write(&path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(RuntimePidFileGuard { path })
+}
+
+fn read_runtime_pid(path: &Path) -> Result<u32> {
+    let value =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid runtime pid file {}", path.display()))
+}
+
+fn signal_runtime_profile(
+    config: &NanoclawConfig,
+    profile: RuntimeServeProfile,
+    signal: &str,
+    remove_pid_file_on_success: bool,
+) -> Result<()> {
+    let path = runtime_pid_path(config, profile);
+    let pid = read_runtime_pid(&path)?;
+    let status = Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to invoke kill for pid {pid}"))?;
+    if !status.success() {
+        anyhow::bail!(
+            "failed to signal runtime profile '{}' pid {} with {}: {}",
+            profile.as_str(),
+            pid,
+            signal,
+            status
+        );
+    }
+    if remove_pid_file_on_success {
+        let _ = fs::remove_file(&path);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "profile": profile.as_str(),
+            "pid": pid,
+            "signal": signal,
+            "pidFile": path.display().to_string(),
+        }))?
+    );
+    Ok(())
+}
+
 fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
     json!({
         "ok": true,
         "activeBinary": "nanoclaw",
         "dataDir": config.data_dir.display().to_string(),
         "storeDir": config.store_dir.display().to_string(),
+        "control": runtime_pid_status_json(config),
         "local": {
             "enabled": true,
             "mode": "poll",
@@ -285,6 +419,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_runtime_control_profile() {
+        let mut args = vec!["--profile".to_string(), "gateway".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_control_args(&mut args, "stop").unwrap(),
+            RuntimeServeProfile::Gateway
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_control_arg() {
+        let mut args = vec!["--force".to_string()].into_iter();
+        let error = parse_runtime_control_args(&mut args, "reload").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unexpected runtime reload argument"));
+    }
+
+    #[test]
     fn parses_runtime_inspect_limit() {
         let mut args = vec!["--limit".to_string(), "5".to_string()].into_iter();
         assert_eq!(
@@ -321,6 +473,7 @@ fn park_runtime(profile: RuntimeServeProfile) -> ! {
 }
 
 fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
+    let _pid_guard = write_runtime_pid_file(&config, serve_args.profile)?;
     match serve_args.profile {
         RuntimeServeProfile::Full => {
             let app = NanoclawApp::open(config.clone())?;
@@ -885,6 +1038,14 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                 "serve" => {
                     let serve_args = parse_runtime_serve_args(&mut args)?;
                     run_runtime_serve(config, serve_args)?;
+                }
+                "stop" => {
+                    let profile = parse_runtime_control_args(&mut args, "stop")?;
+                    signal_runtime_profile(&config, profile, "-TERM", true)?;
+                }
+                "reload" => {
+                    let profile = parse_runtime_control_args(&mut args, "reload")?;
+                    signal_runtime_profile(&config, profile, "-HUP", false)?;
                 }
                 other => anyhow::bail!("unsupported runtime command '{}'", other),
             }

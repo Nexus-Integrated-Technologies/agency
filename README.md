@@ -69,6 +69,10 @@ Inspect the active runtime channel set:
 cargo run --quiet --bin nanoclaw -- runtime status
 ```
 
+The status report includes runtime PID files under `data/runtime/`, so local
+production profiles can be inspected and controlled without the old Agency
+service scripts.
+
 Inspect runtime state, recent tasks, and recent execution provenance:
 
 ```bash
@@ -92,6 +96,13 @@ Serve a selected production profile through the NanoClaw entrypoint:
 ```bash
 cargo run --quiet --bin nanoclaw -- runtime serve --profile full
 cargo run --quiet --bin nanoclaw -- runtime serve --profile gateway
+```
+
+Stop or signal a running profile through the NanoClaw entrypoint:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime stop --profile full
+cargo run --quiet --bin nanoclaw -- runtime reload --profile full
 ```
 
 List available commands:
