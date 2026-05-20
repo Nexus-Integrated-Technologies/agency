@@ -232,6 +232,9 @@ Already active:
   preserving the raw log artifact.
 - Local and Slack runtimes persist the envelope into `execution_evidence` and
   also emit operator artifacts.
+- Local and Slack scheduled-task paths persist execution provenance, logs, and
+  evidence before applying the completion gate, so failed structured evidence is
+  not discarded before the task is marked failed.
 - `nanoclaw runtime inspect` reports recent durable execution evidence beside
   recent provenance.
 - Swarm task results carry execution evidence in task metadata instead of
@@ -249,6 +252,9 @@ Already active:
   carry valid structured execution evidence before it can be marked completed.
 - Runtime task errors use a failed-run path, so missing/invalid execution
   evidence no longer reaches completed status through the generic error path.
+- Unsupported worker backends and unsupported custom execution lanes now return
+  failed execution evidence with blockers instead of only returning opaque
+  `Err` values.
 
 Remaining work:
 
@@ -256,8 +262,9 @@ Remaining work:
   local scheduled-task path.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
-- Extend failure paths so nonzero shell, timeout, and cancelled runs return
-  structured blockers even when the adapter exits with an error.
+- Extend lower-level process failure paths so container/remote worker startup
+  failures, nonzero shell exits, timeouts, and cancelled runs return structured
+  blockers even when the adapter exits before producing a worker outcome.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 

@@ -305,10 +305,10 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             boundary_claims,
             gate_evaluation: None,
         })?;
-        validate_task_execution_completion_evidence(&task.id, &execution)?;
         self.record_execution_provenance(&execution)?;
         self.record_execution_log_artifact(&group, Some(&task.id), &session, &execution)?;
         self.record_execution_evidence_artifact(&group, Some(&task.id), &session, &execution)?;
+        validate_task_execution_completion_evidence(&task.id, &execution)?;
         let sent = self.deliver_response(
             &group,
             &session,

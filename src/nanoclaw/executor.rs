@@ -846,9 +846,14 @@ impl ExecutorBoundary for ExecutionLaneRouter {
             ExecutionLane::Container => self.container.execute(request),
             ExecutionLane::RemoteWorker => self.remote.execute(request),
             ExecutionLane::Omx => self.omx.execute(request),
-            ExecutionLane::Custom(value) => {
-                bail!("unsupported execution lane '{}'", value)
-            }
+            ExecutionLane::Custom(value) => Ok(build_blocked_execution_response(
+                &request,
+                "execution_lane",
+                ExecutionEvidenceMode::Code,
+                format!("unsupported execution lane '{}'", value).as_str(),
+                None,
+                None,
+            )),
         }?;
         validate_execution_response_evidence(&response)?;
         Ok(response)
@@ -1641,7 +1646,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 None,
             ),
             WorkerBackend::Custom(value) => {
-                bail!("unsupported worker backend '{}'", value)
+                Err(anyhow::anyhow!("unsupported worker backend '{}'", value))
             }
         }
     };
@@ -1763,25 +1768,204 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
             })
         }
         Err(error) => {
+            let error_text = error.to_string();
             let _ = session_store.save(&session_state);
             let log_body = format!(
                 "invocation_id={}\nsession_id={}\nworkspace={}\nstatus=error\nerror={}\n",
-                request.invocation_id, request.session.id, request.session.workspace_root, error
+                request.invocation_id,
+                request.session.id,
+                request.session.workspace_root,
+                error_text
             );
-            let _ = fs::write(&log_path, log_body);
+            let _ = fs::write(&log_path, &log_body);
             let _ = append_history_entry(
                 &history_path,
                 SessionHistoryEntry {
-                    invocation_id: request.invocation_id,
-                    requested_at: request.requested_at,
+                    invocation_id: request.invocation_id.clone(),
+                    requested_at: request.requested_at.clone(),
                     message_count: request.messages.len(),
                     prompt_bytes: request.prompt.len(),
-                    script: request.script,
+                    script: request.script.clone(),
                     success: false,
                 },
             );
-            Err(error)
+            Ok(build_blocked_worker_response(
+                &request,
+                &resolved_backend.backend,
+                &error_text,
+                log_path.as_path(),
+                log_body,
+                Some(compact_session_state(&session_state, 6)),
+                execution_location,
+            ))
         }
+    }
+}
+
+fn build_blocked_execution_response(
+    request: &ExecutionRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    message: &str,
+    log_path: Option<&Path>,
+    log_body: Option<&str>,
+) -> ExecutionResponse {
+    let boundary = ExecutionBoundary {
+        kind: ExecutionBoundaryKind::Host,
+        root: Some(request.session.workspace_root.clone()),
+        isolated: true,
+    };
+    let metadata = ExecutionMetadata {
+        backend: Some(adapter_type.to_string()),
+        routing_decision: request.routing_decision.clone(),
+        objective: request.objective.clone(),
+        plan: request.plan.clone(),
+        gate_evaluation: request.gate_evaluation.clone(),
+        status: Some(ExecutionEvidenceStatus::Failed.as_str().to_string()),
+        summary: Some(message.to_string()),
+        ..Default::default()
+    };
+    let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type,
+        mode,
+        run_id: request
+            .task_id
+            .as_deref()
+            .unwrap_or(request.session.id.as_str()),
+        status: ExecutionEvidenceStatus::Failed,
+        session_id: request.session.id.as_str(),
+        group_folder: Some(request.session.group_folder.as_str()),
+        workspace_root: Some(request.session.workspace_root.as_str()),
+        boundary: &boundary,
+        log_path: log_path.and_then(|path| path.to_str()),
+        log_body,
+        metadata: Some(&metadata),
+        provenance_id: None,
+        verification: Vec::new(),
+        blockers: vec![ExecutionBlockerRef {
+            kind: "unsupported_execution_lane".to_string(),
+            source: Some(adapter_type.to_string()),
+            message: message.to_string(),
+        }],
+    });
+
+    ExecutionResponse {
+        text: format!("Execution blocked: {message}"),
+        boundary,
+        session_id: request.session.id.clone(),
+        log_path: log_path.map(|path| path.display().to_string()),
+        log_body: log_body.map(str::to_string),
+        provenance: None,
+        metadata: Some(metadata),
+        evidence: Some(evidence),
+    }
+}
+
+fn build_blocked_worker_response(
+    request: &WorkerRequest,
+    backend: &WorkerBackend,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+) -> WorkerResponse {
+    let completed_at = Utc::now().to_rfc3339();
+    let boundary = ExecutionBoundary {
+        kind: ExecutionBoundaryKind::Host,
+        root: Some(request.session.workspace_root.clone()),
+        isolated: true,
+    };
+    let task_signature = request.task_signature.clone();
+    let boundary_claims = request.boundary_claims.clone();
+    let gate_evaluation = request.gate_evaluation.clone();
+    let assurance = task_signature.as_ref().map(|signature| {
+        derive_assurance(
+            backend.as_str(),
+            signature,
+            gate_evaluation.as_ref(),
+            request.script.is_some(),
+        )
+    });
+    let symbol_carriers =
+        derive_symbol_carriers(&request.invocation_id, &request.session, Some(log_path));
+    let provenance_edges =
+        derive_provenance_edges(&request.invocation_id, &symbol_carriers, &boundary_claims);
+    let provenance = build_execution_provenance_record(BuildExecutionProvenanceInput {
+        id: request.invocation_id.clone(),
+        run_kind: run_kind_for_backend(backend, request.script.is_some()),
+        group_folder: request.session.group_folder.clone(),
+        chat_jid: Some(request.group.jid.clone()),
+        execution_location,
+        request_plane: request.request_plane.clone(),
+        effective_capabilities: derive_capability_manifest(
+            &request.request_plane,
+            DeriveCapabilityManifestInput::default(),
+        ),
+        project_environment_id: None,
+        mount_summary: vec![ExecutionMountSummaryEntry {
+            host_path: Some(request.session.workspace_root.clone()),
+            container_path: None,
+            readonly: false,
+            kind: ExecutionMountKind::Project,
+        }],
+        secret_handles_used: Vec::new(),
+        fallback_reason: Some("execution_blocked".to_string()),
+        sync_scope: None,
+        task_signature,
+        boundary_claims,
+        gate_evaluation: gate_evaluation.clone(),
+        assurance: assurance.clone(),
+        symbol_carriers,
+        provenance_edges,
+        status: ExecutionStatus::Error,
+        created_at: request.requested_at.clone(),
+        updated_at: completed_at.clone(),
+        completed_at: Some(completed_at),
+    });
+    let metadata = ExecutionMetadata {
+        backend: Some(backend.as_str().to_string()),
+        routing_decision: request.routing_decision.clone(),
+        objective: request.objective.clone(),
+        plan: request.plan.clone(),
+        session_state,
+        gate_evaluation,
+        assurance,
+        status: Some(ExecutionEvidenceStatus::Failed.as_str().to_string()),
+        summary: Some(message.to_string()),
+        ..Default::default()
+    };
+    let log_path_string = log_path.display().to_string();
+    let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type: backend.as_str(),
+        mode: execution_mode_for_backend(backend, request.script.is_some()),
+        run_id: request.invocation_id.as_str(),
+        status: ExecutionEvidenceStatus::Failed,
+        session_id: request.session.id.as_str(),
+        group_folder: Some(request.session.group_folder.as_str()),
+        workspace_root: Some(request.session.workspace_root.as_str()),
+        boundary: &boundary,
+        log_path: Some(log_path_string.as_str()),
+        log_body: Some(log_body.as_str()),
+        metadata: Some(&metadata),
+        provenance_id: Some(provenance.id.as_str()),
+        verification: Vec::new(),
+        blockers: vec![ExecutionBlockerRef {
+            kind: "adapter_error".to_string(),
+            source: Some(backend.as_str().to_string()),
+            message: message.to_string(),
+        }],
+    });
+
+    WorkerResponse {
+        text: format!("Execution failed: {message}"),
+        boundary,
+        session_id: request.session.id.clone(),
+        log_path: Some(log_path_string),
+        log_body: Some(log_body),
+        provenance: Some(provenance),
+        metadata: Some(metadata),
+        evidence: Some(evidence),
     }
 }
 
@@ -4466,8 +4650,8 @@ mod tests {
 
     use crate::foundation::CapabilityManifest;
     use crate::foundation::{
-        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, Group, MessageRecord,
-        RemoteWorkerMode, RequestPlane,
+        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, ExecutionStatus, Group,
+        MessageRecord, RemoteWorkerMode, RequestPlane,
     };
     use crate::nanoclaw::config::NanoclawConfig;
     use crate::nanoclaw::model_router::WorkerBackend;
@@ -5071,6 +5255,55 @@ mod tests {
         assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
         assert_eq!(evidence.status, ExecutionEvidenceStatus::Succeeded);
         assert_eq!(evidence.provenance_id.as_deref(), Some("exec-1"));
+    }
+
+    #[test]
+    fn worker_backend_errors_return_structured_failed_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("CLAUDE.md"), "# Andy\n").unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+
+        let request = WorkerRequest {
+            invocation_id: "exec-blocked".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: Some(WorkerBackend::Custom("missing-adapter".to_string())),
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = execute_worker_request(request).unwrap();
+        assert!(response
+            .text
+            .contains("unsupported worker backend 'missing-adapter'"));
+        let evidence = response.evidence.as_ref().expect("worker emits evidence");
+        assert_eq!(evidence.adapter_type, "missing-adapter");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Code);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.run_id, "exec-blocked");
+        assert_eq!(evidence.blockers[0].kind, "adapter_error");
+        assert!(Path::new(response.log_path.as_deref().unwrap()).exists());
+        assert!(response
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| matches!(provenance.status, ExecutionStatus::Error)));
     }
 
     #[test]
