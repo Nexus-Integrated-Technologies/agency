@@ -400,16 +400,6 @@ pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> Execu
         input.log_body,
         input.metadata,
     );
-    let verification = if input.verification.is_empty() {
-        vec![ExecutionVerificationRef {
-            kind: "adapter_status".to_string(),
-            command: None,
-            status: input.status.as_str().to_string(),
-            summary: input.metadata.and_then(|metadata| metadata.summary.clone()),
-        }]
-    } else {
-        input.verification
-    };
     let workspace_exists = input
         .workspace_root
         .map(|root| Path::new(root).exists())
@@ -431,12 +421,26 @@ pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> Execu
         git: collect_git_evidence(input.workspace_root),
         boundary: input.boundary.clone(),
         artifacts,
-        verification,
+        verification: input.verification,
         blockers: input.blockers,
         provenance_id: input.provenance_id.map(str::to_string),
         external_run_id: input
             .metadata
             .and_then(|metadata| metadata.external_run_id.clone()),
+    }
+}
+
+fn status_verification(
+    kind: &str,
+    command: Option<String>,
+    status: ExecutionEvidenceStatus,
+    summary: Option<String>,
+) -> ExecutionVerificationRef {
+    ExecutionVerificationRef {
+        kind: kind.to_string(),
+        command,
+        status: status.as_str().to_string(),
+        summary,
     }
 }
 
@@ -1315,11 +1319,12 @@ impl ExecutorBoundary for OmxExecutor {
         } else {
             Vec::new()
         };
+        let evidence_status = omx_status_to_evidence_status(&response.status);
         let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
             adapter_type: "omx",
             mode: ExecutionEvidenceMode::Gateway,
             run_id: external_run_id.as_deref().unwrap_or(session_id.as_str()),
-            status: omx_status_to_evidence_status(&response.status),
+            status: evidence_status,
             session_id: session_id.as_str(),
             group_folder: Some(request.group.folder.as_str()),
             workspace_root: Some(response.workspace_root.as_str()),
@@ -1328,7 +1333,12 @@ impl ExecutorBoundary for OmxExecutor {
             log_body: log_body.as_deref(),
             metadata: Some(&metadata),
             provenance_id: Some(provenance.id.as_str()),
-            verification: Vec::new(),
+            verification: vec![status_verification(
+                "omx_session_status",
+                None,
+                evidence_status,
+                Some(response.summary.clone()),
+            )],
             blockers,
         });
 
@@ -1399,7 +1409,12 @@ impl ExecutorBoundary for InProcessEchoExecutor {
             log_body: None,
             metadata: None,
             provenance_id: None,
-            verification: Vec::new(),
+            verification: vec![status_verification(
+                "in_process_response",
+                None,
+                ExecutionEvidenceStatus::Succeeded,
+                Some("in-process advisory response generated".to_string()),
+            )],
             blockers: Vec::new(),
         });
 
@@ -1862,6 +1877,28 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 isolated: true,
             };
             let log_path_string = log_path.display().to_string();
+            let verification = request
+                .script
+                .as_ref()
+                .map(|script| {
+                    vec![status_verification(
+                        "command",
+                        Some(script.clone()),
+                        ExecutionEvidenceStatus::Succeeded,
+                        Some("host command completed successfully".to_string()),
+                    )]
+                })
+                .unwrap_or_else(|| {
+                    vec![status_verification(
+                        "backend_response",
+                        None,
+                        ExecutionEvidenceStatus::Succeeded,
+                        Some(format!(
+                            "{} backend returned a successful response",
+                            result.metadata.backend.as_str()
+                        )),
+                    )]
+                });
             let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
                 adapter_type: result.metadata.backend.as_str(),
                 mode: execution_mode_for_backend(
@@ -1878,18 +1915,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 log_body: Some(result.log_body.as_str()),
                 metadata: Some(&execution_metadata),
                 provenance_id: Some(provenance.id.as_str()),
-                verification: request
-                    .script
-                    .as_ref()
-                    .map(|script| {
-                        vec![ExecutionVerificationRef {
-                            kind: "command".to_string(),
-                            command: Some(script.clone()),
-                            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
-                            summary: Some("host command completed successfully".to_string()),
-                        }]
-                    })
-                    .unwrap_or_default(),
+                verification,
                 blockers: Vec::new(),
             });
             Ok(WorkerResponse {
@@ -1977,7 +2003,12 @@ fn build_blocked_execution_response(
         log_body,
         metadata: Some(&metadata),
         provenance_id: None,
-        verification: Vec::new(),
+        verification: vec![status_verification(
+            "blocked_before_execution",
+            None,
+            ExecutionEvidenceStatus::Failed,
+            Some(message.to_string()),
+        )],
         blockers: vec![ExecutionBlockerRef {
             kind: "unsupported_execution_lane".to_string(),
             source: Some(adapter_type.to_string()),
@@ -2145,7 +2176,12 @@ fn build_blocked_worker_response_with_status(
         log_body: Some(log_body.as_str()),
         metadata: Some(&metadata),
         provenance_id: Some(provenance.id.as_str()),
-        verification: Vec::new(),
+        verification: vec![status_verification(
+            "worker_blocked_before_execution",
+            None,
+            status,
+            Some(message.to_string()),
+        )],
         blockers: vec![ExecutionBlockerRef {
             kind: blocker_kind.to_string(),
             source: Some(adapter_type.to_string()),
@@ -5103,9 +5139,9 @@ mod tests {
         write_json, BackendExecutionMetadata, BackendExecutionResult, BuildExecutionEvidenceInput,
         ContainerExecutor, DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
         ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
-        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
-        GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor,
-        RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutionVerificationRef,
+        ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor,
+        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
         EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
 
@@ -5234,7 +5270,12 @@ mod tests {
             log_body: Some("status=ok"),
             metadata: Some(&metadata),
             provenance_id: Some("exec-1"),
-            verification: Vec::new(),
+            verification: vec![ExecutionVerificationRef {
+                kind: "test_verification".to_string(),
+                command: None,
+                status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+                summary: Some("test verification supplied".to_string()),
+            }],
             blockers: Vec::new(),
         });
 
@@ -5243,6 +5284,7 @@ mod tests {
         assert_eq!(evidence.mode, ExecutionEvidenceMode::Code);
         assert_eq!(evidence.workspace.group_folder.as_deref(), Some("main"));
         assert!(evidence.workspace.exists);
+        assert_eq!(evidence.verification[0].kind, "test_verification");
         assert_eq!(evidence.verification[0].status, "succeeded");
         assert_eq!(
             evidence.artifacts[0].location.as_deref(),
@@ -5293,6 +5335,12 @@ mod tests {
             title: "log".to_string(),
             location: Some("/tmp/exec.log".to_string()),
             body: None,
+        });
+        evidence.verification.push(ExecutionVerificationRef {
+            kind: "test_verification".to_string(),
+            command: None,
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("test verification supplied".to_string()),
         });
         response.evidence = Some(evidence);
         validate_execution_response_evidence(&response).unwrap();
@@ -5969,7 +6017,8 @@ mod tests {
 
         let session_root = PathBuf::from(&session.session_root);
         let daemon = thread::spawn(move || {
-            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(150)).unwrap();
+            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(1000))
+                .unwrap();
         });
 
         let send_request = |session: &ExecutionSession, invocation_id: &str, content: &str| {
@@ -6023,7 +6072,7 @@ mod tests {
         let second = send_request(&session, "exec-2", "second");
         assert!(second.text.contains("Session turn: 2"));
 
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(1200));
         daemon.join().unwrap();
         assert!(!session.socket_path().exists());
         assert!(!session.pid_path().exists());

@@ -494,6 +494,7 @@ mod tests {
     use crate::nanoclaw::executor::{
         build_execution_evidence, BuildExecutionEvidenceInput, ExecutionArtifactRef,
         ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionResponse,
+        ExecutionVerificationRef,
     };
     use crate::nanoclaw::scheduler::TaskScheduleInput;
 
@@ -544,6 +545,12 @@ mod tests {
             title: "log".to_string(),
             location: Some("/tmp/exec.log".to_string()),
             body: None,
+        });
+        evidence.verification.push(ExecutionVerificationRef {
+            kind: "test_verification".to_string(),
+            command: None,
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("test verification supplied".to_string()),
         });
         response.evidence = Some(evidence);
         validate_task_execution_completion_evidence("task-1", &response)?;
