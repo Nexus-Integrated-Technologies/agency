@@ -48,10 +48,10 @@ or clean-roomed into the active runtime.
 | `src/utils/truncate.rs`, `src/utils/hardening.rs`, `src/utils/otel.rs` | `assimilate-runtime` | context shaping, process hardening, observability | Narrow utilities can be adopted without keeping the old utility module. |
 | `src/utils/toon.rs`, `src/utils/sandbox.rs` | `park-reference` | none yet | Only adopt if a runtime evidence or sandbox contract needs them. |
 | `src/runtime/wasm.rs` | `park-reference` | future sandbox/tool lane | Not required for the current host/container/remote-worker lanes. |
-| `src/models/*`, `src/services/{speaker,listener}.rs`, `docker/Dockerfile.speaker` | `park-reference` | future media/audio lane if required | Model/audio services are not part of the NanoClaw control-plane collapse. |
+| `src/models/*`, `src/services/{speaker,listener}.rs`, `docker/Dockerfile.speaker`, old compose stack | `park-reference` | future media/audio lane if required | Model/audio services are not part of the NanoClaw control-plane collapse. The old Docker artifacts are parked under `graveyard/agency-harness/docker/`. |
 | `src/services/memory.rs`, `src/services/responses.rs` | `park-reference` | future service wrappers | Runtime should stay CLI/local-first until a service wrapper is intentionally reintroduced. |
 | `src-tauri/` | `park-reference` | future desktop operator shell | Keep out of the control-plane runtime path for now. |
-| inactive `src/bin/*` and `tests/*` | `park-reference` | `graveyard/agency-harness/` | Preserved as source material but removed from active Cargo discovery paths. |
+| inactive `src/bin/*`, `tests/*`, and old service launch scripts | `park-reference` | `graveyard/agency-harness/` | Preserved as source material but removed from active Cargo discovery and root operator paths. |
 
 ## First Assimilation Slices
 

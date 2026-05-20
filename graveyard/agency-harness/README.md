@@ -1,7 +1,8 @@
 # Parked Agency Harness Reference
 
-This folder preserves inactive Agency harness entrypoints, tests, and legacy
-documentation while the runtime collapses toward Rust NanoClaw.
+This folder preserves inactive Agency harness entrypoints, service scripts,
+tests, Docker files, and legacy documentation while the runtime collapses
+toward Rust NanoClaw.
 
 These files are not active runtime targets. They were moved out of Cargo's
 auto-discovery paths so active validation can focus on:
@@ -18,3 +19,8 @@ equivalent primitive in `src/foundation/` or `src/nanoclaw/` with focused tests.
 `LEGACY_README.md` is the pre-collapse repository README. It describes the old
 Agency microservice suite and should not be treated as current operator
 documentation.
+
+The original `start_agency.sh`, Matrix Conduit launcher, speaker Dockerfile,
+and old compose stack are parked under `scripts/` and `docker/`. The root
+`start_agency.sh` is now only a guard that points operators to the active
+NanoClaw commands.

@@ -129,6 +129,9 @@ The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
   `docs/agency-capability-adoption-ledger.md`.
 - Inactive old Agency bins and tests are parked under
   `graveyard/agency-harness/` as clean-room reference material.
+- Old Agency service launch scripts and the old speaker compose stack are also
+  parked under `graveyard/agency-harness/`; the root `start_agency.sh` is a
+  compatibility guard only.
 - Strip `src/fpf/` and governance-dependent orchestration modules after their
   useful primitives are clean-roomed or their remaining call sites are removed
   or replaced.

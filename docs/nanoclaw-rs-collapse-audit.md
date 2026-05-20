@@ -82,8 +82,7 @@ The repository still contains substantial parked or candidate code:
   `src/services`, `src/tools`, and `src/utils`, about 25k lines
 - inactive bins and integration tests parked under `graveyard/agency-harness/`
 - desktop shell under `src-tauri/`
-- old service scripts such as `start_agency.sh`, `docker-compose.yml`, and
-  `docker/Dockerfile.speaker`
+- old service scripts and Docker files parked under `graveyard/agency-harness/`
 
 ## What Is Left To Do
 
@@ -139,13 +138,17 @@ Exit criterion:
 
 ### 3. Replace Legacy Scripts With NanoClaw Entrypoints
 
-Status: not done.
+Status: started.
 
 Remaining work:
 
-- Replace or archive `start_agency.sh`, which still builds and launches
-  `memory_server`, `speaker_server`, `listener_server`, and `nexus_server`.
-- Replace old service/docker docs with NanoClaw-specific commands.
+- Keep the root `start_agency.sh` as a guard only; it must not launch old
+  `memory_server`, `speaker_server`, `listener_server`, or `nexus_server`
+  binaries.
+- Keep the original service launchers and old speaker compose stack parked under
+  `graveyard/agency-harness/`.
+- Replace old service/docker docs with NanoClaw-specific commands where those
+  docs still describe the legacy suite as active.
 - Keep `docker/start-openclaw-gateway.sh` because it is already part of the
   NanoClaw OpenClaw gateway runtime.
 - Keep `Dockerfile.openclaw-gateway` but continue reducing its build context as
@@ -256,7 +259,8 @@ Exit criterion:
 1. Merge the explicit Cargo target graph and collapse audit.
 2. Park inactive bins/tests so `src/bin/` and `tests/` stop advertising broken
    old targets while preserving useful examples for capability extraction.
-3. Rewrite README and startup docs around the NanoClaw runtime.
+3. Rewrite README and startup docs around the NanoClaw runtime; keep legacy
+   startup artifacts parked or guarded.
 4. Refine the Agency capability adoption ledger, starting with `src/fpf/`,
    `src/orchestrator/`, `src/agent/`, and `src/tools/`.
 5. Clean-room useful Agency concepts into `foundation` or `nanoclaw`; move only
