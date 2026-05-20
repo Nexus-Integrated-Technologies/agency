@@ -49,6 +49,10 @@ use super::swarm::{
     cancel_swarm_objective_run, create_swarm_objective_run, get_swarm_run_details,
     list_swarm_run_details, pump_swarm_once, CreateSwarmObjectiveRunInput,
 };
+use super::tool_registry::{
+    built_in_tool_adapter_contracts, load_external_tool_adapter_contracts,
+    validate_built_in_tool_adapter_contracts,
+};
 use super::webhook_server::start_webhook_server;
 use super::{NanoclawApp, NanoclawConfig};
 
@@ -780,6 +784,23 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
         }),
     ));
 
+    let tool_adapters = runtime_tool_adapter_registry_json(&app.config);
+    let tool_adapters_ok = tool_adapters.get("ok").and_then(Value::as_bool) == Some(true);
+    checks.push(runtime_health_check(
+        "tool_adapter_registry",
+        if tool_adapters_ok {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if tool_adapters_ok {
+            "tool adapter registry contracts are valid"
+        } else {
+            "tool adapter registry has invalid contracts"
+        },
+        tool_adapters,
+    ));
+
     let failing = checks
         .iter()
         .filter(|check| check.status == RuntimeHealthCheckStatus::Fail)
@@ -814,6 +835,88 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
         },
         "checks": checks.iter().map(runtime_health_check_json).collect::<Vec<_>>(),
     }))
+}
+
+fn runtime_tool_adapter_registry_json(config: &NanoclawConfig) -> Value {
+    let built_in_contracts = built_in_tool_adapter_contracts();
+    let built_in_reports = validate_built_in_tool_adapter_contracts();
+    let external_path = config.tool_adapter_manifest_path();
+    let external_exists = external_path.exists();
+    let external_result = load_external_tool_adapter_contracts(&external_path);
+
+    let (external_ok, external_status, external_count, external_ids, external_error) =
+        match external_result {
+            Ok(contracts) => {
+                let status = if external_exists {
+                    if contracts.is_empty() {
+                        "empty"
+                    } else {
+                        "loaded"
+                    }
+                } else {
+                    "missing"
+                };
+                (
+                    true,
+                    status,
+                    contracts.len(),
+                    contracts
+                        .iter()
+                        .map(|contract| contract.id.clone())
+                        .collect::<Vec<_>>(),
+                    Value::Null,
+                )
+            }
+            Err(error) => (
+                false,
+                "invalid",
+                0,
+                Vec::new(),
+                Value::String(error.to_string()),
+            ),
+        };
+
+    let built_in_ok = built_in_reports.is_empty();
+    json!({
+        "ok": built_in_ok && external_ok,
+        "builtIn": {
+            "ok": built_in_ok,
+            "count": built_in_contracts.len(),
+            "ids": built_in_contracts
+                .iter()
+                .map(|contract| contract.id.clone())
+                .collect::<Vec<_>>(),
+            "validationReports": validation_reports_json(&built_in_reports),
+        },
+        "external": {
+            "ok": external_ok,
+            "path": external_path.display().to_string(),
+            "exists": external_exists,
+            "status": external_status,
+            "count": external_count,
+            "ids": external_ids,
+            "error": external_error,
+        },
+    })
+}
+
+fn validation_reports_json(
+    reports: &[super::tool_registry::ToolAdapterContractValidationReport],
+) -> Vec<Value> {
+    reports
+        .iter()
+        .map(|report| {
+            json!({
+                "id": report.id,
+                "violations": report.violations.iter().map(|violation| {
+                    json!({
+                        "field": violation.field,
+                        "message": violation.message,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
@@ -855,6 +958,7 @@ fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
             "defaultLane": config.execution_lane.as_str(),
             "gatewayLane": config.openclaw_gateway_execution_lane.as_str(),
         },
+        "toolAdapters": runtime_tool_adapter_registry_json(config),
         "serveProfiles": ["full", "gateway", "webhook", "pm", "slack"],
     })
 }
@@ -1757,6 +1861,68 @@ mod tests {
     }
 
     #[test]
+    fn runtime_status_reports_tool_adapter_registry() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+
+        let status = runtime_status_json(&config);
+
+        assert_eq!(status["toolAdapters"]["ok"], true);
+        assert_eq!(status["toolAdapters"]["external"]["status"], "missing");
+        assert!(
+            status["toolAdapters"]["builtIn"]["count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 7
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_tool_adapter_registry_reports_invalid_external_manifest() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        fs::write(
+            config.tool_adapter_manifest_path(),
+            r#"[{
+                "id": "bad_shell",
+                "runtime_name": "bad-shell",
+                "mode": "shell",
+                "request_plane": "None",
+                "capabilities": {
+                    "web_request": false,
+                    "email_request": false,
+                    "browser": false,
+                    "repo_sync": false,
+                    "ssh": false,
+                    "host_command": false,
+                    "secret_broker": false,
+                    "os_control": false
+                },
+                "approval_policy": "not_required",
+                "artifact_kinds_required": [],
+                "verification_kinds_required": [],
+                "blockers_required_on_failure": false,
+                "workspace_required": false,
+                "operator_visible": false,
+                "source_material": null
+            }]"#,
+        )?;
+
+        let registry = runtime_tool_adapter_registry_json(&config);
+
+        assert_eq!(registry["ok"], false);
+        assert_eq!(registry["external"]["status"], "invalid");
+        assert!(registry["external"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed validation: bad_shell"));
+        Ok(())
+    }
+
+    #[test]
     fn runtime_cleanup_dry_run_keeps_invalid_pid_file() -> Result<()> {
         let temp = tempdir()?;
         let mut config = NanoclawConfig::from_env();
@@ -2513,6 +2679,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
             println!(
                 "observability_adapters_path: {}",
                 config.observability_adapters_path.display()
+            );
+            println!(
+                "tool_adapters_path: {}",
+                config.tool_adapter_manifest_path().display()
             );
             println!(
                 "linear_chat_jid: {}",
