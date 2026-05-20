@@ -5970,7 +5970,7 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("printf stdout; printf stderr >&2; exit 42");
+            .arg("cat >/dev/null; printf stdout; printf stderr >&2; exit 42");
 
         let response = run_worker_command(&mut command, &payload).unwrap();
         let evidence = response.evidence.as_ref().expect("process emits evidence");
