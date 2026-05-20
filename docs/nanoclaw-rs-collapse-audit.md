@@ -299,7 +299,11 @@ Already active:
   registry keeps Workers AI advisory-only and makes host OS control
   explicit-approval-only.
 - External tool adapter manifests now load through the same registry path and
-  fail closed when a contract is invalid or two adapters claim the same id.
+  fail closed when a contract is invalid, two external adapters claim the same
+  id, or an external adapter tries to reuse a built-in runtime-hand id.
+  `tool-adapters.example.json` is a checked-in compatibility fixture for
+  plugin directories that will produce `NANOCLAW_TOOL_ADAPTERS_PATH`
+  manifests.
 - `runtime status`, `runtime inspect`, and `runtime health` expose the tool
   adapter registry and external manifest validation state. The external
   manifest path defaults to `tool-adapters.json` under the project root and can
@@ -329,8 +333,8 @@ Remaining work:
 - If a new active Nexus/Paperclip/GitHub writeback surface needs to transition
   work states, route it through the app completion APIs instead of adding raw
   status mutation callsites.
-- Wire concrete plugin directories to produce `NANOCLAW_TOOL_ADAPTERS_PATH`
-  manifests when external plugins are introduced.
+- Wire concrete plugin directories to produce manifests compatible with
+  `tool-adapters.example.json` when external plugins are introduced.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 - Extend the same command-safety classifier to any future active shell-capable
