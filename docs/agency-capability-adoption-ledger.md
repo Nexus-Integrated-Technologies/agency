@@ -90,10 +90,12 @@ or clean-roomed into the active runtime.
    stale-PID cleanup. `runtime state` and `runtime cleanup --state-residue`
    now expose a report-only active-vs-legacy state residue inventory so
    `.fastembed_cache`, legacy memory stores, and old history files can be
-   reviewed without deleting active production controller data. Remaining work
-   is to connect health alerts to remote/operator channels when those channels
-   are configured and convert safe residue candidates into explicit
-   operator-approved purge or migration actions.
+   reviewed without deleting active production controller data. The inventory
+   now includes explicit `operatorActions` that classify legacy candidates as
+   migration, purge-candidate, preserve-reference, or review while keeping the
+   safe default as leave-in-place. Remaining work is to connect health alerts to
+   remote/operator channels when those channels are configured and add apply
+   commands only for migration or purge actions with a runtime contract.
 3. Tool contract: convert useful tools into typed runtime adapters with
    request-plane policy, approval gates, artifacts, and verification.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
