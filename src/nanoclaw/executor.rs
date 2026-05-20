@@ -377,6 +377,7 @@ pub struct BuildExecutionEvidenceInput<'a> {
     pub log_body: Option<&'a str>,
     pub metadata: Option<&'a ExecutionMetadata>,
     pub provenance_id: Option<&'a str>,
+    pub verification: Vec<ExecutionVerificationRef>,
     pub blockers: Vec<ExecutionBlockerRef>,
 }
 
@@ -399,12 +400,16 @@ pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> Execu
         input.log_body,
         input.metadata,
     );
-    let verification = vec![ExecutionVerificationRef {
-        kind: "adapter_status".to_string(),
-        command: None,
-        status: input.status.as_str().to_string(),
-        summary: input.metadata.and_then(|metadata| metadata.summary.clone()),
-    }];
+    let verification = if input.verification.is_empty() {
+        vec![ExecutionVerificationRef {
+            kind: "adapter_status".to_string(),
+            command: None,
+            status: input.status.as_str().to_string(),
+            summary: input.metadata.and_then(|metadata| metadata.summary.clone()),
+        }]
+    } else {
+        input.verification
+    };
     let workspace_exists = input
         .workspace_root
         .map(|root| Path::new(root).exists())
@@ -442,6 +447,13 @@ pub fn validate_execution_response_evidence(response: &ExecutionResponse) -> Res
             response.session_id
         );
     };
+    validate_execution_evidence(evidence, Some(response.session_id.as_str()))
+}
+
+pub fn validate_execution_evidence(
+    evidence: &ExecutionEvidence,
+    expected_session_id: Option<&str>,
+) -> Result<()> {
     if evidence.schema_version != EXECUTION_EVIDENCE_SCHEMA_VERSION {
         bail!(
             "execution evidence schema mismatch for run {}: expected {}, got {}",
@@ -459,13 +471,15 @@ pub fn validate_execution_response_evidence(response: &ExecutionResponse) -> Res
             evidence.run_id
         );
     }
-    if evidence.workspace.session_id != response.session_id {
-        bail!(
-            "execution evidence session mismatch for run {}: response={}, evidence={}",
-            evidence.run_id,
-            response.session_id,
-            evidence.workspace.session_id
-        );
+    if let Some(expected_session_id) = expected_session_id {
+        if evidence.workspace.session_id != expected_session_id {
+            bail!(
+                "execution evidence session mismatch for run {}: response={}, evidence={}",
+                evidence.run_id,
+                expected_session_id,
+                evidence.workspace.session_id
+            );
+        }
     }
     if evidence.verification.is_empty() {
         bail!(
@@ -513,6 +527,14 @@ fn collect_execution_artifacts(
                 body: log_body.map(str::to_string),
             });
         }
+    }
+    if log_path.is_none() && log_body.is_some() {
+        artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: format!("{adapter_type} execution log"),
+            location: None,
+            body: log_body.map(str::to_string),
+        });
     }
     artifacts
 }
@@ -1165,6 +1187,7 @@ impl ExecutorBoundary for OmxExecutor {
             log_body: log_body.as_deref(),
             metadata: Some(&metadata),
             provenance_id: Some(provenance.id.as_str()),
+            verification: Vec::new(),
             blockers,
         });
 
@@ -1235,6 +1258,7 @@ impl ExecutorBoundary for InProcessEchoExecutor {
             log_body: None,
             metadata: None,
             provenance_id: None,
+            verification: Vec::new(),
             blockers: Vec::new(),
         });
 
@@ -1713,6 +1737,18 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 log_body: Some(result.log_body.as_str()),
                 metadata: Some(&execution_metadata),
                 provenance_id: Some(provenance.id.as_str()),
+                verification: request
+                    .script
+                    .as_ref()
+                    .map(|script| {
+                        vec![ExecutionVerificationRef {
+                            kind: "command".to_string(),
+                            command: Some(script.clone()),
+                            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+                            summary: Some("host command completed successfully".to_string()),
+                        }]
+                    })
+                    .unwrap_or_default(),
                 blockers: Vec::new(),
             });
             Ok(WorkerResponse {
@@ -4580,6 +4616,7 @@ mod tests {
             log_body: Some("status=ok"),
             metadata: Some(&metadata),
             provenance_id: Some("exec-1"),
+            verification: Vec::new(),
             blockers: Vec::new(),
         });
 
@@ -4627,6 +4664,7 @@ mod tests {
             log_body: None,
             metadata: None,
             provenance_id: None,
+            verification: Vec::new(),
             blockers: Vec::new(),
         });
         response.evidence = Some(evidence.clone());

@@ -516,6 +516,7 @@ mod tests {
             log_body: None,
             metadata: None,
             provenance_id: None,
+            verification: Vec::new(),
             blockers: Vec::new(),
         });
         response.evidence = Some(evidence.clone());

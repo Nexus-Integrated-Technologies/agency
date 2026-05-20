@@ -218,6 +218,12 @@ Already active:
 - Scheduled task completion now calls a runtime closure gate: an executed task
   can only transition to completed from successful validated execution
   evidence.
+- Direct swarm lanes (`repo_mirror` and `symphony`) now emit shell-mode
+  execution evidence with command verification, body-backed log artifacts, and
+  blockers on command failure instead of completing from remote stdout alone.
+- Swarm task completion now runs an evidence contract gate across built-in
+  lanes, so a successful agent, Codex, host, repo mirror, or Symphony task must
+  carry valid structured execution evidence before it can be marked completed.
 - Runtime task errors use a failed-run path, so missing/invalid execution
   evidence no longer reaches completed status through the generic error path.
 

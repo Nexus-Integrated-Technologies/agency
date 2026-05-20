@@ -62,8 +62,10 @@ or clean-roomed into the active runtime.
    `execution_evidence`; the execution router validates the envelope before
    success returns, scheduled-task completion now requires successful validated
    evidence, and runtime errors record failed runs instead of completing through
-   the error path. Remaining work is failure blockers, explicit verification
-   commands, and non-local issue/writeback closure gating.
+   the error path. Direct swarm remote lanes now emit command verification,
+   artifacts, and blockers, and built-in swarm lanes gate completion on valid
+   execution evidence. Remaining work is to extend the same contract to future
+   external adapter plugins as they are registered.
 2. Runtime supervisor: extend `nanoclaw runtime status|inspect|poll|serve`
    with stop/reload semantics and health-loop reporting.
 3. Tool contract: convert useful tools into typed runtime adapters with

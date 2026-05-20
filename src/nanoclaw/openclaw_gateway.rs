@@ -23,7 +23,8 @@ use super::config::NanoclawConfig;
 use super::executor::{
     build_execution_evidence, build_execution_session, BuildExecutionEvidenceInput,
     ExecutionArtifactRef, ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionLaneRouter,
-    ExecutionMetadata, ExecutionRequest, ExecutionResponse, ExecutorBoundary,
+    ExecutionMetadata, ExecutionRequest, ExecutionResponse, ExecutionVerificationRef,
+    ExecutorBoundary,
 };
 use super::model_router::WorkerBackend;
 use super::omx::{
@@ -1155,6 +1156,12 @@ fn execute_codespaces_gateway_run(
         log_body: Some(log_body.as_str()),
         metadata: Some(&metadata),
         provenance_id: None,
+        verification: vec![ExecutionVerificationRef {
+            kind: "command".to_string(),
+            command: Some(describe_process_command(&command)),
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("GitHub Codespaces command completed successfully".to_string()),
+        }],
         blockers: Vec::new(),
     });
 
