@@ -125,7 +125,10 @@ The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
 
 - The current collapse audit and ordered backlog live in
   `docs/nanoclaw-rs-collapse-audit.md`.
-- Build an Agency capability adoption ledger before moving large directories.
+- The Agency capability adoption ledger lives in
+  `docs/agency-capability-adoption-ledger.md`.
+- Inactive old Agency bins and tests are parked under
+  `graveyard/agency-harness/` as clean-room reference material.
 - Strip `src/fpf/` and governance-dependent orchestration modules after their
   useful primitives are clean-roomed or their remaining call sites are removed
   or replaced.

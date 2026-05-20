@@ -52,6 +52,10 @@ targets:
 This keeps the Rust NanoClaw runtime buildable while the legacy source tree is
 still being sorted.
 
+The next cut parks inactive bins and tests under `graveyard/agency-harness/`.
+They remain available as clean-room reference material, but no longer sit in
+Cargo's active discovery paths.
+
 This pass also removed one active-runtime flake found by the stricter gate:
 worker daemon sockets now include a hash of the session root instead of using
 only the short session ID, so parallel sessions with names like `session-1` do
@@ -76,8 +80,7 @@ The repository still contains substantial parked or candidate code:
 - Agency source still on disk under `src/agent`, `src/fpf`, `src/memory`,
   `src/models`, `src/orchestrator`, `src/runtime`, `src/safety`,
   `src/services`, `src/tools`, and `src/utils`, about 25k lines
-- inactive bins under `src/bin/` other than `nanoclaw.rs`
-- inactive integration tests under `tests/`
+- inactive bins and integration tests parked under `graveyard/agency-harness/`
 - desktop shell under `src-tauri/`
 - old service scripts such as `start_agency.sh`, `docker-compose.yml`, and
   `docker/Dockerfile.speaker`
@@ -107,12 +110,12 @@ Exit criterion:
 
 ### 2. Classify Agency Capabilities For Adoption
 
-Status: not done.
+Status: started in `docs/agency-capability-adoption-ledger.md`.
 
 Remaining work:
 
-- Create a capability ledger for each old source directory before moving or
-  deleting anything.
+- Keep the capability ledger updated before moving or deleting old source
+  directories.
 - Decide whether each capability should be:
   - clean-roomed into `src/foundation/` as a domain primitive,
   - clean-roomed into `src/nanoclaw/` as runtime behavior,
@@ -231,13 +234,15 @@ Exit criterion:
 
 ### 7. Rewrite Public Repo Documentation
 
-Status: not done.
+Status: started.
 
 Remaining work:
 
-- Remove the old Agency README body or move it to a legacy reference document.
-- Make README describe the current Nexus/NanoClaw runtime only.
-- Update `src/bin/README.md` or move it with the legacy bins.
+- Keep the root README focused on the current Nexus/Rust NanoClaw runtime only.
+- Keep the old Agency README body parked as
+  `graveyard/agency-harness/LEGACY_README.md`.
+- Keep the old `src/bin/README.md` parked with the legacy bins under
+  `graveyard/agency-harness/src-bin/`.
 - Update docs that still describe old FPF/governance/SOTA microservice posture
   as active runtime behavior.
 
@@ -252,7 +257,7 @@ Exit criterion:
 2. Park inactive bins/tests so `src/bin/` and `tests/` stop advertising broken
    old targets while preserving useful examples for capability extraction.
 3. Rewrite README and startup docs around the NanoClaw runtime.
-4. Build an Agency capability adoption ledger, starting with `src/fpf/`,
+4. Refine the Agency capability adoption ledger, starting with `src/fpf/`,
    `src/orchestrator/`, `src/agent/`, and `src/tools/`.
 5. Clean-room useful Agency concepts into `foundation` or `nanoclaw`; move only
    non-adopted holonic/governance material into `graveyard/holonic/`.
