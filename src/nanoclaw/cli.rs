@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 
 use crate::foundation::{
@@ -29,7 +30,7 @@ use super::linear::{
     LinearIssueCommentUpsertTaskInput, LinearIssueQualityTaskInput, LinearIssueTransitionTaskInput,
     LinearPmMemoryTaskInput, LinearTeamsTaskInput,
 };
-use super::local_channel::LocalInboundEnvelope;
+use super::local_channel::{LocalChannel, LocalInboundEnvelope};
 use super::observability::{
     ingest_observability_event, ObservabilityEventStatus, ObservabilitySeverity,
 };
@@ -39,7 +40,9 @@ use super::remote_control::{build_remote_control_context, describe_remote_contro
 use super::runtime::LocalRuntime;
 use super::scheduler::TaskScheduleInput;
 use super::service_slack::{ensure_registered_group, send_recorded_slack_message};
-use super::session_storage::{ensure_session_sidecars, record_on_wake_message};
+use super::session_storage::{
+    ensure_session_sidecars, record_on_wake_message, session_sidecar_paths,
+};
 use super::slack::SlackChannel;
 use super::slack_runtime::SlackRuntime;
 use super::swarm::{
@@ -51,7 +54,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -109,10 +112,56 @@ struct RuntimeCleanupArgs {
     apply: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeHealthArgs {
     limit: usize,
     strict: bool,
+    notify_local: Option<String>,
+    notify_always: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskCompleteArgs {
+    task_id: String,
+    result: Option<String>,
+}
+
+fn parse_task_complete_args<I>(args: &mut I) -> Result<TaskCompleteArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut manual_override = false;
+    let mut values = Vec::<String>::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--manual-override" => manual_override = true,
+            other if other.starts_with("--") => {
+                anyhow::bail!("unexpected task complete argument '{}'", other)
+            }
+            _ => values.push(arg),
+        }
+    }
+
+    if !manual_override {
+        anyhow::bail!(
+            "task complete requires --manual-override; execution-driven completion must use structured execution evidence"
+        );
+    }
+    let Some(task_id) = values.first().cloned() else {
+        anyhow::bail!("task complete requires a task id");
+    };
+    let result = values
+        .get(1..)
+        .unwrap_or_default()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    Ok(TaskCompleteArgs {
+        task_id,
+        result: (!result.is_empty()).then_some(result),
+    })
 }
 
 fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
@@ -196,6 +245,8 @@ where
 {
     let mut limit = 10;
     let mut strict = false;
+    let mut notify_local = None::<String>;
+    let mut notify_always = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -210,11 +261,28 @@ where
                     .max(1);
             }
             "--strict" => strict = true,
+            "--notify-local" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    anyhow::bail!("runtime health --notify-local requires a non-empty chat id");
+                }
+                notify_local = Some(value);
+            }
+            "--notify-always" => notify_always = true,
             other => anyhow::bail!("unexpected runtime health argument '{}'", other),
         }
     }
 
-    Ok(RuntimeHealthArgs { limit, strict })
+    Ok(RuntimeHealthArgs {
+        limit,
+        strict,
+        notify_local,
+        notify_always,
+    })
 }
 
 fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
@@ -614,7 +682,8 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
     checks.push(gateway_check);
 
     let webhook_missing_auth = app.config.linear_webhook_port > 0
-        && app.config.linear_webhook_secret.trim().is_empty()
+        && (!app.config.linear_legacy_enabled
+            || app.config.linear_webhook_secret.trim().is_empty())
         && app.config.github_webhook_secret.trim().is_empty()
         && app.config.observability_webhook_token.trim().is_empty();
     checks.push(runtime_health_check(
@@ -633,7 +702,8 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
         },
         json!({
             "port": app.config.linear_webhook_port,
-            "linearSignatureRequired": !app.config.linear_webhook_secret.trim().is_empty(),
+            "linearLegacyEnabled": app.config.linear_legacy_enabled,
+            "linearSignatureRequired": app.config.linear_legacy_enabled && !app.config.linear_webhook_secret.trim().is_empty(),
             "githubSignatureRequired": !app.config.github_webhook_secret.trim().is_empty(),
             "observabilityTokenConfigured": !app.config.observability_webhook_token.trim().is_empty(),
         }),
@@ -757,12 +827,14 @@ fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
         "webhook": {
             "enabled": config.linear_webhook_port > 0,
             "port": config.linear_webhook_port,
-            "linearSignatureRequired": !config.linear_webhook_secret.trim().is_empty(),
+            "linearLegacyEnabled": config.linear_legacy_enabled,
+            "linearSignatureRequired": config.linear_legacy_enabled && !config.linear_webhook_secret.trim().is_empty(),
             "githubSignatureRequired": !config.github_webhook_secret.trim().is_empty(),
             "observabilityTokenConfigured": !config.observability_webhook_token.trim().is_empty(),
         },
         "pmAutomation": {
-            "enabled": !config.linear_chat_jid.trim().is_empty(),
+            "enabled": config.linear_legacy_enabled && !config.linear_chat_jid.trim().is_empty(),
+            "status": if config.linear_legacy_enabled { "legacy-enabled" } else { "discontinued" },
             "linearChatJidConfigured": !config.linear_chat_jid.trim().is_empty(),
             "teamKeysConfigured": !config.linear_pm_team_keys.is_empty(),
         },
@@ -775,10 +847,323 @@ fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
     })
 }
 
+fn path_state_json(path: &Path) -> Value {
+    match fs::metadata(path) {
+        Ok(metadata) => json!({
+            "path": path.display().to_string(),
+            "exists": true,
+            "isDir": metadata.is_dir(),
+            "isFile": metadata.is_file(),
+            "bytes": if metadata.is_file() {
+                Value::from(metadata.len())
+            } else {
+                Value::Null
+            },
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "isDir": false,
+            "isFile": false,
+            "bytes": null,
+        }),
+        Err(error) => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "isDir": false,
+            "isFile": false,
+            "bytes": null,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn dir_inventory_json(path: &Path) -> Value {
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut json_files = 0usize;
+    let mut other = 0usize;
+    let mut errors = Vec::<Value>::new();
+
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let entry_path = entry.path();
+                        match entry.file_type() {
+                            Ok(file_type) if file_type.is_dir() => dirs += 1,
+                            Ok(file_type) if file_type.is_file() => {
+                                files += 1;
+                                if entry_path.extension().and_then(|ext| ext.to_str())
+                                    == Some("json")
+                                {
+                                    json_files += 1;
+                                } else {
+                                    other += 1;
+                                }
+                            }
+                            Ok(_) => other += 1,
+                            Err(error) => errors.push(json!({
+                                "path": entry_path.display().to_string(),
+                                "error": error.to_string(),
+                            })),
+                        }
+                    }
+                    Err(error) => errors.push(json!({ "error": error.to_string() })),
+                }
+            }
+            json!({
+                "path": path.display().to_string(),
+                "exists": true,
+                "files": files,
+                "dirs": dirs,
+                "jsonFiles": json_files,
+                "otherEntries": other,
+                "errors": errors,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "files": 0,
+            "dirs": 0,
+            "jsonFiles": 0,
+            "otherEntries": 0,
+            "errors": [],
+        }),
+        Err(error) => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "files": 0,
+            "dirs": 0,
+            "jsonFiles": 0,
+            "otherEntries": 0,
+            "errors": [{ "error": error.to_string() }],
+        }),
+    }
+}
+
+fn sqlite_table_count_json(path: &Path, table: &str) -> Value {
+    if !path.exists() {
+        return json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "table": table,
+            "count": null,
+        });
+    }
+
+    match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            match conn.query_row(&sql, [], |row| row.get::<_, i64>(0)) {
+                Ok(count) => json!({
+                    "path": path.display().to_string(),
+                    "exists": true,
+                    "table": table,
+                    "count": count,
+                }),
+                Err(error) => json!({
+                    "path": path.display().to_string(),
+                    "exists": true,
+                    "table": table,
+                    "count": null,
+                    "error": error.to_string(),
+                }),
+            }
+        }
+        Err(error) => json!({
+            "path": path.display().to_string(),
+            "exists": true,
+            "table": table,
+            "count": null,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn runtime_session_sidecar_state_json(
+    config: &NanoclawConfig,
+    group_folder: &str,
+    session_id: &str,
+) -> Value {
+    let session = build_execution_session(
+        &config.data_dir,
+        group_folder,
+        session_id,
+        &config.groups_dir.join(group_folder),
+    );
+    let paths = session_sidecar_paths(&session);
+
+    json!({
+        "groupFolder": group_folder,
+        "sessionId": session_id,
+        "sessionRoot": path_state_json(&paths.session_root),
+        "inboundDb": {
+            "file": path_state_json(&paths.inbound_db),
+            "messagesIn": sqlite_table_count_json(&paths.inbound_db, "messages_in"),
+            "destinations": sqlite_table_count_json(&paths.inbound_db, "destinations"),
+            "sessionRouting": sqlite_table_count_json(&paths.inbound_db, "session_routing"),
+        },
+        "outboundDb": {
+            "file": path_state_json(&paths.outbound_db),
+            "messagesOut": sqlite_table_count_json(&paths.outbound_db, "messages_out"),
+            "processingAck": sqlite_table_count_json(&paths.outbound_db, "processing_ack"),
+        },
+    })
+}
+
+fn runtime_state_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
+    let counts = app.db.counts()?;
+    let groups = app.groups()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_tasks = tasks.iter().take(limit).cloned().collect::<Vec<_>>();
+    let mut task_status_counts = BTreeMap::<String, usize>::new();
+    for task in &tasks {
+        *task_status_counts
+            .entry(task.status.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    let local_root = app.config.data_dir.join("channels").join("local");
+    let executor_sessions_dir = app.config.data_dir.join("executor").join("sessions");
+    let mut linked_session_ids = BTreeSet::<String>::new();
+    let mut group_sessions = Vec::<Option<String>>::new();
+    let mut group_roots = Vec::<Value>::new();
+    let mut session_sidecars = Vec::<Value>::new();
+
+    for group in &groups {
+        let session_id = app.db.session_for_group(&group.folder)?;
+        if let Some(session_id) = session_id.as_deref() {
+            linked_session_ids.insert(session_id.to_string());
+        }
+        group_sessions.push(session_id);
+    }
+
+    for (group, session_id) in groups.iter().zip(group_sessions.iter()).take(limit) {
+        let group_root = app.config.groups_dir.join(&group.folder);
+        if let Some(session_id) = session_id.as_deref() {
+            session_sidecars.push(runtime_session_sidecar_state_json(
+                &app.config,
+                &group.folder,
+                session_id,
+            ));
+        }
+        group_roots.push(json!({
+            "folder": group.folder,
+            "jid": group.jid,
+            "name": group.name,
+            "isMain": group.is_main,
+            "root": path_state_json(&group_root),
+            "template": path_state_json(&group_root.join("CLAUDE.md")),
+            "sessionId": session_id,
+        }));
+    }
+
+    let mut orphan_session_dirs = Vec::<Value>::new();
+    if let Ok(entries) = fs::read_dir(&executor_sessions_dir) {
+        let mut dirs = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_dir() {
+                    return None;
+                }
+                let session_id = entry.file_name().to_string_lossy().to_string();
+                if linked_session_ids.contains(&session_id) {
+                    return None;
+                }
+                Some((session_id, path))
+            })
+            .collect::<Vec<_>>();
+        dirs.sort_by(|left, right| left.0.cmp(&right.0));
+        orphan_session_dirs = dirs
+            .into_iter()
+            .take(limit)
+            .map(|(session_id, path)| {
+                json!({
+                    "sessionId": session_id,
+                    "root": path_state_json(&path),
+                    "inventory": dir_inventory_json(&path),
+                })
+            })
+            .collect();
+    }
+
+    Ok(json!({
+        "ok": true,
+        "runtime": {
+            "activeBinary": "nanoclaw",
+            "control": runtime_pid_status_json(&app.config),
+        },
+        "roots": {
+            "projectRoot": path_state_json(&app.config.project_root),
+            "dataDir": path_state_json(&app.config.data_dir),
+            "storeDir": path_state_json(&app.config.store_dir),
+            "groupsDir": path_state_json(&app.config.groups_dir),
+            "runtimeControlDir": path_state_json(&runtime_control_dir(&app.config)),
+            "executorSessionsDir": path_state_json(&executor_sessions_dir),
+        },
+        "centralDb": {
+            "file": path_state_json(app.db.path()),
+            "tables": {
+                "chats": counts.chats,
+                "messages": counts.messages,
+                "scheduledTasks": counts.scheduled_tasks,
+                "registeredGroups": counts.registered_groups,
+                "sessions": sqlite_table_count_json(app.db.path(), "sessions"),
+                "executionProvenance": sqlite_table_count_json(app.db.path(), "execution_provenance"),
+                "executionEvidence": sqlite_table_count_json(app.db.path(), "execution_evidence"),
+                "swarmRuns": sqlite_table_count_json(app.db.path(), "swarm_runs"),
+                "swarmTasks": sqlite_table_count_json(app.db.path(), "swarm_tasks"),
+                "observabilityEvents": sqlite_table_count_json(app.db.path(), "observability_events"),
+            },
+        },
+        "localChannel": {
+            "root": path_state_json(&local_root),
+            "inbox": dir_inventory_json(&local_root.join("inbox")),
+            "outbox": dir_inventory_json(&local_root.join("outbox")),
+            "processed": dir_inventory_json(&local_root.join("processed")),
+        },
+        "groupRoots": {
+            "root": path_state_json(&app.config.groups_dir),
+            "inventory": dir_inventory_json(&app.config.groups_dir),
+            "registeredTotal": groups.len(),
+            "shown": group_roots.len(),
+            "items": group_roots,
+        },
+        "sessionSidecars": {
+            "root": path_state_json(&executor_sessions_dir),
+            "linkedShown": session_sidecars.len(),
+            "linkedItems": session_sidecars,
+            "orphanShown": orphan_session_dirs.len(),
+            "orphanItems": orphan_session_dirs,
+        },
+        "queuedTasks": {
+            "total": tasks.len(),
+            "due": due_tasks.len(),
+            "byStatus": task_status_counts,
+            "recent": recent_tasks,
+        },
+    }))
+}
+
 fn print_runtime_status(config: &NanoclawConfig) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&runtime_status_json(config))?
+    );
+    Ok(())
+}
+
+fn print_runtime_state(config: NanoclawConfig, limit: usize) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_state_json(&app, limit)?)?
     );
     Ok(())
 }
@@ -817,6 +1202,90 @@ fn runtime_inspect_json(app: &NanoclawApp, limit: usize) -> Result<serde_json::V
     }))
 }
 
+fn runtime_health_alert_text(health: &Value) -> String {
+    let status = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let summary = health.get("summary").unwrap_or(&Value::Null);
+    let passing = summary
+        .get("passing")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let warnings = summary
+        .get("warnings")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let failing = summary
+        .get("failing")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let mut lines = vec![
+        format!("NanoClaw runtime health: {status}"),
+        format!("checks: {passing} passing, {warnings} warnings, {failing} failing"),
+    ];
+
+    let mut surfaced = 0usize;
+    if let Some(checks) = health.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let check_status = check
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if check_status == "pass" {
+                continue;
+            }
+            surfaced += 1;
+            let id = check.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            let message = check
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            lines.push(format!("- {id}: {check_status} - {message}"));
+        }
+    }
+
+    if surfaced == 0 {
+        lines.push("- all checks passing".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn maybe_send_runtime_health_notification(
+    config: &NanoclawConfig,
+    args: &RuntimeHealthArgs,
+    health: &Value,
+) -> Result<Value> {
+    let Some(chat_jid) = args.notify_local.as_deref() else {
+        return Ok(json!({
+            "sent": false,
+            "reason": "not_configured",
+        }));
+    };
+
+    let status = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if status == "healthy" && !args.notify_always {
+        return Ok(json!({
+            "sent": false,
+            "reason": "healthy",
+            "chatJid": chat_jid,
+        }));
+    }
+
+    let channel = LocalChannel::new(&config.data_dir)?;
+    let envelope = channel.send_message(chat_jid, &runtime_health_alert_text(health))?;
+    Ok(json!({
+        "sent": true,
+        "chatJid": chat_jid,
+        "outboxId": envelope.id,
+        "timestamp": envelope.timestamp,
+    }))
+}
+
 fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
     let app = NanoclawApp::open(config)?;
     println!(
@@ -828,7 +1297,11 @@ fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
 
 fn print_runtime_health(config: NanoclawConfig, args: RuntimeHealthArgs) -> Result<()> {
     let app = NanoclawApp::open(config)?;
-    let health = runtime_health_json(&app, args.limit)?;
+    let mut health = runtime_health_json(&app, args.limit)?;
+    let notification = maybe_send_runtime_health_notification(&app.config, &args, &health)?;
+    if let Value::Object(fields) = &mut health {
+        fields.insert("notification".to_string(), notification);
+    }
     println!("{}", serde_json::to_string_pretty(&health)?);
     if args.strict && health.get("ok").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!("runtime health strict check failed");
@@ -915,6 +1388,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_runtime_state_limit() {
+        let mut args = vec!["--limit".to_string(), "4".to_string()].into_iter();
+        assert_eq!(parse_limit_args(&mut args, 10, "runtime state").unwrap(), 4);
+    }
+
+    #[test]
     fn parses_runtime_cleanup_apply() {
         let mut args = vec!["--apply".to_string()].into_iter();
         assert_eq!(
@@ -935,9 +1414,53 @@ mod tests {
             parse_runtime_health_args(&mut args).unwrap(),
             RuntimeHealthArgs {
                 limit: 3,
-                strict: true
+                strict: true,
+                notify_local: None,
+                notify_always: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_runtime_health_notification_target() {
+        let mut args = vec![
+            "--notify-local".to_string(),
+            "ops".to_string(),
+            "--notify-always".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_health_args(&mut args).unwrap(),
+            RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: true,
+            }
+        );
+    }
+
+    #[test]
+    fn task_complete_requires_manual_override() {
+        let mut args = vec!["task-1".to_string(), "done".to_string()].into_iter();
+        let error = parse_task_complete_args(&mut args).unwrap_err();
+
+        assert!(error.to_string().contains("requires --manual-override"));
+    }
+
+    #[test]
+    fn parses_task_complete_manual_override() {
+        let mut args = vec![
+            "--manual-override".to_string(),
+            "task-1".to_string(),
+            "operator".to_string(),
+            "verified".to_string(),
+        ]
+        .into_iter();
+        let parsed = parse_task_complete_args(&mut args).unwrap();
+
+        assert_eq!(parsed.task_id, "task-1");
+        assert_eq!(parsed.result.as_deref(), Some("operator verified"));
     }
 
     #[test]
@@ -1017,6 +1540,121 @@ mod tests {
         assert!(!pid_path.exists());
         Ok(())
     }
+
+    #[test]
+    fn runtime_health_notification_skips_healthy_report_by_default() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        let health = json!({
+            "ok": true,
+            "status": "healthy",
+            "summary": {
+                "passing": 1,
+                "warnings": 0,
+                "failing": 0,
+            },
+            "checks": [],
+        });
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+
+        assert_eq!(notification["sent"], false);
+        assert_eq!(notification["reason"], "healthy");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_notification_writes_local_outbox_when_requested() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        let health = json!({
+            "ok": false,
+            "status": "unhealthy",
+            "summary": {
+                "passing": 0,
+                "warnings": 0,
+                "failing": 1,
+            },
+            "checks": [{
+                "id": "webhook_auth",
+                "status": "fail",
+                "message": "webhook server is enabled without auth",
+            }],
+        });
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+        let channel = LocalChannel::new(&config.data_dir)?;
+        let outbox = channel.read_outbox()?;
+
+        assert_eq!(notification["sent"], true);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].chat_jid, "ops");
+        assert!(outbox[0]
+            .text
+            .contains("NanoClaw runtime health: unhealthy"));
+        assert!(outbox[0].text.contains("webhook_auth"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_reports_active_files_and_sidecars() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let app = NanoclawApp::open(config.clone())?;
+        let group = group_by_folder(&app, "main")?;
+        let session = ensure_cli_session(&app, &group)?;
+        let paths = ensure_session_sidecars(&session)?;
+        record_on_wake_message(&paths, &group, "wake")?;
+        let channel = LocalChannel::new(&config.data_dir)?;
+        channel.enqueue_inbound(LocalInboundEnvelope {
+            id: Some("local-in-1".to_string()),
+            chat_jid: "main".to_string(),
+            sender: "operator".to_string(),
+            sender_name: None,
+            content: "state probe".to_string(),
+            timestamp: Some("2026-05-20T00:00:00Z".to_string()),
+        })?;
+        channel.send_message("main", "state reply")?;
+
+        let state = runtime_state_json(&app, 5)?;
+
+        assert_eq!(state["ok"], true);
+        assert_eq!(state["centralDb"]["file"]["exists"], true);
+        assert_eq!(state["localChannel"]["inbox"]["jsonFiles"], 1);
+        assert_eq!(state["localChannel"]["outbox"]["jsonFiles"], 1);
+        assert_eq!(state["groupRoots"]["registeredTotal"], 1);
+        assert_eq!(state["sessionSidecars"]["linkedShown"], 1);
+        assert_eq!(
+            state["sessionSidecars"]["linkedItems"][0]["inboundDb"]["messagesIn"]["count"],
+            1
+        );
+        Ok(())
+    }
 }
 
 fn print_runtime_poll_summary(summary: super::runtime::RuntimePumpSummary) {
@@ -1083,6 +1721,11 @@ fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Re
             park_runtime(RuntimeServeProfile::Webhook);
         }
         RuntimeServeProfile::Pm => {
+            if !config.linear_legacy_enabled {
+                anyhow::bail!(
+                    "runtime pm profile is discontinued with Linear; set NANOCLAW_LINEAR_LEGACY_ENABLED=true only for controlled legacy migration"
+                );
+            }
             if config.linear_chat_jid.trim().is_empty() {
                 anyhow::bail!("runtime pm profile is disabled: set LINEAR_CHAT_JID");
             }
@@ -1524,6 +2167,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     .unwrap_or_else(|| "-".to_string())
             );
             println!("slack_poll_interval_ms: {}", config.slack_poll_interval_ms);
+            println!("linear_legacy_enabled: {}", config.linear_legacy_enabled);
             println!("linear_webhook_port: {}", config.linear_webhook_port);
             println!(
                 "observability_chat_jid: {}",
@@ -1600,6 +2244,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
             };
             match runtime_command.as_str() {
                 "status" => print_runtime_status(&config)?,
+                "state" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime state")?;
+                    print_runtime_state(config, limit)?;
+                }
                 "inspect" => {
                     let limit = parse_limit_args(&mut args, 10, "runtime inspect")?;
                     print_runtime_inspect(config, limit)?;
@@ -2335,27 +2983,15 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     println!("deleted: {}", task_id);
                 }
                 "complete" => {
-                    let Some(task_id) = args.next() else {
-                        print_usage();
-                        std::process::exit(2);
-                    };
-                    let result = args.collect::<Vec<_>>().join(" ");
-                    let updated = app.complete_task_run(
-                        &task_id,
-                        0,
-                        if result.trim().is_empty() {
-                            None
-                        } else {
-                            Some(result)
-                        },
-                        None,
-                    )?;
+                    let parsed = parse_task_complete_args(&mut args)?;
+                    let updated =
+                        app.complete_task_run_manual_override(&parsed.task_id, parsed.result)?;
                     if let Some(task) = updated {
                         println!("completed: {}", task.id);
                         println!("status: {}", task.status.as_str());
                         println!("next_run: {}", task.next_run.as_deref().unwrap_or("-"));
                     } else {
-                        println!("task_not_found: {}", task_id);
+                        println!("task_not_found: {}", parsed.task_id);
                     }
                 }
                 "run-due" => {
@@ -2503,6 +3139,11 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
             }
         }
         "linear" => {
+            if !config.linear_legacy_enabled {
+                anyhow::bail!(
+                    "Linear integration is discontinued for this Nexus runtime; set NANOCLAW_LINEAR_LEGACY_ENABLED=true only for controlled legacy migration"
+                );
+            }
             let Some(linear_command) = args.next() else {
                 print_usage();
                 std::process::exit(2);

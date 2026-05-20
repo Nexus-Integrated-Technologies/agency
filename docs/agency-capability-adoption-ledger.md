@@ -30,7 +30,7 @@ or clean-roomed into the active runtime.
 | `src/fpf/holon.rs`, `src/fpf/mereology.rs`, `src/fpf/aggregation.rs`, `src/fpf/kernel.rs` | `park-reference` then maybe `graveyard-holonic` | none until a concrete runtime contract needs them | Valuable conceptual source, but too broad for the immediate runtime. |
 | `src/fpf/cg_*`, `src/fpf/*_cal.rs`, `src/fpf/*_chr.rs`, `src/fpf/mvpk.rs`, `src/fpf/sota_pack.rs`, `src/fpf/tga.rs`, `src/fpf/uts.rs` | `park-reference` | none yet | Research/governance-rich material should not re-enter active code without a narrow runtime use. |
 | `src/orchestrator/planner.rs`, `src/orchestrator/router.rs`, `src/orchestrator/objective.rs`, `src/orchestrator/scheduler.rs`, `src/orchestrator/session.rs` | `assimilate-runtime` | `src/nanoclaw/{router,scheduler,runtime}.rs` plus `src/foundation/{planning,session}.rs` | These map directly to active NanoClaw operations. |
-| `src/orchestrator/supervisor.rs`, `src/orchestrator/healing.rs`, `src/orchestrator/homeostasis.rs`, `src/orchestrator/sensory.rs` | `assimilate-runtime` | `nanoclaw runtime status|inspect|health|cleanup|poll|serve|stop|reload` plus future alerting hooks | Keep the harness idea of a supervisor, not the old supervisor type. |
+| `src/orchestrator/supervisor.rs`, `src/orchestrator/healing.rs`, `src/orchestrator/homeostasis.rs`, `src/orchestrator/sensory.rs` | `assimilate-runtime` | `nanoclaw runtime status|inspect|health|cleanup|poll|serve|stop|reload` plus local health notifications | Keep the harness idea of a supervisor, not the old supervisor type. |
 | `src/orchestrator/budget.rs`, `src/orchestrator/optimal_info.rs`, `src/orchestrator/drr.rs`, `src/orchestrator/event_bus.rs` | `assimilate-runtime` | compute budgets, decision logs, event/audit stream | These support trustworthy autonomous execution and cost discipline. |
 | `src/orchestrator/a2a.rs`, `src/orchestrator/arti_a2a.rs`, `src/orchestrator/uap_grpc.rs`, `src/orchestrator/sns.rs` | `park-reference` | future inter-agent protocol lane | Useful later, but not on the critical path to Rust NanoClaw production. |
 | `src/orchestrator/metabolism.rs`, `src/orchestrator/sovereignty.rs`, `src/orchestrator/vault.rs` | `park-reference` | finance/identity/vault integrations only after explicit product need | Too broad to pull into runtime during collapse. |
@@ -64,13 +64,27 @@ or clean-roomed into the active runtime.
    evidence, and runtime errors record failed runs instead of completing through
    the error path. Direct swarm remote lanes now emit command verification,
    artifacts, and blockers, and built-in swarm lanes gate completion on valid
-   execution evidence. Remaining work is to extend the same contract to future
-   external adapter plugins as they are registered.
+   execution evidence. Unsupported worker backends and custom execution lanes
+   now produce failed evidence with blockers, and scheduled-task runtime loops
+   persist evidence before rejecting failed completion. Container worker
+   process failures now emit `worker_process` evidence with stdout/stderr
+   artifacts instead of opaque process errors, and remote-worker sync/command
+   failures now emit `remote_worker_process` evidence with remote boundaries.
+   Host worker daemon startup, socket write/shutdown, timeout, empty outcome,
+   and cancellation-before-evidence paths now emit `worker_transport`
+   evidence with the correct failed/timed-out/cancelled status. Manual CLI task
+   completion now requires an explicit `--manual-override`, keeping
+   execution-driven closure on the structured evidence path. Linear is parked
+   as a discontinued legacy integration and is disabled by default. Remaining
+   work is to extend the same contract to active Nexus/Paperclip/GitHub
+   writeback surfaces and future external adapter plugins as they are
+   registered.
 2. Runtime supervisor:
-   `nanoclaw runtime status|inspect|health|cleanup|poll|serve|stop|reload` now
-   owns the basic lifecycle surface with NanoClaw PID files, deterministic
-   health checks, and explicit stale-PID cleanup. Remaining work is to connect
-   the health output to operator alerting.
+   `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
+   now owns the basic lifecycle surface with NanoClaw PID files, deterministic
+   state inventory, health checks, local health notifications, and explicit
+   stale-PID cleanup. Remaining work is to connect health alerts to
+   remote/operator channels when those channels are configured.
 3. Tool contract: convert useful tools into typed runtime adapters with
    request-plane policy, approval gates, artifacts, and verification.
 4. Session memory: adopt episodic/history/compaction into session sidecars or

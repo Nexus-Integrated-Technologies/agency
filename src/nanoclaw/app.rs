@@ -172,7 +172,7 @@ impl NanoclawApp {
         self.db.delete_task(task_id)
     }
 
-    pub fn complete_task_run(
+    fn complete_task_run(
         &mut self,
         task_id: &str,
         duration_ms: i64,
@@ -205,6 +205,19 @@ impl NanoclawApp {
     ) -> Result<Option<ScheduledTask>> {
         validate_task_execution_completion_evidence(task_id, execution)?;
         self.complete_task_run(task_id, duration_ms, result, None)
+    }
+
+    pub fn complete_task_run_manual_override(
+        &mut self,
+        task_id: &str,
+        result: Option<String>,
+    ) -> Result<Option<ScheduledTask>> {
+        let result = result
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("Manual completion override: {value}"))
+            .unwrap_or_else(|| "Manual completion override.".to_string());
+        self.complete_task_run(task_id, 0, Some(result), None)
     }
 
     pub fn record_failed_task_run(
@@ -481,6 +494,7 @@ mod tests {
     use crate::nanoclaw::executor::{
         build_execution_evidence, BuildExecutionEvidenceInput, ExecutionArtifactRef,
         ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionResponse,
+        ExecutionVerificationRef,
     };
     use crate::nanoclaw::scheduler::TaskScheduleInput;
 
@@ -532,6 +546,12 @@ mod tests {
             location: Some("/tmp/exec.log".to_string()),
             body: None,
         });
+        evidence.verification.push(ExecutionVerificationRef {
+            kind: "test_verification".to_string(),
+            command: None,
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("test verification supplied".to_string()),
+        });
         response.evidence = Some(evidence);
         validate_task_execution_completion_evidence("task-1", &response)?;
         Ok(())
@@ -581,6 +601,7 @@ mod tests {
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),
@@ -693,6 +714,7 @@ mod tests {
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),
@@ -807,6 +829,7 @@ mod tests {
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),

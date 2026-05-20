@@ -47,6 +47,7 @@ pub struct NanoclawConfig {
     pub openclaw_gateway_execution_lane: ExecutionLane,
     pub slack_env_file: Option<PathBuf>,
     pub slack_poll_interval_ms: u64,
+    pub linear_legacy_enabled: bool,
     pub linear_webhook_port: u16,
     pub linear_webhook_secret: String,
     pub github_webhook_secret: String,
@@ -205,6 +206,7 @@ impl NanoclawConfig {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value >= 100)
             .unwrap_or(500);
+        let linear_legacy_enabled = env_bool("NANOCLAW_LINEAR_LEGACY_ENABLED").unwrap_or(false);
         let linear_webhook_port = env::var("LINEAR_WEBHOOK_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -370,6 +372,7 @@ impl NanoclawConfig {
             openclaw_gateway_execution_lane,
             slack_env_file,
             slack_poll_interval_ms,
+            linear_legacy_enabled,
             linear_webhook_port,
             linear_webhook_secret,
             github_webhook_secret,
@@ -422,4 +425,13 @@ impl NanoclawConfig {
             self.openclaw_gateway_public_host, self.openclaw_gateway_port
         ))
     }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name)
+        .ok()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            _ => false,
+        })
 }

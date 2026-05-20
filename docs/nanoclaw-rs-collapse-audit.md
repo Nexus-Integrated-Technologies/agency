@@ -179,6 +179,9 @@ Already active:
 - `runtime health` for deterministic checks over directories, PID file state,
   gateway/webhook auth posture, scheduled-task backlog, and recent execution
   evidence
+- `runtime health --notify-local <chat>` for local operator alerts when health
+  is degraded or unhealthy, with `--notify-always` available for explicit
+  heartbeat reporting
 - `runtime cleanup` for report-only stale/invalid PID-file cleanup, with
   mutation gated behind `--apply`
 
@@ -199,9 +202,11 @@ Current unified entrypoint:
   OpenClaw gateway readiness from one configuration model.
 - `nanoclaw runtime inspect` reports runtime counts, task distribution, recent
   tasks, and recent execution provenance for lifecycle inspection.
-- `nanoclaw runtime health --limit <n> [--strict]` reports operator health
-  checks without invoking model inference or legacy supervisor code; strict mode
-  exits nonzero when the report is unhealthy.
+- `nanoclaw runtime health --limit <n> [--strict] [--notify-local <chat>]`
+  reports operator health checks without invoking model inference or legacy
+  supervisor code; strict mode exits nonzero when the report is unhealthy, and
+  local notifications write to the NanoClaw local outbox only when attention is
+  needed unless `--notify-always` is set.
 - `nanoclaw runtime cleanup [--apply]` reports stale or invalid runtime PID
   files and removes only those files when explicitly applied.
 - `nanoclaw runtime poll` runs one local control-plane pump.
@@ -227,6 +232,9 @@ Already active:
   preserving the raw log artifact.
 - Local and Slack runtimes persist the envelope into `execution_evidence` and
   also emit operator artifacts.
+- Local and Slack scheduled-task paths persist execution provenance, logs, and
+  evidence before applying the completion gate, so failed structured evidence is
+  not discarded before the task is marked failed.
 - `nanoclaw runtime inspect` reports recent durable execution evidence beside
   recent provenance.
 - Swarm task results carry execution evidence in task metadata instead of
@@ -244,15 +252,36 @@ Already active:
   carry valid structured execution evidence before it can be marked completed.
 - Runtime task errors use a failed-run path, so missing/invalid execution
   evidence no longer reaches completed status through the generic error path.
+- Unsupported worker backends and unsupported custom execution lanes now return
+  failed execution evidence with blockers instead of only returning opaque
+  `Err` values.
+- Container worker process failures now return `worker_process` shell-mode
+  failed evidence with stdout/stderr in the log artifact and a
+  `worker_process_error` blocker before completion is rejected.
+- Remote-worker project sync, workspace sync, command failure, and invalid
+  worker response paths now return `remote_worker_process` shell-mode failed
+  evidence with the remote boundary preserved.
+- Host worker daemon startup, socket write/shutdown, request timeout, empty
+  outcome, and cancellation-before-evidence paths now return structured
+  `worker_transport` evidence with `failed`, `timed_out`, or `cancelled`
+  status before the run reaches closure validation.
+- The `nanoclaw task complete` operator command now requires
+  `--manual-override` and records a manual completion override, while
+  execution-driven completion remains gated through structured execution
+  evidence.
+- Linear is no longer an active issue/writeback surface for this instance.
+  Legacy Linear CLI and webhook paths are disabled by default and require
+  `NANOCLAW_LINEAR_LEGACY_ENABLED=true` only for controlled migration/reference
+  use.
 
 Remaining work:
 
-- Thread the same closure gate into every issue/writeback surface outside the
-  local scheduled-task path.
+- Thread the same closure gate into active Nexus/Paperclip/GitHub issue and
+  writeback surfaces that can transition work states.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
-- Extend failure paths so nonzero shell, timeout, and cancelled runs return
-  structured blockers even when the adapter exits with an error.
+- Extend this transport/error normalization to future external adapter plugins
+  as they are registered.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 
@@ -270,13 +299,15 @@ Already active:
 - per-session sidecar `inbound.db` and `outbound.db`
 - group runtime config
 - destination projection records
+- `nanoclaw runtime state --limit <n>` reports the active central DB, runtime
+  roots, local inbox/outbox/processed directories, linked session sidecars,
+  orphan session directories, group roots, and queued task counts without
+  deleting or migrating anything.
 
 Remaining work:
 
 - Decide which old stores under `store/`, `data/`, `.fastembed_cache/`, and
   legacy memory paths should be ignored, migrated, or deleted.
-- Add a state-inspection command that reports the active central DB, session
-  sidecars, group roots, outbox, and queued tasks.
 - Add a migration/cleanup command for stale local state that does not touch
   active production controller data without an explicit operator action.
 

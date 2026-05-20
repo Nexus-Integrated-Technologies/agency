@@ -196,6 +196,7 @@ mod tests {
             openclaw_gateway_execution_lane: ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),

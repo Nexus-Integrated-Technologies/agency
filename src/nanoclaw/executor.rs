@@ -281,7 +281,7 @@ impl ExecutionEvidenceMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionEvidenceStatus {
     Succeeded,
@@ -400,16 +400,6 @@ pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> Execu
         input.log_body,
         input.metadata,
     );
-    let verification = if input.verification.is_empty() {
-        vec![ExecutionVerificationRef {
-            kind: "adapter_status".to_string(),
-            command: None,
-            status: input.status.as_str().to_string(),
-            summary: input.metadata.and_then(|metadata| metadata.summary.clone()),
-        }]
-    } else {
-        input.verification
-    };
     let workspace_exists = input
         .workspace_root
         .map(|root| Path::new(root).exists())
@@ -431,12 +421,26 @@ pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> Execu
         git: collect_git_evidence(input.workspace_root),
         boundary: input.boundary.clone(),
         artifacts,
-        verification,
+        verification: input.verification,
         blockers: input.blockers,
         provenance_id: input.provenance_id.map(str::to_string),
         external_run_id: input
             .metadata
             .and_then(|metadata| metadata.external_run_id.clone()),
+    }
+}
+
+fn status_verification(
+    kind: &str,
+    command: Option<String>,
+    status: ExecutionEvidenceStatus,
+    summary: Option<String>,
+) -> ExecutionVerificationRef {
+    ExecutionVerificationRef {
+        kind: kind.to_string(),
+        command,
+        status: status.as_str().to_string(),
+        summary,
     }
 }
 
@@ -689,18 +693,92 @@ impl ExecutorBoundary for RustSubprocessExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
         let payload = build_worker_request(request);
-        let mut stream = self.connect_or_start_daemon(&payload.session)?;
-        write_json(&mut stream, &payload)?;
-        stream
+        let mut stream = match self.connect_or_start_daemon(&payload.session) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Ok(build_worker_transport_failure_response(
+                    &payload,
+                    "worker_transport",
+                    "worker_daemon_start_error",
+                    &format!("failed to start or connect to worker daemon: {error}"),
+                    ExecutionEvidenceStatus::Failed,
+                    "",
+                    "",
+                    ExecutionLocation::Host,
+                    ExecutionBoundaryKind::Host,
+                ));
+            }
+        };
+        if let Err(error) = write_json(&mut stream, &payload) {
+            return Ok(build_worker_transport_failure_response(
+                &payload,
+                "worker_transport",
+                "worker_socket_write_error",
+                &format!("failed to write worker request over daemon socket: {error}"),
+                ExecutionEvidenceStatus::Failed,
+                "",
+                "",
+                ExecutionLocation::Host,
+                ExecutionBoundaryKind::Host,
+            ));
+        }
+        if let Err(error) = stream
             .shutdown(Shutdown::Write)
-            .context("failed to close worker socket write side")?;
-        let outcome: WorkerOutcome = read_json(&mut stream).with_context(|| {
-            format!(
-                "worker did not return a payload before the request timeout ({} ms); set NANOCLAW_WORKER_REQUEST_TIMEOUT_MS higher for long local jobs",
-                worker_request_timeout().as_millis()
-            )
-        })?;
-        decode_worker_outcome(outcome)
+            .context("failed to close worker socket write side")
+        {
+            return Ok(build_worker_transport_failure_response(
+                &payload,
+                "worker_transport",
+                "worker_socket_shutdown_error",
+                &error.to_string(),
+                ExecutionEvidenceStatus::Failed,
+                "",
+                "",
+                ExecutionLocation::Host,
+                ExecutionBoundaryKind::Host,
+            ));
+        }
+        let outcome: WorkerOutcome = match read_json(&mut stream) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let status = if is_timeout_like_error(&error) {
+                    ExecutionEvidenceStatus::TimedOut
+                } else {
+                    ExecutionEvidenceStatus::Failed
+                };
+                let blocker_kind = if matches!(status, ExecutionEvidenceStatus::TimedOut) {
+                    "worker_request_timeout"
+                } else {
+                    "worker_response_error"
+                };
+                let message = if matches!(status, ExecutionEvidenceStatus::TimedOut) {
+                    format!(
+                        "worker did not return a payload before the request timeout ({} ms); set NANOCLAW_WORKER_REQUEST_TIMEOUT_MS higher for long local jobs: {error}",
+                        worker_request_timeout().as_millis()
+                    )
+                } else {
+                    format!("failed to read worker response over daemon socket: {error}")
+                };
+                return Ok(build_worker_transport_failure_response(
+                    &payload,
+                    "worker_transport",
+                    blocker_kind,
+                    &message,
+                    status,
+                    "",
+                    "",
+                    ExecutionLocation::Host,
+                    ExecutionBoundaryKind::Host,
+                ));
+            }
+        };
+        Ok(decode_worker_outcome_with_context(
+            outcome,
+            &payload,
+            "worker_transport",
+            ExecutionLocation::Host,
+            ExecutionBoundaryKind::Host,
+        ))
     }
 }
 
@@ -846,9 +924,14 @@ impl ExecutorBoundary for ExecutionLaneRouter {
             ExecutionLane::Container => self.container.execute(request),
             ExecutionLane::RemoteWorker => self.remote.execute(request),
             ExecutionLane::Omx => self.omx.execute(request),
-            ExecutionLane::Custom(value) => {
-                bail!("unsupported execution lane '{}'", value)
-            }
+            ExecutionLane::Custom(value) => Ok(build_blocked_execution_response(
+                &request,
+                "execution_lane",
+                ExecutionEvidenceMode::Code,
+                format!("unsupported execution lane '{}'", value).as_str(),
+                None,
+                None,
+            )),
         }?;
         validate_execution_response_evidence(&response)?;
         Ok(response)
@@ -951,6 +1034,9 @@ impl ExecutorBoundary for ContainerExecutor {
             root: Some(payload.session.workspace_root.clone()),
             isolated: true,
         };
+        if let Some(evidence) = response.evidence.as_mut() {
+            evidence.boundary = response.boundary.clone();
+        }
         Ok(response)
     }
 }
@@ -979,13 +1065,36 @@ impl RemoteWorkerExecutor {
 impl ExecutorBoundary for RemoteWorkerExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
-        self.dev_environment.sync_project()?;
-        self.dev_environment.sync_group_workspace(
-            Path::new(&request.session.workspace_root),
-            &request.group.folder,
-        )?;
-
+        let local_workspace_root = request.session.workspace_root.clone();
+        let group_folder = request.group.folder.clone();
         let payload = build_worker_request(remoteize_request(&self.remote_worker_root, request));
+        if let Err(error) = self.dev_environment.sync_project() {
+            return Ok(build_worker_process_failure_response(
+                &payload,
+                "remote_worker_process",
+                "remote worker project sync",
+                &format!("failed to sync project to remote worker: {error}"),
+                "",
+                "",
+                ExecutionLocation::RemoteWorker,
+                ExecutionBoundaryKind::RemoteWorker,
+            ));
+        }
+        if let Err(error) = self
+            .dev_environment
+            .sync_group_workspace(Path::new(&local_workspace_root), &group_folder)
+        {
+            return Ok(build_worker_process_failure_response(
+                &payload,
+                "remote_worker_process",
+                "remote worker workspace sync",
+                &format!("failed to sync group workspace to remote worker: {error}"),
+                "",
+                "",
+                ExecutionLocation::RemoteWorker,
+                ExecutionBoundaryKind::RemoteWorker,
+            ));
+        }
         let command = format!(
             "if [ -x {binary} ]; then NANOCLAW_EXECUTION_LOCATION=remote_worker {binary} exec-worker-stdio; else NANOCLAW_EXECUTION_LOCATION=remote_worker cargo run --quiet --manifest-path {manifest} --bin nanoclaw -- exec-worker-stdio; fi",
             binary = shell_quote(&self.remote_worker_binary),
@@ -993,15 +1102,51 @@ impl ExecutorBoundary for RemoteWorkerExecutor {
         );
         let stdin =
             serde_json::to_vec(&payload).context("failed to encode remote worker request")?;
-        let result = self.dev_environment.exec_with_stdin(&command, &stdin)?;
-        let outcome: WorkerOutcome = serde_json::from_str(&result.stdout)
-            .context("failed to parse remote worker response")?;
-        let mut response = decode_worker_outcome(outcome)?;
+        let result = match self.dev_environment.exec_with_stdin(&command, &stdin) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(build_worker_process_failure_response(
+                    &payload,
+                    "remote_worker_process",
+                    &command,
+                    &format!("remote worker command failed: {error}"),
+                    "",
+                    "",
+                    ExecutionLocation::RemoteWorker,
+                    ExecutionBoundaryKind::RemoteWorker,
+                ));
+            }
+        };
+        let outcome: WorkerOutcome = match serde_json::from_str(&result.stdout) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(build_worker_process_failure_response(
+                    &payload,
+                    "remote_worker_process",
+                    &command,
+                    &format!("failed to parse remote worker response: {error}"),
+                    result.stdout.trim(),
+                    "",
+                    ExecutionLocation::RemoteWorker,
+                    ExecutionBoundaryKind::RemoteWorker,
+                ));
+            }
+        };
+        let mut response = decode_worker_outcome_with_context(
+            outcome,
+            &payload,
+            "remote_worker_process",
+            ExecutionLocation::RemoteWorker,
+            ExecutionBoundaryKind::RemoteWorker,
+        );
         response.boundary = ExecutionBoundary {
             kind: ExecutionBoundaryKind::RemoteWorker,
             root: Some(payload.session.workspace_root.clone()),
             isolated: true,
         };
+        if let Some(evidence) = response.evidence.as_mut() {
+            evidence.boundary = response.boundary.clone();
+        }
         Ok(response)
     }
 }
@@ -1174,11 +1319,12 @@ impl ExecutorBoundary for OmxExecutor {
         } else {
             Vec::new()
         };
+        let evidence_status = omx_status_to_evidence_status(&response.status);
         let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
             adapter_type: "omx",
             mode: ExecutionEvidenceMode::Gateway,
             run_id: external_run_id.as_deref().unwrap_or(session_id.as_str()),
-            status: omx_status_to_evidence_status(&response.status),
+            status: evidence_status,
             session_id: session_id.as_str(),
             group_folder: Some(request.group.folder.as_str()),
             workspace_root: Some(response.workspace_root.as_str()),
@@ -1187,7 +1333,12 @@ impl ExecutorBoundary for OmxExecutor {
             log_body: log_body.as_deref(),
             metadata: Some(&metadata),
             provenance_id: Some(provenance.id.as_str()),
-            verification: Vec::new(),
+            verification: vec![status_verification(
+                "omx_session_status",
+                None,
+                evidence_status,
+                Some(response.summary.clone()),
+            )],
             blockers,
         });
 
@@ -1258,7 +1409,12 @@ impl ExecutorBoundary for InProcessEchoExecutor {
             log_body: None,
             metadata: None,
             provenance_id: None,
-            verification: Vec::new(),
+            verification: vec![status_verification(
+                "in_process_response",
+                None,
+                ExecutionEvidenceStatus::Succeeded,
+                Some("in-process advisory response generated".to_string()),
+            )],
             blockers: Vec::new(),
         });
 
@@ -1641,7 +1797,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 None,
             ),
             WorkerBackend::Custom(value) => {
-                bail!("unsupported worker backend '{}'", value)
+                Err(anyhow::anyhow!("unsupported worker backend '{}'", value))
             }
         }
     };
@@ -1721,6 +1877,28 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 isolated: true,
             };
             let log_path_string = log_path.display().to_string();
+            let verification = request
+                .script
+                .as_ref()
+                .map(|script| {
+                    vec![status_verification(
+                        "command",
+                        Some(script.clone()),
+                        ExecutionEvidenceStatus::Succeeded,
+                        Some("host command completed successfully".to_string()),
+                    )]
+                })
+                .unwrap_or_else(|| {
+                    vec![status_verification(
+                        "backend_response",
+                        None,
+                        ExecutionEvidenceStatus::Succeeded,
+                        Some(format!(
+                            "{} backend returned a successful response",
+                            result.metadata.backend.as_str()
+                        )),
+                    )]
+                });
             let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
                 adapter_type: result.metadata.backend.as_str(),
                 mode: execution_mode_for_backend(
@@ -1737,18 +1915,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 log_body: Some(result.log_body.as_str()),
                 metadata: Some(&execution_metadata),
                 provenance_id: Some(provenance.id.as_str()),
-                verification: request
-                    .script
-                    .as_ref()
-                    .map(|script| {
-                        vec![ExecutionVerificationRef {
-                            kind: "command".to_string(),
-                            command: Some(script.clone()),
-                            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
-                            summary: Some("host command completed successfully".to_string()),
-                        }]
-                    })
-                    .unwrap_or_default(),
+                verification,
                 blockers: Vec::new(),
             });
             Ok(WorkerResponse {
@@ -1763,25 +1930,288 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
             })
         }
         Err(error) => {
+            let error_text = error.to_string();
             let _ = session_store.save(&session_state);
             let log_body = format!(
                 "invocation_id={}\nsession_id={}\nworkspace={}\nstatus=error\nerror={}\n",
-                request.invocation_id, request.session.id, request.session.workspace_root, error
+                request.invocation_id,
+                request.session.id,
+                request.session.workspace_root,
+                error_text
             );
-            let _ = fs::write(&log_path, log_body);
+            let _ = fs::write(&log_path, &log_body);
             let _ = append_history_entry(
                 &history_path,
                 SessionHistoryEntry {
-                    invocation_id: request.invocation_id,
-                    requested_at: request.requested_at,
+                    invocation_id: request.invocation_id.clone(),
+                    requested_at: request.requested_at.clone(),
                     message_count: request.messages.len(),
                     prompt_bytes: request.prompt.len(),
-                    script: request.script,
+                    script: request.script.clone(),
                     success: false,
                 },
             );
-            Err(error)
+            Ok(build_blocked_worker_response(
+                &request,
+                &resolved_backend.backend,
+                &error_text,
+                log_path.as_path(),
+                log_body,
+                Some(compact_session_state(&session_state, 6)),
+                execution_location,
+            ))
         }
+    }
+}
+
+fn build_blocked_execution_response(
+    request: &ExecutionRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    message: &str,
+    log_path: Option<&Path>,
+    log_body: Option<&str>,
+) -> ExecutionResponse {
+    let boundary = ExecutionBoundary {
+        kind: ExecutionBoundaryKind::Host,
+        root: Some(request.session.workspace_root.clone()),
+        isolated: true,
+    };
+    let metadata = ExecutionMetadata {
+        backend: Some(adapter_type.to_string()),
+        routing_decision: request.routing_decision.clone(),
+        objective: request.objective.clone(),
+        plan: request.plan.clone(),
+        gate_evaluation: request.gate_evaluation.clone(),
+        status: Some(ExecutionEvidenceStatus::Failed.as_str().to_string()),
+        summary: Some(message.to_string()),
+        ..Default::default()
+    };
+    let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type,
+        mode,
+        run_id: request
+            .task_id
+            .as_deref()
+            .unwrap_or(request.session.id.as_str()),
+        status: ExecutionEvidenceStatus::Failed,
+        session_id: request.session.id.as_str(),
+        group_folder: Some(request.session.group_folder.as_str()),
+        workspace_root: Some(request.session.workspace_root.as_str()),
+        boundary: &boundary,
+        log_path: log_path.and_then(|path| path.to_str()),
+        log_body,
+        metadata: Some(&metadata),
+        provenance_id: None,
+        verification: vec![status_verification(
+            "blocked_before_execution",
+            None,
+            ExecutionEvidenceStatus::Failed,
+            Some(message.to_string()),
+        )],
+        blockers: vec![ExecutionBlockerRef {
+            kind: "unsupported_execution_lane".to_string(),
+            source: Some(adapter_type.to_string()),
+            message: message.to_string(),
+        }],
+    });
+
+    ExecutionResponse {
+        text: format!("Execution blocked: {message}"),
+        boundary,
+        session_id: request.session.id.clone(),
+        log_path: log_path.map(|path| path.display().to_string()),
+        log_body: log_body.map(str::to_string),
+        provenance: None,
+        metadata: Some(metadata),
+        evidence: Some(evidence),
+    }
+}
+
+fn build_blocked_worker_response(
+    request: &WorkerRequest,
+    backend: &WorkerBackend,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+) -> WorkerResponse {
+    build_blocked_worker_response_with_context(
+        request,
+        backend.as_str(),
+        execution_mode_for_backend(backend, request.script.is_some()),
+        run_kind_for_backend(backend, request.script.is_some()),
+        "adapter_error",
+        message,
+        log_path,
+        log_body,
+        session_state,
+        execution_location,
+        ExecutionBoundaryKind::Host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_blocked_worker_response_with_context(
+    request: &WorkerRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    run_kind: ExecutionRunKind,
+    blocker_kind: &str,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> WorkerResponse {
+    build_blocked_worker_response_with_status(
+        request,
+        adapter_type,
+        mode,
+        run_kind,
+        blocker_kind,
+        message,
+        log_path,
+        log_body,
+        session_state,
+        execution_location,
+        boundary_kind,
+        ExecutionEvidenceStatus::Failed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_blocked_worker_response_with_status(
+    request: &WorkerRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    run_kind: ExecutionRunKind,
+    blocker_kind: &str,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+    status: ExecutionEvidenceStatus,
+) -> WorkerResponse {
+    let completed_at = Utc::now().to_rfc3339();
+    let boundary = ExecutionBoundary {
+        kind: boundary_kind,
+        root: Some(request.session.workspace_root.clone()),
+        isolated: true,
+    };
+    let task_signature = request.task_signature.clone();
+    let boundary_claims = request.boundary_claims.clone();
+    let gate_evaluation = request.gate_evaluation.clone();
+    let assurance = task_signature.as_ref().map(|signature| {
+        derive_assurance(
+            adapter_type,
+            signature,
+            gate_evaluation.as_ref(),
+            request.script.is_some(),
+        )
+    });
+    let symbol_carriers =
+        derive_symbol_carriers(&request.invocation_id, &request.session, Some(log_path));
+    let provenance_edges =
+        derive_provenance_edges(&request.invocation_id, &symbol_carriers, &boundary_claims);
+    let provenance = build_execution_provenance_record(BuildExecutionProvenanceInput {
+        id: request.invocation_id.clone(),
+        run_kind,
+        group_folder: request.session.group_folder.clone(),
+        chat_jid: Some(request.group.jid.clone()),
+        execution_location,
+        request_plane: request.request_plane.clone(),
+        effective_capabilities: derive_capability_manifest(
+            &request.request_plane,
+            DeriveCapabilityManifestInput::default(),
+        ),
+        project_environment_id: None,
+        mount_summary: vec![ExecutionMountSummaryEntry {
+            host_path: Some(request.session.workspace_root.clone()),
+            container_path: None,
+            readonly: false,
+            kind: ExecutionMountKind::Project,
+        }],
+        secret_handles_used: Vec::new(),
+        fallback_reason: Some("execution_blocked".to_string()),
+        sync_scope: None,
+        task_signature,
+        boundary_claims,
+        gate_evaluation: gate_evaluation.clone(),
+        assurance: assurance.clone(),
+        symbol_carriers,
+        provenance_edges,
+        status: ExecutionStatus::Error,
+        created_at: request.requested_at.clone(),
+        updated_at: completed_at.clone(),
+        completed_at: Some(completed_at),
+    });
+    let metadata = ExecutionMetadata {
+        backend: Some(adapter_type.to_string()),
+        routing_decision: request.routing_decision.clone(),
+        objective: request.objective.clone(),
+        plan: request.plan.clone(),
+        session_state,
+        gate_evaluation,
+        assurance,
+        status: Some(status.as_str().to_string()),
+        summary: Some(message.to_string()),
+        ..Default::default()
+    };
+    let log_path_string = log_path.display().to_string();
+    let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type,
+        mode,
+        run_id: request.invocation_id.as_str(),
+        status,
+        session_id: request.session.id.as_str(),
+        group_folder: Some(request.session.group_folder.as_str()),
+        workspace_root: Some(request.session.workspace_root.as_str()),
+        boundary: &boundary,
+        log_path: Some(log_path_string.as_str()),
+        log_body: Some(log_body.as_str()),
+        metadata: Some(&metadata),
+        provenance_id: Some(provenance.id.as_str()),
+        verification: vec![status_verification(
+            "worker_blocked_before_execution",
+            None,
+            status,
+            Some(message.to_string()),
+        )],
+        blockers: vec![ExecutionBlockerRef {
+            kind: blocker_kind.to_string(),
+            source: Some(adapter_type.to_string()),
+            message: message.to_string(),
+        }],
+    });
+
+    let status_label = status.as_str().replace('_', " ");
+    WorkerResponse {
+        text: format!("Execution {status_label}: {message}"),
+        boundary,
+        session_id: request.session.id.clone(),
+        log_path: Some(log_path_string),
+        log_body: Some(log_body),
+        provenance: Some(provenance),
+        metadata: Some(metadata),
+        evidence: Some(evidence),
+    }
+}
+
+fn blocked_worker_response_into_execution_response(response: WorkerResponse) -> ExecutionResponse {
+    ExecutionResponse {
+        text: response.text,
+        boundary: response.boundary,
+        session_id: response.session_id,
+        log_path: response.log_path,
+        log_body: response.log_body,
+        provenance: response.provenance,
+        metadata: response.metadata,
+        evidence: response.evidence,
     }
 }
 
@@ -1825,50 +2255,227 @@ fn build_worker_request(request: ExecutionRequest) -> WorkerRequest {
     }
 }
 
-fn decode_worker_outcome(outcome: WorkerOutcome) -> Result<ExecutionResponse> {
-    let response = match (outcome.response, outcome.error) {
-        (Some(response), None) => response,
-        (_, Some(error)) => bail!("worker execution failed: {}", error),
-        _ => bail!("worker returned an empty response"),
-    };
-
-    Ok(ExecutionResponse {
-        text: response.text,
-        boundary: response.boundary,
-        session_id: response.session_id,
-        log_path: response.log_path,
-        log_body: response.log_body,
-        provenance: response.provenance,
-        metadata: response.metadata,
-        evidence: response.evidence,
-    })
+fn decode_worker_outcome_with_context(
+    outcome: WorkerOutcome,
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> ExecutionResponse {
+    match (outcome.response, outcome.error) {
+        (Some(response), None) => blocked_worker_response_into_execution_response(response),
+        (_, Some(error)) => {
+            let status = classify_worker_outcome_error_status(&error);
+            let blocker_kind = classify_worker_outcome_blocker_kind(&error, &status);
+            build_worker_transport_failure_response(
+                payload,
+                adapter_type,
+                blocker_kind,
+                &format!("worker execution failed before returning evidence: {error}"),
+                status,
+                "",
+                "",
+                execution_location,
+                boundary_kind,
+            )
+        }
+        _ => build_worker_transport_failure_response(
+            payload,
+            adapter_type,
+            "worker_empty_response",
+            "worker returned an empty response before producing execution evidence",
+            ExecutionEvidenceStatus::Failed,
+            "",
+            "",
+            execution_location,
+            boundary_kind,
+        ),
+    }
 }
 
 fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<ExecutionResponse> {
     let stdin = serde_json::to_vec(payload).context("failed to encode worker request")?;
-    let output = command
+    let command_description = describe_command(command);
+    let output = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to spawn {}", describe_command(command)))?;
-    let output = write_and_wait_for_output(output, &stdin, command)?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(build_worker_process_failure_response(
+                payload,
+                "worker_process",
+                &command_description,
+                &format!("failed to spawn {command_description}: {error}"),
+                "",
+                "",
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
+            ));
+        }
+    };
+    let output = match write_and_wait_for_output(output, &stdin, command) {
+        Ok(output) => output,
+        Err(error) => {
+            return Ok(build_worker_process_failure_response(
+                payload,
+                "worker_process",
+                &command_description,
+                &error.to_string(),
+                "",
+                "",
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
+            ));
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "{} exited with status {}{}",
-            describe_command(command),
-            output.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok(build_worker_process_failure_response(
+            payload,
+            "worker_process",
+            &command_description,
+            &format!(
+                "{} exited with status {}{}",
+                command_description,
+                output.status,
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            ),
+            &stdout,
+            &stderr,
+            ExecutionLocation::LocalContainer,
+            ExecutionBoundaryKind::Container,
+        ));
     }
-    let outcome: WorkerOutcome =
-        serde_json::from_slice(&output.stdout).context("failed to parse worker outcome")?;
-    decode_worker_outcome(outcome)
+    let outcome: WorkerOutcome = match serde_json::from_slice(&output.stdout) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(build_worker_transport_failure_response(
+                payload,
+                "worker_process",
+                "worker_response_parse_error",
+                &format!("failed to parse worker outcome: {error}"),
+                ExecutionEvidenceStatus::Failed,
+                &stdout,
+                &stderr,
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
+            ));
+        }
+    };
+    Ok(decode_worker_outcome_with_context(
+        outcome,
+        payload,
+        "worker_process",
+        ExecutionLocation::LocalContainer,
+        ExecutionBoundaryKind::Container,
+    ))
+}
+
+fn build_worker_process_failure_response(
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    command_description: &str,
+    message: &str,
+    stdout: &str,
+    stderr: &str,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> ExecutionResponse {
+    build_worker_failure_response(
+        payload,
+        adapter_type,
+        "worker_process_error",
+        command_description,
+        message,
+        stdout,
+        stderr,
+        ExecutionEvidenceStatus::Failed,
+        execution_location,
+        boundary_kind,
+        "process",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_worker_transport_failure_response(
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    blocker_kind: &str,
+    message: &str,
+    status: ExecutionEvidenceStatus,
+    stdout: &str,
+    stderr: &str,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> ExecutionResponse {
+    build_worker_failure_response(
+        payload,
+        adapter_type,
+        blocker_kind,
+        adapter_type,
+        message,
+        stdout,
+        stderr,
+        status,
+        execution_location,
+        boundary_kind,
+        "transport",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_worker_failure_response(
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    blocker_kind: &str,
+    command_description: &str,
+    message: &str,
+    stdout: &str,
+    stderr: &str,
+    status: ExecutionEvidenceStatus,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+    log_suffix: &str,
+) -> ExecutionResponse {
+    let log_path = Path::new(&payload.session.logs_root)
+        .join(format!("{}.{}.log", payload.invocation_id, log_suffix));
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\nstatus=error\ncommand={}\nerror={}\nstdout={}\nstderr={}\n",
+        payload.invocation_id,
+        payload.session.id,
+        payload.session.workspace_root,
+        command_description,
+        message,
+        stdout,
+        stderr
+    );
+    let _ = fs::create_dir_all(Path::new(&payload.session.logs_root));
+    let _ = fs::write(&log_path, &log_body);
+    let response = build_blocked_worker_response_with_status(
+        payload,
+        adapter_type,
+        ExecutionEvidenceMode::Shell,
+        ExecutionRunKind::Custom(adapter_type.to_string()),
+        blocker_kind,
+        message,
+        log_path.as_path(),
+        log_body,
+        None,
+        execution_location,
+        boundary_kind,
+        status,
+    );
+    blocked_worker_response_into_execution_response(response)
 }
 
 fn write_and_wait_for_output(
@@ -1899,6 +2506,51 @@ fn describe_command(command: &Command) -> String {
         program
     } else {
         format!("{} {}", program, args.join(" "))
+    }
+}
+
+fn is_timeout_like_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            })
+    })
+}
+
+fn classify_worker_outcome_error_status(error: &str) -> ExecutionEvidenceStatus {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timed out") || normalized.contains("timeout") {
+        ExecutionEvidenceStatus::TimedOut
+    } else if normalized.contains("cancelled")
+        || normalized.contains("canceled")
+        || normalized.contains("cancel")
+    {
+        ExecutionEvidenceStatus::Cancelled
+    } else {
+        ExecutionEvidenceStatus::Failed
+    }
+}
+
+fn classify_worker_outcome_blocker_kind(
+    error: &str,
+    status: &ExecutionEvidenceStatus,
+) -> &'static str {
+    match status {
+        ExecutionEvidenceStatus::TimedOut => "worker_outcome_timeout",
+        ExecutionEvidenceStatus::Cancelled => "worker_outcome_cancelled",
+        ExecutionEvidenceStatus::Failed | ExecutionEvidenceStatus::Succeeded => {
+            let normalized = error.to_ascii_lowercase();
+            if normalized.contains("empty response") {
+                "worker_empty_response"
+            } else {
+                "worker_outcome_error"
+            }
+        }
     }
 }
 
@@ -4466,28 +5118,30 @@ mod tests {
 
     use crate::foundation::CapabilityManifest;
     use crate::foundation::{
-        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, Group, MessageRecord,
-        RemoteWorkerMode, RequestPlane,
+        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, ExecutionLocation,
+        ExecutionStatus, Group, MessageRecord, RemoteWorkerMode, RequestPlane,
     };
     use crate::nanoclaw::config::NanoclawConfig;
     use crate::nanoclaw::model_router::WorkerBackend;
 
     use super::{
         build_azure_openai_chat_target, build_execution_evidence, build_execution_metadata,
-        build_execution_session, build_github_copilot_command, collect_git_evidence,
-        connect_to_worker_socket, default_codex_sandbox_for_request,
-        detect_paperclip_control_plane_blocker, execute_worker_request, extract_azure_openai_text,
-        is_codex_usage_limit_error, normalize_azure_openai_fallback_backend, normalize_branch_name,
-        normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
-        parse_git_status_porcelain, read_json, resolve_container_image,
+        build_execution_session, build_github_copilot_command,
+        build_worker_process_failure_response, build_worker_transport_failure_response,
+        collect_git_evidence, connect_to_worker_socket, decode_worker_outcome_with_context,
+        default_codex_sandbox_for_request, detect_paperclip_control_plane_blocker,
+        execute_worker_request, extract_azure_openai_text, is_codex_usage_limit_error,
+        normalize_azure_openai_fallback_backend, normalize_branch_name, normalize_github_repo_ref,
+        parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
+        parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
         run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
         should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
         write_json, BackendExecutionMetadata, BackendExecutionResult, BuildExecutionEvidenceInput,
         ContainerExecutor, DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
         ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
-        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
-        GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor,
-        RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutionVerificationRef,
+        ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor,
+        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
         EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
 
@@ -4616,7 +5270,12 @@ mod tests {
             log_body: Some("status=ok"),
             metadata: Some(&metadata),
             provenance_id: Some("exec-1"),
-            verification: Vec::new(),
+            verification: vec![ExecutionVerificationRef {
+                kind: "test_verification".to_string(),
+                command: None,
+                status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+                summary: Some("test verification supplied".to_string()),
+            }],
             blockers: Vec::new(),
         });
 
@@ -4625,6 +5284,7 @@ mod tests {
         assert_eq!(evidence.mode, ExecutionEvidenceMode::Code);
         assert_eq!(evidence.workspace.group_folder.as_deref(), Some("main"));
         assert!(evidence.workspace.exists);
+        assert_eq!(evidence.verification[0].kind, "test_verification");
         assert_eq!(evidence.verification[0].status, "succeeded");
         assert_eq!(
             evidence.artifacts[0].location.as_deref(),
@@ -4675,6 +5335,12 @@ mod tests {
             title: "log".to_string(),
             location: Some("/tmp/exec.log".to_string()),
             body: None,
+        });
+        evidence.verification.push(ExecutionVerificationRef {
+            kind: "test_verification".to_string(),
+            command: None,
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("test verification supplied".to_string()),
         });
         response.evidence = Some(evidence);
         validate_execution_response_evidence(&response).unwrap();
@@ -5074,6 +5740,273 @@ mod tests {
     }
 
     #[test]
+    fn worker_backend_errors_return_structured_failed_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("CLAUDE.md"), "# Andy\n").unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+
+        let request = WorkerRequest {
+            invocation_id: "exec-blocked".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: Some(WorkerBackend::Custom("missing-adapter".to_string())),
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = execute_worker_request(request).unwrap();
+        assert!(response
+            .text
+            .contains("unsupported worker backend 'missing-adapter'"));
+        let evidence = response.evidence.as_ref().expect("worker emits evidence");
+        assert_eq!(evidence.adapter_type, "missing-adapter");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Code);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.run_id, "exec-blocked");
+        assert_eq!(evidence.blockers[0].kind, "adapter_error");
+        assert!(Path::new(response.log_path.as_deref().unwrap()).exists());
+        assert!(response
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| matches!(provenance.status, ExecutionStatus::Error)));
+    }
+
+    #[test]
+    fn worker_process_failures_return_structured_failed_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-process-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf stdout; printf stderr >&2; exit 42");
+
+        let response = run_worker_command(&mut command, &payload).unwrap();
+        let evidence = response.evidence.as_ref().expect("process emits evidence");
+        assert_eq!(response.boundary.kind, ExecutionBoundaryKind::Container);
+        assert_eq!(evidence.boundary.kind, ExecutionBoundaryKind::Container);
+        assert_eq!(evidence.adapter_type, "worker_process");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "worker_process_error");
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stdout=stdout"));
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stderr=stderr"));
+    }
+
+    #[test]
+    fn remote_worker_process_failures_return_remote_structured_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-remote-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session,
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = build_worker_process_failure_response(
+            &payload,
+            "remote_worker_process",
+            "remote command",
+            "failed to parse remote worker response",
+            "not json",
+            "",
+            ExecutionLocation::RemoteWorker,
+            ExecutionBoundaryKind::RemoteWorker,
+        );
+        let evidence = response.evidence.as_ref().expect("remote process evidence");
+        assert_eq!(response.boundary.kind, ExecutionBoundaryKind::RemoteWorker);
+        assert_eq!(evidence.boundary.kind, ExecutionBoundaryKind::RemoteWorker);
+        assert_eq!(evidence.adapter_type, "remote_worker_process");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(
+            evidence.blockers[0].source.as_deref(),
+            Some("remote_worker_process")
+        );
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stdout=not json"));
+    }
+
+    #[test]
+    fn worker_transport_failures_return_structured_evidence_before_worker_outcome() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let executor =
+            RustSubprocessExecutor::with_worker_binary(temp.path().join("missing-nanoclaw-worker"));
+
+        let response = executor
+            .execute(ExecutionRequest {
+                group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+                prompt: "<task />".to_string(),
+                paperclip_overlay_context: None,
+                messages: Vec::new(),
+                task_id: Some("task-1".to_string()),
+                script: None,
+                omx: None,
+                assistant_name: "Andy".to_string(),
+                request_plane: RequestPlane::Web,
+                env: Default::default(),
+                session,
+                backend_override: None,
+                task_signature: None,
+                routing_decision: None,
+                objective: None,
+                plan: None,
+                boundary_claims: Vec::new(),
+                gate_evaluation: None,
+            })
+            .unwrap();
+
+        let evidence = response.evidence.as_ref().expect("transport evidence");
+        assert_eq!(evidence.adapter_type, "worker_transport");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "worker_daemon_start_error");
+        assert!(Path::new(response.log_path.as_deref().unwrap()).exists());
+    }
+
+    #[test]
+    fn worker_outcome_errors_preserve_timeout_and_cancellation_status() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-transport-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session,
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let timed_out = build_worker_transport_failure_response(
+            &payload,
+            "worker_transport",
+            "worker_request_timeout",
+            "worker did not return a payload before timeout",
+            ExecutionEvidenceStatus::TimedOut,
+            "",
+            "",
+            ExecutionLocation::Host,
+            ExecutionBoundaryKind::Host,
+        );
+        let timeout_evidence = timed_out.evidence.as_ref().expect("timeout evidence");
+        assert_eq!(timeout_evidence.status, ExecutionEvidenceStatus::TimedOut);
+        assert_eq!(timeout_evidence.blockers[0].kind, "worker_request_timeout");
+
+        let cancelled = decode_worker_outcome_with_context(
+            WorkerOutcome {
+                response: None,
+                error: Some("operation canceled by operator".to_string()),
+            },
+            &payload,
+            "worker_transport",
+            ExecutionLocation::Host,
+            ExecutionBoundaryKind::Host,
+        );
+        let cancelled_evidence = cancelled.evidence.as_ref().expect("cancel evidence");
+        assert_eq!(
+            cancelled_evidence.status,
+            ExecutionEvidenceStatus::Cancelled
+        );
+        assert_eq!(
+            cancelled_evidence.blockers[0].kind,
+            "worker_outcome_cancelled"
+        );
+    }
+
+    #[test]
     fn worker_daemon_reuses_session_across_connections() {
         let temp = tempdir().unwrap();
         let workspace_root = temp.path().join("workspace");
@@ -5084,7 +6017,8 @@ mod tests {
 
         let session_root = PathBuf::from(&session.session_root);
         let daemon = thread::spawn(move || {
-            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(150)).unwrap();
+            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(1000))
+                .unwrap();
         });
 
         let send_request = |session: &ExecutionSession, invocation_id: &str, content: &str| {
@@ -5138,7 +6072,7 @@ mod tests {
         let second = send_request(&session, "exec-2", "second");
         assert!(second.text.contains("Session turn: 2"));
 
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(1200));
         daemon.join().unwrap();
         assert!(!session.socket_path().exists());
         assert!(!session.pid_path().exists());
@@ -5284,6 +6218,7 @@ mod tests {
                     openclaw_gateway_execution_lane: ExecutionLane::Host,
                     slack_env_file: None,
                     slack_poll_interval_ms: 500,
+                    linear_legacy_enabled: false,
                     linear_webhook_port: 0,
                     linear_webhook_secret: String::new(),
                     github_webhook_secret: String::new(),
@@ -5393,6 +6328,7 @@ mod tests {
                     openclaw_gateway_execution_lane: ExecutionLane::Host,
                     slack_env_file: None,
                     slack_poll_interval_ms: 500,
+                    linear_legacy_enabled: false,
                     linear_webhook_port: 0,
                     linear_webhook_secret: String::new(),
                     github_webhook_secret: String::new(),

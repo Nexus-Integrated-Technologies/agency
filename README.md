@@ -79,12 +79,19 @@ Inspect runtime state, recent tasks, and recent execution provenance:
 cargo run --quiet --bin nanoclaw -- runtime inspect --limit 5
 ```
 
+Inventory the active runtime state roots without deleting or migrating anything:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime state --limit 5
+```
+
 Get a deterministic health report over runtime directories, PID files,
 gateway/webhook auth posture, task backlog, and recent execution evidence:
 
 ```bash
 cargo run --quiet --bin nanoclaw -- runtime health --limit 5
 cargo run --quiet --bin nanoclaw -- runtime health --strict
+cargo run --quiet --bin nanoclaw -- runtime health --notify-local ops
 ```
 
 Report stale or invalid runtime PID files, then remove them only when explicitly

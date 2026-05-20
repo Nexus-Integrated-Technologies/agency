@@ -305,10 +305,10 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             boundary_claims,
             gate_evaluation: None,
         })?;
-        validate_task_execution_completion_evidence(&task.id, &execution)?;
         self.record_execution_provenance(&execution)?;
         self.record_execution_log_artifact(&group, Some(&task.id), &session, &execution)?;
         self.record_execution_evidence_artifact(&group, Some(&task.id), &session, &execution)?;
+        validate_task_execution_completion_evidence(&task.id, &execution)?;
         let sent = self.deliver_response(
             &group,
             &session,
@@ -631,6 +631,7 @@ mod tests {
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),
@@ -739,6 +740,7 @@ mod tests {
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),

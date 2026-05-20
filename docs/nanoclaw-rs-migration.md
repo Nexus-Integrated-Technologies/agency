@@ -39,7 +39,7 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
 - A Rust scheduled-task surface with persisted task CRUD, due-task selection,
   next-run computation for `once`, `interval`, and `cron`, plus CLI commands for
   `task add`, `task list`, `task due`, `task pause`, `task resume`, `task delete`,
-  and `task complete`.
+  and explicit manual completion via `task complete --manual-override`.
 - A first real Rust harness slice for local operation:
   `local send` writes inbound envelopes, `local run` processes them through the
   Rust queue/router/executor path, and `local outbox` reads outbound envelopes.
