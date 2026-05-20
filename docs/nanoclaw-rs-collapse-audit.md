@@ -280,6 +280,9 @@ Already active:
 - The lower-level DB `set_task_status` helper also rejects raw `Completed`
   transitions; durable completion remains available only through run-completion
   update paths that the app gates with execution evidence or manual override.
+- `make verify` now runs a task-completion source guard that rejects new
+  `set_task_status` callsites outside the narrow app/DB/CLI/port boundary, so
+  future writeback surfaces cannot quietly bypass the completion gate.
 - Linear is no longer an active issue/writeback surface for this instance.
   Legacy Linear CLI and webhook paths are disabled by default and require
   `NANOCLAW_LINEAR_LEGACY_ENABLED=true` only for controlled migration/reference
@@ -287,9 +290,9 @@ Already active:
 
 Remaining work:
 
-- Thread the same closure gate into active Nexus/Paperclip/GitHub issue and
-  writeback surfaces that can transition work states, avoiding direct DB status
-  writes for completion.
+- If a new active Nexus/Paperclip/GitHub writeback surface needs to transition
+  work states, route it through the app completion APIs instead of adding raw
+  status mutation callsites.
 - Extend this transport/error normalization to future external adapter plugins
   as they are registered.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing

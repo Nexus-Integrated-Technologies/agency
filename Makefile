@@ -1,6 +1,6 @@
 # Makefile - Nexus Rust NanoClaw runtime gates
 
-.PHONY: build check test verify show-config runtime-status runtime-state runtime-inspect clean
+.PHONY: build check test verify show-config runtime-status runtime-state runtime-inspect task-completion-gates clean
 
 build:
 	cargo build --bin nanoclaw
@@ -23,7 +23,10 @@ runtime-state:
 runtime-inspect:
 	cargo run --quiet --bin nanoclaw -- runtime inspect --limit 5
 
-verify: check test show-config runtime-status runtime-state runtime-inspect
+task-completion-gates:
+	./scripts/check-task-completion-gates.sh
+
+verify: check test show-config runtime-status runtime-state runtime-inspect task-completion-gates
 	git diff --check
 
 clean:
