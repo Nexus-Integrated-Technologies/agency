@@ -110,7 +110,10 @@ or clean-roomed into the active runtime.
    and host OS control lanes, with unit coverage proving the registry satisfies
    the contract. External tool adapter manifests now load through the same
    contract validation path and are rejected if any adapter is invalid or if two
-   adapters claim the same id.
+   adapters claim the same id. `runtime status`, `runtime inspect`, and
+   `runtime health` now report the built-in registry and the external
+   `NANOCLAW_TOOL_ADAPTERS_PATH` manifest state, so adapter contract drift is
+   visible before a tool can be treated as an active runtime hand.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
    the central DB without reintroducing heavyweight vector dependencies. The
    first clean-room slice is active: `SessionState::compact_with_summary`

@@ -300,14 +300,18 @@ Already active:
   explicit-approval-only.
 - External tool adapter manifests now load through the same registry path and
   fail closed when a contract is invalid or two adapters claim the same id.
+- `runtime status`, `runtime inspect`, and `runtime health` expose the tool
+  adapter registry and external manifest validation state. The external
+  manifest path defaults to `tool-adapters.json` under the project root and can
+  be overridden with `NANOCLAW_TOOL_ADAPTERS_PATH`.
 
 Remaining work:
 
 - If a new active Nexus/Paperclip/GitHub writeback surface needs to transition
   work states, route it through the app completion APIs instead of adding raw
   status mutation callsites.
-- Wire configured external plugin manifests into runtime startup/inspect once a
-  concrete plugin directory is introduced.
+- Wire concrete plugin directories to produce `NANOCLAW_TOOL_ADAPTERS_PATH`
+  manifests when external plugins are introduced.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 

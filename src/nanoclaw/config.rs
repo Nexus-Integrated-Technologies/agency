@@ -425,6 +425,12 @@ impl NanoclawConfig {
             self.openclaw_gateway_public_host, self.openclaw_gateway_port
         ))
     }
+
+    pub fn tool_adapter_manifest_path(&self) -> PathBuf {
+        env::var("NANOCLAW_TOOL_ADAPTERS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.project_root.join("tool-adapters.json"))
+    }
 }
 
 fn env_bool(name: &str) -> Option<bool> {
