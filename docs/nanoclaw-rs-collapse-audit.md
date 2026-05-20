@@ -196,22 +196,32 @@ Current unified entrypoint:
 
 ### 5. Normalize Execution Evidence Across Lanes
 
-Status: partially done in surrounding control-plane work, not complete here.
+Status: first active Rust envelope landed.
+
+Already active:
+
+- `ExecutionResponse` can carry a typed `ExecutionEvidence` envelope.
+- Host/script worker responses emit adapter type, mode, workspace, git state,
+  artifacts, verification, blockers, and provenance IDs.
+- OMX responses map team artifacts, terminal status, and failure summaries into
+  the same envelope.
+- OpenClaw GitHub Codespaces handoffs emit gateway-mode evidence while
+  preserving the raw log artifact.
+- Local and Slack runtimes persist the envelope into `execution_evidence` and
+  also emit operator artifacts.
+- `nanoclaw runtime inspect` reports recent durable execution evidence beside
+  recent provenance.
+- Swarm task results carry execution evidence in task metadata instead of
+  relying only on summary prose.
 
 Remaining work:
 
-- Ensure host, container, remote-worker, OMX, and gateway runs all produce the
-  same structured evidence envelope.
-- Promote provider outcome fields from routing docs into concrete runtime
-  records:
-  - backend
-  - provider
-  - model
-  - billing route
-  - usage
-  - artifacts
-  - verification
-  - blockers
+- Add strict closure gating that refuses to complete code-capable work without
+  valid evidence and verification.
+- Add explicit verification command records instead of the current adapter
+  status sentinel.
+- Extend failure paths so nonzero shell, timeout, and cancelled runs return
+  structured blockers even when the adapter exits with an error.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 
@@ -278,7 +288,8 @@ Exit criterion:
    non-adopted holonic/governance material into `graveyard/holonic/`.
 6. Expand the unified `nanoclaw runtime` command from status/inspect/poll/serve
    into stop/reload operations and richer health-loop reporting.
-7. Add structured execution evidence as the closure gate for every lane.
+7. Persist structured execution evidence and make it the closure gate for every
+   lane.
 8. Add state-inspection and safe cleanup commands.
 
 ## Non-Goals During Collapse

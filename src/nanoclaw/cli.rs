@@ -206,6 +206,7 @@ fn runtime_inspect_json(app: &NanoclawApp, limit: usize) -> Result<serde_json::V
     let due_tasks = app.due_tasks()?;
     let recent_tasks = tasks.iter().take(limit).cloned().collect::<Vec<_>>();
     let recent_provenance = app.db.list_execution_provenance(None, limit)?;
+    let recent_evidence = app.db.list_execution_evidence(None, limit)?;
     let mut task_status_counts = BTreeMap::<String, usize>::new();
     for task in &tasks {
         *task_status_counts
@@ -229,6 +230,7 @@ fn runtime_inspect_json(app: &NanoclawApp, limit: usize) -> Result<serde_json::V
             "recent": recent_tasks,
         },
         "recentExecutionProvenance": recent_provenance,
+        "recentExecutionEvidence": recent_evidence,
     }))
 }
 
@@ -285,7 +287,10 @@ mod tests {
     #[test]
     fn parses_runtime_inspect_limit() {
         let mut args = vec!["--limit".to_string(), "5".to_string()].into_iter();
-        assert_eq!(parse_limit_args(&mut args, 10, "runtime inspect").unwrap(), 5);
+        assert_eq!(
+            parse_limit_args(&mut args, 10, "runtime inspect").unwrap(),
+            5
+        );
     }
 }
 

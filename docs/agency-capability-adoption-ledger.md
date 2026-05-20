@@ -57,7 +57,10 @@ or clean-roomed into the active runtime.
 ## First Assimilation Slices
 
 1. Evidence and closure: fold FPF evidence, gate, assurance, provenance, and
-   task signature concepts into the active execution evidence contract.
+   task signature concepts into the active execution evidence contract. The
+   first Rust envelope now exists on `ExecutionResponse` and persists to
+   `execution_evidence`; remaining work is failure blockers, explicit
+   verification commands, and closure gating.
 2. Runtime supervisor: extend `nanoclaw runtime status|inspect|poll|serve`
    with stop/reload semantics and health-loop reporting.
 3. Tool contract: convert useful tools into typed runtime adapters with

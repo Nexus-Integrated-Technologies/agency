@@ -1210,6 +1210,7 @@ fn execution_response_to_task_result(response: ExecutionResponse) -> SwarmTaskEx
             "boundary": format!("{:?}", response.boundary.kind),
             "log_path": response.log_path,
             "provenance_id": response.provenance.as_ref().map(|value| value.id.clone()),
+            "execution_evidence": response.evidence,
         })),
         non_retryable: false,
     }
