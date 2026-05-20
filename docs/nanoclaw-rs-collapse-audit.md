@@ -199,8 +199,9 @@ Current unified entrypoint:
   OpenClaw gateway readiness from one configuration model.
 - `nanoclaw runtime inspect` reports runtime counts, task distribution, recent
   tasks, and recent execution provenance for lifecycle inspection.
-- `nanoclaw runtime health --limit <n>` reports operator health checks without
-  invoking model inference or legacy supervisor code.
+- `nanoclaw runtime health --limit <n> [--strict]` reports operator health
+  checks without invoking model inference or legacy supervisor code; strict mode
+  exits nonzero when the report is unhealthy.
 - `nanoclaw runtime cleanup [--apply]` reports stale or invalid runtime PID
   files and removes only those files when explicitly applied.
 - `nanoclaw runtime poll` runs one local control-plane pump.

@@ -84,6 +84,7 @@ gateway/webhook auth posture, task backlog, and recent execution evidence:
 
 ```bash
 cargo run --quiet --bin nanoclaw -- runtime health --limit 5
+cargo run --quiet --bin nanoclaw -- runtime health --strict
 ```
 
 Report stale or invalid runtime PID files, then remove them only when explicitly

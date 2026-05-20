@@ -109,6 +109,12 @@ struct RuntimeCleanupArgs {
     apply: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeHealthArgs {
+    limit: usize,
+    strict: bool,
+}
+
 fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
 where
     I: Iterator<Item = String>,
@@ -182,6 +188,33 @@ where
     }
 
     Ok(RuntimeCleanupArgs { apply })
+}
+
+fn parse_runtime_health_args<I>(args: &mut I) -> Result<RuntimeHealthArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = 10;
+    let mut strict = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid runtime health --limit value {value}"))?
+                    .max(1);
+            }
+            "--strict" => strict = true,
+            other => anyhow::bail!("unexpected runtime health argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeHealthArgs { limit, strict })
 }
 
 fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
@@ -793,12 +826,13 @@ fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn print_runtime_health(config: NanoclawConfig, limit: usize) -> Result<()> {
+fn print_runtime_health(config: NanoclawConfig, args: RuntimeHealthArgs) -> Result<()> {
     let app = NanoclawApp::open(config)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&runtime_health_json(&app, limit)?)?
-    );
+    let health = runtime_health_json(&app, args.limit)?;
+    println!("{}", serde_json::to_string_pretty(&health)?);
+    if args.strict && health.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("runtime health strict check failed");
+    }
     Ok(())
 }
 
@@ -886,6 +920,23 @@ mod tests {
         assert_eq!(
             parse_runtime_cleanup_args(&mut args).unwrap(),
             RuntimeCleanupArgs { apply: true }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_health_strict_limit() {
+        let mut args = vec![
+            "--limit".to_string(),
+            "3".to_string(),
+            "--strict".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_health_args(&mut args).unwrap(),
+            RuntimeHealthArgs {
+                limit: 3,
+                strict: true
+            }
         );
     }
 
@@ -1554,8 +1605,8 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     print_runtime_inspect(config, limit)?;
                 }
                 "health" => {
-                    let limit = parse_limit_args(&mut args, 10, "runtime health")?;
-                    print_runtime_health(config, limit)?;
+                    let health_args = parse_runtime_health_args(&mut args)?;
+                    print_runtime_health(config, health_args)?;
                 }
                 "cleanup" => {
                     let cleanup_args = parse_runtime_cleanup_args(&mut args)?;
