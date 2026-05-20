@@ -33,6 +33,8 @@ built-in registry.
 - `operator_visible` must be `true`.
 - `blockers_required_on_failure` must be `true`.
 - every adapter must declare `verification_kinds_required`.
+- `request_plane` should use lowercase `web`, `email`, or `none`; legacy Rust
+  enum casing is accepted for compatibility.
 - completion-capable modes must declare `artifact_kinds_required`.
 - `shell` adapters require `host_command`.
 - `http` adapters require `web_request`.
