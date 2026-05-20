@@ -165,6 +165,11 @@ impl NanoclawApp {
     }
 
     pub fn set_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
+        if matches!(status, TaskStatus::Completed) {
+            bail!(
+                "task {task_id} cannot be marked completed through set_task_status; use execution evidence or a manual completion override"
+            );
+        }
         self.db.set_task_status(task_id, status)
     }
 
@@ -774,6 +779,14 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, FoundationEvent::TaskScheduled { .. })));
+        let completion_error = app
+            .set_task_status(&task.id, TaskStatus::Completed)
+            .expect_err("raw status update should not bypass completion evidence");
+        assert!(completion_error
+            .to_string()
+            .contains("cannot be marked completed through set_task_status"));
+        let guarded = app.task(&task.id)?.expect("task should still exist");
+        assert_eq!(guarded.status, TaskStatus::Active);
         let failed = app
             .record_failed_task_run(&task.id, 12, "missing execution evidence".to_string())?
             .expect("task should still exist");

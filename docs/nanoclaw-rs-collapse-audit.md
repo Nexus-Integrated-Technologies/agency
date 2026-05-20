@@ -274,6 +274,9 @@ Already active:
   `--manual-override` and records a manual completion override, while
   execution-driven completion remains gated through structured execution
   evidence.
+- App-level task status updates now reject raw `Completed` transitions through
+  `set_task_status`, so active writeback surfaces that use the app API must use
+  execution evidence or an explicit manual completion override.
 - Linear is no longer an active issue/writeback surface for this instance.
   Legacy Linear CLI and webhook paths are disabled by default and require
   `NANOCLAW_LINEAR_LEGACY_ENABLED=true` only for controlled migration/reference
@@ -282,7 +285,8 @@ Already active:
 Remaining work:
 
 - Thread the same closure gate into active Nexus/Paperclip/GitHub issue and
-  writeback surfaces that can transition work states.
+  writeback surfaces that can transition work states, avoiding direct DB status
+  writes for completion.
 - Extend this transport/error normalization to future external adapter plugins
   as they are registered.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
