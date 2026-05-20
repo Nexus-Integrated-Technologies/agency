@@ -293,14 +293,19 @@ Already active:
   completion-capable adapters, structured verification for every adapter, and
   blockers on failure. Old Agency tool material remains source material until a
   runtime adapter satisfies this contract.
+- Active built-in runtime hands are now registered against that contract in
+  `src/nanoclaw/tool_registry.rs`: Codex-local, OpenClaw gateway, OMX gateway,
+  host shell, HTTP request, Workers AI advisory, and host OS control. The
+  registry keeps Workers AI advisory-only and makes host OS control
+  explicit-approval-only.
 
 Remaining work:
 
 - If a new active Nexus/Paperclip/GitHub writeback surface needs to transition
   work states, route it through the app completion APIs instead of adding raw
   status mutation callsites.
-- Register concrete external adapter plugins against `ToolAdapterContract`
-  before making them active runtime hands.
+- Load future external adapter plugin manifests through `ToolAdapterContract`
+  validation before making them active runtime hands.
 - Keep Azure, ZAI, Codex, and OpenClaw provider usage inside the existing
   adapter/gateway contracts.
 

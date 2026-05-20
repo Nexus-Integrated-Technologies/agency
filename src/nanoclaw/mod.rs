@@ -32,6 +32,7 @@ pub mod slack;
 pub mod slack_runtime;
 pub mod slack_threading;
 pub mod swarm;
+pub mod tool_registry;
 pub mod types;
 pub mod webhook_server;
 
