@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -57,7 +61,7 @@ pub fn load_external_tool_adapter_contracts(
     }
 
     let contracts = parse_external_tool_adapter_contracts(&raw, path)?;
-    let reports = validate_tool_adapter_contracts(&contracts);
+    let reports = validate_external_tool_adapter_contracts(&contracts);
     if !reports.is_empty() {
         bail!(
             "external tool adapter manifest {} failed validation: {}",
@@ -93,6 +97,35 @@ pub fn validate_tool_adapter_contracts(
         if count > 1 {
             reports_by_id.entry(id.to_string()).or_default().push(
                 ToolAdapterContractViolation::new("id", "tool adapter ids must be unique"),
+            );
+        }
+    }
+
+    reports_by_id
+        .into_iter()
+        .map(|(id, violations)| ToolAdapterContractValidationReport { id, violations })
+        .collect()
+}
+
+pub fn validate_external_tool_adapter_contracts(
+    contracts: &[ToolAdapterContract],
+) -> Vec<ToolAdapterContractValidationReport> {
+    let mut reports_by_id = validate_tool_adapter_contracts(contracts)
+        .into_iter()
+        .map(|report| (report.id, report.violations))
+        .collect::<BTreeMap<_, _>>();
+    let built_in_ids = built_in_tool_adapter_contracts()
+        .into_iter()
+        .map(|contract| contract.id)
+        .collect::<BTreeSet<_>>();
+
+    for contract in contracts {
+        if built_in_ids.contains(&contract.id) {
+            reports_by_id.entry(contract.id.clone()).or_default().push(
+                ToolAdapterContractViolation::new(
+                    "id",
+                    "external tool adapter id is reserved for a built-in adapter",
+                ),
             );
         }
     }
@@ -308,6 +341,51 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn example_external_code_contract() -> ToolAdapterContract {
+        ToolAdapterContract {
+            id: "example_repo_patch".to_string(),
+            runtime_name: "example-repo-patch".to_string(),
+            mode: ToolAdapterMode::Code,
+            request_plane: RequestPlane::None,
+            capabilities: CapabilityManifest {
+                repo_sync: true,
+                host_command: true,
+                secret_broker: true,
+                ..CapabilityManifest::default()
+            },
+            approval_policy: ToolAdapterApprovalPolicy::NotRequired,
+            artifact_kinds_required: vec!["diff".to_string(), "execution_log".to_string()],
+            verification_kinds_required: vec![
+                "execution_evidence".to_string(),
+                "verification_command".to_string(),
+            ],
+            blockers_required_on_failure: true,
+            workspace_required: true,
+            operator_visible: true,
+            source_material: Some("plugins/example-repo-patch/manifest.json".to_string()),
+        }
+    }
+
+    fn example_external_http_contract() -> ToolAdapterContract {
+        ToolAdapterContract {
+            id: "example_web_check".to_string(),
+            runtime_name: "example-web-check".to_string(),
+            mode: ToolAdapterMode::Http,
+            request_plane: RequestPlane::Web,
+            capabilities: CapabilityManifest {
+                web_request: true,
+                ..CapabilityManifest::default()
+            },
+            approval_policy: ToolAdapterApprovalPolicy::NotRequired,
+            artifact_kinds_required: Vec::new(),
+            verification_kinds_required: vec!["http_status".to_string()],
+            blockers_required_on_failure: true,
+            workspace_required: false,
+            operator_visible: true,
+            source_material: Some("plugins/example-web-check/manifest.json".to_string()),
+        }
+    }
+
     #[test]
     fn built_in_tool_adapter_contracts_are_valid() {
         let reports = validate_built_in_tool_adapter_contracts();
@@ -330,16 +408,15 @@ mod tests {
     fn external_tool_adapter_manifest_loads_valid_contracts() -> Result<()> {
         let dir = tempdir()?;
         let manifest_path = dir.path().join("tool-adapters.json");
-        let contract = built_in_tool_adapter_contract("host_shell").unwrap();
         let manifest = ExternalToolAdapterManifest {
-            contracts: vec![contract],
+            contracts: vec![example_external_code_contract()],
         };
         fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
 
         let loaded = load_external_tool_adapter_contracts(&manifest_path)?;
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "host_shell");
+        assert_eq!(loaded[0].id, "example_repo_patch");
         Ok(())
     }
 
@@ -347,7 +424,7 @@ mod tests {
     fn external_tool_adapter_manifest_loads_valid_contract_array() -> Result<()> {
         let dir = tempdir()?;
         let manifest_path = dir.path().join("tool-adapters.json");
-        let contract = built_in_tool_adapter_contract("http_request").unwrap();
+        let contract = example_external_http_contract();
         fs::write(
             &manifest_path,
             serde_json::to_string_pretty(&vec![contract])?,
@@ -356,7 +433,22 @@ mod tests {
         let loaded = load_external_tool_adapter_contracts(&manifest_path)?;
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "http_request");
+        assert_eq!(loaded[0].id, "example_web_check");
+        Ok(())
+    }
+
+    #[test]
+    fn checked_in_external_tool_adapter_example_loads() -> Result<()> {
+        let manifest_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tool-adapters.example.json");
+
+        let loaded = load_external_tool_adapter_contracts(&manifest_path)?;
+        let ids = loaded
+            .iter()
+            .map(|contract| contract.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["example_repo_patch", "example_web_check"]);
         Ok(())
     }
 
@@ -372,7 +464,7 @@ mod tests {
     fn external_tool_adapter_manifest_rejects_invalid_contract() -> Result<()> {
         let dir = tempdir()?;
         let manifest_path = dir.path().join("tool-adapters.json");
-        let mut contract = built_in_tool_adapter_contract("host_shell").unwrap();
+        let mut contract = example_external_code_contract();
         contract.verification_kinds_required.clear();
         fs::write(
             &manifest_path,
@@ -381,7 +473,9 @@ mod tests {
 
         let error = load_external_tool_adapter_contracts(&manifest_path).unwrap_err();
 
-        assert!(error.to_string().contains("failed validation: host_shell"));
+        assert!(error
+            .to_string()
+            .contains("failed validation: example_repo_patch"));
         Ok(())
     }
 
@@ -389,8 +483,8 @@ mod tests {
     fn external_tool_adapter_manifest_rejects_duplicate_contract_ids() -> Result<()> {
         let dir = tempdir()?;
         let manifest_path = dir.path().join("tool-adapters.json");
-        let first = built_in_tool_adapter_contract("host_shell").unwrap();
-        let second = built_in_tool_adapter_contract("host_shell").unwrap();
+        let first = example_external_code_contract();
+        let second = example_external_code_contract();
         fs::write(
             &manifest_path,
             serde_json::to_string_pretty(&vec![first, second])?,
@@ -401,6 +495,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("tool adapter ids must be unique"));
+        Ok(())
+    }
+
+    #[test]
+    fn external_tool_adapter_manifest_rejects_builtin_id_collisions() -> Result<()> {
+        let dir = tempdir()?;
+        let manifest_path = dir.path().join("tool-adapters.json");
+        let contract = built_in_tool_adapter_contract("host_shell").unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&vec![contract])?,
+        )?;
+
+        let error = load_external_tool_adapter_contracts(&manifest_path).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reserved for a built-in adapter"));
         Ok(())
     }
 
