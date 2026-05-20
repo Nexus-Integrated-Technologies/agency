@@ -96,8 +96,15 @@ or clean-roomed into the active runtime.
    safe default as leave-in-place. Remaining work is to connect health alerts to
    remote/operator channels when those channels are configured and add apply
    commands only for migration or purge actions with a runtime contract.
-3. Tool contract: convert useful tools into typed runtime adapters with
-   request-plane policy, approval gates, artifacts, and verification.
+3. Tool contract: the first native foundation contract now exists as
+   `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
+   Agency tools can only re-enter as typed runtime adapters after declaring
+   request-plane policy, capability requirements, approval policy, required
+   artifacts, required verification, failure blockers, workspace expectations,
+   and operator visibility. Host OS control adapters require explicit
+   approval, request-plane tools must declare matching capabilities, and
+   completion-capable adapters must declare artifacts and verification before
+   they can be treated as active runtime hands.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
    the central DB without reintroducing heavyweight vector dependencies. The
    first clean-room slice is active: `SessionState::compact_with_summary`
