@@ -38,6 +38,7 @@ use super::openclaw_gateway::{describe_openclaw_gateway_readiness, start_opencla
 use super::pm_automation::start_pm_automation_loop;
 use super::remote_control::{build_remote_control_context, describe_remote_control};
 use super::runtime::LocalRuntime;
+use super::runtime_channels::runtime_channel_registry;
 use super::scheduler::TaskScheduleInput;
 use super::service_slack::{ensure_registered_group, send_recorded_slack_message};
 use super::session_storage::{
@@ -801,6 +802,29 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
         tool_adapters,
     ));
 
+    let runtime_channels = runtime_channel_registry(&app.config);
+    let runtime_channel_status = if runtime_channels.summary.misconfigured > 0 {
+        RuntimeHealthCheckStatus::Fail
+    } else if runtime_channels.summary.degraded > 0 {
+        RuntimeHealthCheckStatus::Warn
+    } else {
+        RuntimeHealthCheckStatus::Pass
+    };
+    checks.push(runtime_health_check(
+        "runtime_channels",
+        runtime_channel_status,
+        match runtime_channel_status {
+            RuntimeHealthCheckStatus::Pass => "runtime channels have declared ownership",
+            RuntimeHealthCheckStatus::Warn => {
+                "runtime channels have declared ownership with degraded configuration"
+            }
+            RuntimeHealthCheckStatus::Fail => {
+                "runtime channels have declared ownership but some channels are misconfigured"
+            }
+        },
+        json!(runtime_channels),
+    ));
+
     let failing = checks
         .iter()
         .filter(|check| check.status == RuntimeHealthCheckStatus::Fail)
@@ -959,6 +983,7 @@ fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
             "gatewayLane": config.openclaw_gateway_execution_lane.as_str(),
         },
         "toolAdapters": runtime_tool_adapter_registry_json(config),
+        "runtimeChannels": json!(runtime_channel_registry(config)),
         "serveProfiles": ["full", "gateway", "webhook", "pm", "slack"],
     })
 }
@@ -1865,6 +1890,8 @@ mod tests {
         let temp = tempdir()?;
         let mut config = NanoclawConfig::from_env();
         config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
 
         let status = runtime_status_json(&config);
 
@@ -1876,6 +1903,75 @@ mod tests {
                 .unwrap_or_default()
                 >= 7
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_status_reports_runtime_channel_registry() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
+        config.linear_webhook_port = 0;
+        config.openclaw_gateway_port = 0;
+        config.openclaw_gateway_token.clear();
+        config.linear_legacy_enabled = false;
+
+        let status = runtime_status_json(&config);
+        let channels = &status["runtimeChannels"];
+
+        assert_eq!(channels["ok"], true);
+        assert_eq!(channels["summary"]["total"], 6);
+        assert!(channels["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|channel| {
+                channel["id"] == "local"
+                    && channel["status"] == "ready"
+                    && channel["operatorVisible"] == true
+            }));
+        assert!(channels["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|channel| {
+                channel["id"] == "pm_automation"
+                    && channel["status"] == "legacy_disabled"
+                    && channel["legacy"] == true
+            }));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_flags_runtime_channel_misconfiguration() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        config.slack_env_file = None;
+        config.linear_webhook_port = 8789;
+        config.github_webhook_secret.clear();
+        config.observability_webhook_token.clear();
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+        let app = NanoclawApp::open(config)?;
+
+        let health = runtime_health_json(&app, 5)?;
+        let channel_check = health["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "runtime_channels")
+            .expect("runtime channel health check");
+
+        assert_eq!(channel_check["status"], "fail");
+        assert_eq!(channel_check["evidence"]["ok"], false);
+        assert_eq!(channel_check["evidence"]["summary"]["misconfigured"], 2);
         Ok(())
     }
 

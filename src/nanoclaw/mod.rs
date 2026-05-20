@@ -25,6 +25,7 @@ pub mod remote_control;
 pub mod request_plane;
 pub mod router;
 pub mod runtime;
+pub mod runtime_channels;
 pub mod scheduler;
 pub mod security_profile;
 pub mod sender_allowlist;
