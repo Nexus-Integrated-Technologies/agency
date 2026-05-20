@@ -213,11 +213,13 @@ Already active:
   recent provenance.
 - Swarm task results carry execution evidence in task metadata instead of
   relying only on summary prose.
+- `ExecutionLaneRouter` validates evidence before returning a successful
+  response; code, shell, and gateway modes must include artifacts.
 
 Remaining work:
 
-- Add strict closure gating that refuses to complete code-capable work without
-  valid evidence and verification.
+- Thread the evidence validator into higher-level issue/task closure decisions
+  so completed work cannot bypass the runtime contract.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
 - Extend failure paths so nonzero shell, timeout, and cancelled runs return

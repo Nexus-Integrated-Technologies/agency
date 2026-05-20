@@ -59,8 +59,9 @@ or clean-roomed into the active runtime.
 1. Evidence and closure: fold FPF evidence, gate, assurance, provenance, and
    task signature concepts into the active execution evidence contract. The
    first Rust envelope now exists on `ExecutionResponse` and persists to
-   `execution_evidence`; remaining work is failure blockers, explicit
-   verification commands, and closure gating.
+   `execution_evidence`; the execution router validates the envelope before
+   success returns. Remaining work is failure blockers, explicit verification
+   commands, and higher-level closure gating.
 2. Runtime supervisor: extend `nanoclaw runtime status|inspect|poll|serve`
    with stop/reload semantics and health-loop reporting.
 3. Tool contract: convert useful tools into typed runtime adapters with

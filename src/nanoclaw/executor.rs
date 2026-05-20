@@ -435,6 +435,63 @@ pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> Execu
     }
 }
 
+pub fn validate_execution_response_evidence(response: &ExecutionResponse) -> Result<()> {
+    let Some(evidence) = response.evidence.as_ref() else {
+        bail!(
+            "execution evidence missing for session {}",
+            response.session_id
+        );
+    };
+    if evidence.schema_version != EXECUTION_EVIDENCE_SCHEMA_VERSION {
+        bail!(
+            "execution evidence schema mismatch for run {}: expected {}, got {}",
+            evidence.run_id,
+            EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            evidence.schema_version
+        );
+    }
+    if evidence.run_id.trim().is_empty() {
+        bail!("execution evidence missing run_id");
+    }
+    if evidence.adapter_type.trim().is_empty() {
+        bail!(
+            "execution evidence missing adapter_type for run {}",
+            evidence.run_id
+        );
+    }
+    if evidence.workspace.session_id != response.session_id {
+        bail!(
+            "execution evidence session mismatch for run {}: response={}, evidence={}",
+            evidence.run_id,
+            response.session_id,
+            evidence.workspace.session_id
+        );
+    }
+    if evidence.verification.is_empty() {
+        bail!(
+            "execution evidence missing verification for run {}",
+            evidence.run_id
+        );
+    }
+    if matches!(evidence.status, ExecutionEvidenceStatus::Succeeded)
+        && is_completion_capable_mode(&evidence.mode)
+        && evidence.artifacts.is_empty()
+    {
+        bail!(
+            "execution evidence missing artifacts for completion-capable run {}",
+            evidence.run_id
+        );
+    }
+    Ok(())
+}
+
+fn is_completion_capable_mode(mode: &ExecutionEvidenceMode) -> bool {
+    matches!(
+        mode,
+        ExecutionEvidenceMode::Code | ExecutionEvidenceMode::Shell | ExecutionEvidenceMode::Gateway
+    )
+}
+
 fn collect_execution_artifacts(
     adapter_type: &str,
     log_path: Option<&str>,
@@ -762,7 +819,7 @@ impl ExecutionLaneRouter {
 impl ExecutorBoundary for ExecutionLaneRouter {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         let request = self.decorate_request(request);
-        match self.lane_for_request(&request) {
+        let response = match self.lane_for_request(&request) {
             ExecutionLane::Auto | ExecutionLane::Host => self.host.execute(request),
             ExecutionLane::Container => self.container.execute(request),
             ExecutionLane::RemoteWorker => self.remote.execute(request),
@@ -770,7 +827,9 @@ impl ExecutorBoundary for ExecutionLaneRouter {
             ExecutionLane::Custom(value) => {
                 bail!("unsupported execution lane '{}'", value)
             }
-        }
+        }?;
+        validate_execution_response_evidence(&response)?;
+        Ok(response)
     }
 }
 
@@ -4386,13 +4445,14 @@ mod tests {
         normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
         parse_git_status_porcelain, read_json, resolve_container_image,
         run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
-        should_use_remote_lane, wait_for_worker_socket, write_json, BackendExecutionMetadata,
-        BackendExecutionResult, BuildExecutionEvidenceInput, ContainerExecutor,
-        DigitalOceanDevEnvironment, ExecutionEvidenceMode, ExecutionEvidenceStatus,
-        ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest, ExecutionSession,
-        ExecutionUsageSummary, ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor,
-        OmxExecutor, RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest,
-        WorkerResponse, EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
+        write_json, BackendExecutionMetadata, BackendExecutionResult, BuildExecutionEvidenceInput,
+        ContainerExecutor, DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
+        ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
+        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
+        GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor,
+        RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
 
     #[test]
@@ -4533,6 +4593,53 @@ mod tests {
             evidence.artifacts[0].location.as_deref(),
             Some("/tmp/exec.log")
         );
+    }
+
+    #[test]
+    fn validates_required_execution_evidence_contract() {
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some("/tmp/workspace".to_string()),
+            isolated: true,
+        };
+        let mut response = ExecutionResponse {
+            text: "ok".to_string(),
+            boundary: boundary.clone(),
+            session_id: "session-1".to_string(),
+            log_path: None,
+            log_body: None,
+            provenance: None,
+            metadata: None,
+            evidence: None,
+        };
+        assert!(validate_execution_response_evidence(&response).is_err());
+
+        let mut evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-1",
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: "session-1",
+            group_folder: Some("main"),
+            workspace_root: Some("/tmp/workspace"),
+            boundary: &boundary,
+            log_path: None,
+            log_body: None,
+            metadata: None,
+            provenance_id: None,
+            blockers: Vec::new(),
+        });
+        response.evidence = Some(evidence.clone());
+        assert!(validate_execution_response_evidence(&response).is_err());
+
+        evidence.artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: "log".to_string(),
+            location: Some("/tmp/exec.log".to_string()),
+            body: None,
+        });
+        response.evidence = Some(evidence);
+        validate_execution_response_evidence(&response).unwrap();
     }
 
     #[test]
