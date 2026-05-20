@@ -54,6 +54,39 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
   CLI overrides for `local run --lane ...` and `task run-due --lane ...`.
 - A `graveyard/holonic/` policy and initial relocation of governance-only docs.
 
+## Clean-Room Upstream Baseline
+
+The current clean-room upstream reference is official NanoClaw `v2.0.64`
+(`0683c6e`). Keep this as a source-of-truth checkpoint for parity work: inspect
+the upstream behavior, port the smallest equivalent Rust contract, and validate
+through Rust tests rather than copying TypeScript implementation details.
+
+The first `v2.0.64` slice ported into Rust is destination-aware message routing:
+
+- inbound messages can carry a deterministic source destination when their chat
+  maps to a registered group;
+- system prompts now describe the available destinations and the required
+  `<message to="...">...</message>` response shape;
+- local and Slack runtimes split outbound model text into target-specific
+  deliveries;
+- plain text output still falls back to the current group so existing local
+  harness behavior remains compatible.
+
+## Remaining Upstream Parity Ledger
+
+- Split session storage toward upstream `inbound.db` / `outbound.db` semantics
+  once the Rust DB boundary can absorb the migration safely.
+- Add the upstream `on_wake` compatibility behavior so missing wake handlers
+  degrade gracefully instead of failing startup.
+- Move container and per-group runtime configuration toward DB-backed state,
+  including model and effort overrides, while preserving the local-first
+  production controller.
+- Refresh destination maps immediately after approval or registration changes
+  so receiver routing does not depend on stale process memory.
+- Preserve provider routing through the existing OpenClaw/OMX/Nexus contracts;
+  Azure can be the active inference lane, but provider calls should not bypass
+  the runtime evidence and adapter boundaries.
+
 ## Prune Rules
 
 - If a subsystem is holonic, FPF-specific, or governance-specific and no longer
