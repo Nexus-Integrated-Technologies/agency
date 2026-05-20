@@ -58,8 +58,11 @@ pub struct ScheduledTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RequestPlane {
+    #[serde(alias = "web")]
     Web,
+    #[serde(alias = "email")]
     Email,
+    #[serde(alias = "none")]
     None,
     Custom(String),
 }
@@ -947,4 +950,41 @@ pub enum QueueOutcome {
     Started,
     Queued,
     SkippedDuplicate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_plane_accepts_lowercase_manifest_values() {
+        assert_eq!(
+            serde_json::from_str::<RequestPlane>("\"web\"").unwrap(),
+            RequestPlane::Web
+        );
+        assert_eq!(
+            serde_json::from_str::<RequestPlane>("\"email\"").unwrap(),
+            RequestPlane::Email
+        );
+        assert_eq!(
+            serde_json::from_str::<RequestPlane>("\"none\"").unwrap(),
+            RequestPlane::None
+        );
+    }
+
+    #[test]
+    fn request_plane_keeps_legacy_enum_casing_compatible() {
+        assert_eq!(
+            serde_json::from_str::<RequestPlane>("\"Web\"").unwrap(),
+            RequestPlane::Web
+        );
+        assert_eq!(
+            serde_json::from_str::<RequestPlane>("\"Email\"").unwrap(),
+            RequestPlane::Email
+        );
+        assert_eq!(
+            serde_json::from_str::<RequestPlane>("\"None\"").unwrap(),
+            RequestPlane::None
+        );
+    }
 }

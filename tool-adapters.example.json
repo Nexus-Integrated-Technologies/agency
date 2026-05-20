@@ -4,7 +4,7 @@
       "id": "example_repo_patch",
       "runtime_name": "example-repo-patch",
       "mode": "code",
-      "request_plane": "None",
+      "request_plane": "none",
       "capabilities": {
         "web_request": false,
         "email_request": false,
@@ -33,7 +33,7 @@
       "id": "example_web_check",
       "runtime_name": "example-web-check",
       "mode": "http",
-      "request_plane": "Web",
+      "request_plane": "web",
       "capabilities": {
         "web_request": true,
         "email_request": false,
