@@ -108,7 +108,9 @@ or clean-roomed into the active runtime.
    now registered in `src/nanoclaw/tool_registry.rs` for Codex-local,
    OpenClaw gateway, OMX gateway, host shell, HTTP request, Workers AI advisory,
    and host OS control lanes, with unit coverage proving the registry satisfies
-   the contract.
+   the contract. External tool adapter manifests now load through the same
+   contract validation path and are rejected if any adapter is invalid or if two
+   adapters claim the same id.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
    the central DB without reintroducing heavyweight vector dependencies. The
    first clean-room slice is active: `SessionState::compact_with_summary`

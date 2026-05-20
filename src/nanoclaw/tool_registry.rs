@@ -1,3 +1,8 @@
+use std::{collections::BTreeMap, fs, path::Path};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
 use crate::foundation::{
     validate_tool_adapter_contract, CapabilityManifest, RequestPlane, ToolAdapterApprovalPolicy,
     ToolAdapterContract, ToolAdapterContractViolation, ToolAdapterMode,
@@ -7,6 +12,12 @@ use crate::foundation::{
 pub struct ToolAdapterContractValidationReport {
     pub id: String,
     pub violations: Vec<ToolAdapterContractViolation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExternalToolAdapterManifest {
+    #[serde(default)]
+    pub contracts: Vec<ToolAdapterContract>,
 }
 
 pub fn built_in_tool_adapter_contracts() -> Vec<ToolAdapterContract> {
@@ -28,16 +39,101 @@ pub fn built_in_tool_adapter_contract(id: &str) -> Option<ToolAdapterContract> {
 }
 
 pub fn validate_built_in_tool_adapter_contracts() -> Vec<ToolAdapterContractValidationReport> {
-    built_in_tool_adapter_contracts()
+    validate_tool_adapter_contracts(&built_in_tool_adapter_contracts())
+}
+
+pub fn load_external_tool_adapter_contracts(
+    path: impl AsRef<Path>,
+) -> Result<Vec<ToolAdapterContract>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let contracts = parse_external_tool_adapter_contracts(&raw, path)?;
+    let reports = validate_tool_adapter_contracts(&contracts);
+    if !reports.is_empty() {
+        bail!(
+            "external tool adapter manifest {} failed validation: {}",
+            path.display(),
+            summarize_validation_reports(&reports)
+        );
+    }
+
+    Ok(contracts)
+}
+
+pub fn validate_tool_adapter_contracts(
+    contracts: &[ToolAdapterContract],
+) -> Vec<ToolAdapterContractValidationReport> {
+    let mut reports_by_id = BTreeMap::<String, Vec<ToolAdapterContractViolation>>::new();
+
+    for contract in contracts {
+        let violations = validate_tool_adapter_contract(contract);
+        if !violations.is_empty() {
+            reports_by_id
+                .entry(contract.id.clone())
+                .or_default()
+                .extend(violations);
+        }
+    }
+
+    let mut seen = BTreeMap::<&str, usize>::new();
+    for contract in contracts {
+        *seen.entry(contract.id.as_str()).or_default() += 1;
+    }
+
+    for (id, count) in seen {
+        if count > 1 {
+            reports_by_id.entry(id.to_string()).or_default().push(
+                ToolAdapterContractViolation::new("id", "tool adapter ids must be unique"),
+            );
+        }
+    }
+
+    reports_by_id
         .into_iter()
-        .filter_map(|contract| {
-            let violations = validate_tool_adapter_contract(&contract);
-            (!violations.is_empty()).then_some(ToolAdapterContractValidationReport {
-                id: contract.id,
-                violations,
-            })
-        })
+        .map(|(id, violations)| ToolAdapterContractValidationReport { id, violations })
         .collect()
+}
+
+fn parse_external_tool_adapter_contracts(
+    raw: &str,
+    path: &Path,
+) -> Result<Vec<ToolAdapterContract>> {
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    if value.is_array() {
+        serde_json::from_value::<Vec<ToolAdapterContract>>(value)
+            .with_context(|| format!("failed to decode contract array from {}", path.display()))
+    } else {
+        let manifest = serde_json::from_value::<ExternalToolAdapterManifest>(value)
+            .with_context(|| format!("failed to decode manifest from {}", path.display()))?;
+        Ok(manifest.contracts)
+    }
+}
+
+fn summarize_validation_reports(reports: &[ToolAdapterContractValidationReport]) -> String {
+    reports
+        .iter()
+        .map(|report| {
+            let details = report
+                .violations
+                .iter()
+                .map(|violation| format!("{}={}", violation.field, violation.message))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}: {}", report.id, details)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn codex_local_contract() -> ToolAdapterContract {
@@ -207,9 +303,10 @@ fn host_os_control_contract() -> ToolAdapterContract {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, path::PathBuf};
 
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn built_in_tool_adapter_contracts_are_valid() {
@@ -227,6 +324,84 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(ids.len(), contracts.len());
+    }
+
+    #[test]
+    fn external_tool_adapter_manifest_loads_valid_contracts() -> Result<()> {
+        let dir = tempdir()?;
+        let manifest_path = dir.path().join("tool-adapters.json");
+        let contract = built_in_tool_adapter_contract("host_shell").unwrap();
+        let manifest = ExternalToolAdapterManifest {
+            contracts: vec![contract],
+        };
+        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+        let loaded = load_external_tool_adapter_contracts(&manifest_path)?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "host_shell");
+        Ok(())
+    }
+
+    #[test]
+    fn external_tool_adapter_manifest_loads_valid_contract_array() -> Result<()> {
+        let dir = tempdir()?;
+        let manifest_path = dir.path().join("tool-adapters.json");
+        let contract = built_in_tool_adapter_contract("http_request").unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&vec![contract])?,
+        )?;
+
+        let loaded = load_external_tool_adapter_contracts(&manifest_path)?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "http_request");
+        Ok(())
+    }
+
+    #[test]
+    fn external_tool_adapter_manifest_missing_file_is_empty() -> Result<()> {
+        let missing_path = PathBuf::from("/tmp/nanoclaw-missing-tool-adapters.json");
+
+        assert!(load_external_tool_adapter_contracts(missing_path)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn external_tool_adapter_manifest_rejects_invalid_contract() -> Result<()> {
+        let dir = tempdir()?;
+        let manifest_path = dir.path().join("tool-adapters.json");
+        let mut contract = built_in_tool_adapter_contract("host_shell").unwrap();
+        contract.verification_kinds_required.clear();
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&vec![contract])?,
+        )?;
+
+        let error = load_external_tool_adapter_contracts(&manifest_path).unwrap_err();
+
+        assert!(error.to_string().contains("failed validation: host_shell"));
+        Ok(())
+    }
+
+    #[test]
+    fn external_tool_adapter_manifest_rejects_duplicate_contract_ids() -> Result<()> {
+        let dir = tempdir()?;
+        let manifest_path = dir.path().join("tool-adapters.json");
+        let first = built_in_tool_adapter_contract("host_shell").unwrap();
+        let second = built_in_tool_adapter_contract("host_shell").unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&vec![first, second])?,
+        )?;
+
+        let error = load_external_tool_adapter_contracts(&manifest_path).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("tool adapter ids must be unique"));
+        Ok(())
     }
 
     #[test]
