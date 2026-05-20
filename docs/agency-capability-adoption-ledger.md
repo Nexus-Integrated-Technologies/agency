@@ -128,7 +128,9 @@ or clean-roomed into the active runtime.
    scheduled scripts reach `/bin/sh -lc`, while preserving scoped cleanup such
    as `rm -rf target node_modules`. Blocked scripts emit failed shell evidence
    with a `command_safety_policy` blocker instead of running and then relying on
-   prose logs.
+   prose logs. Direct swarm shell lanes now reuse the same gate for repo mirror
+   and Symphony remote commands before remote side effects or completion
+   evidence.
 
 ## Parking Rules
 

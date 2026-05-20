@@ -311,6 +311,11 @@ Already active:
   against broad targets. Blocked scripts return failed shell evidence with a
   `command_safety_policy` blocker, while scoped cleanup commands remain
   allowed.
+- Direct swarm shell lanes now reuse the same command-safety gate before repo
+  mirror or Symphony remote commands can run. A blocked remote command emits
+  failed shell evidence with a `command_safety_policy` blocker and is marked
+  non-retryable instead of creating remote side effects or relying on summary
+  prose.
 
 Remaining work:
 
