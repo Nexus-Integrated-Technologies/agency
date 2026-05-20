@@ -324,6 +324,7 @@ pub fn resolve_host_os_control_request(
         }
     }
 
+    db.touch_destination_projection("approval_resolved")?;
     db.get_host_os_control_approval_request(request_id)?
         .with_context(|| {
             format!(

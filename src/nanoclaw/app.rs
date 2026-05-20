@@ -215,6 +215,7 @@ impl NanoclawApp {
 
     pub fn register_group(&mut self, group: Group) -> Result<Group> {
         self.db.upsert_group(&group)?;
+        self.db.touch_destination_projection("group_registered")?;
         ensure_group_folder(&self.config, &group.folder, &self.config.assistant_name)?;
         self.record_event(FoundationEvent::GroupRegistered {
             group: group.clone(),

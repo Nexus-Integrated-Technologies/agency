@@ -21,9 +21,14 @@ use super::omx::{maybe_inject_slack_reply, OmxExecutionOptions, OmxMode};
 use super::request_plane::default_request_plane;
 use super::router::{
     destination_for_group, destinations_from_groups, format_agent_prompt,
-    format_outbound_deliveries, format_task_request_with_destinations,
+    format_outbound_deliveries, format_task_request_with_destinations, DestinationEntry,
 };
 use super::sender_allowlist::{is_trigger_allowed, load_sender_allowlist};
+use super::session_storage::{
+    ensure_session_sidecars, record_inbound_message, record_on_wake_message,
+    record_outbound_message, record_task_request, refresh_destinations, OutboundSidecarMessage,
+    SessionSidecarPaths,
+};
 use super::slack::{SlackChannel, SlackInboundEvent};
 use super::slack_threading::get_slack_base_jid;
 use super::swarm::pump_swarm_once;
@@ -196,6 +201,10 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             &assistant_name,
             &destinations,
         )?;
+        let sidecars = self.refresh_session_sidecars(&group, &session, &destinations)?;
+        for message in &execution_messages {
+            record_inbound_message(&sidecars, message, None, false)?;
+        }
         let request_plane = default_request_plane();
         let created_at = Utc::now().to_rfc3339();
         let task_signature = derive_task_signature(
@@ -232,6 +241,7 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
         self.record_execution_log_artifact(&group, None, &session, &execution)?;
         let sent = self.deliver_response(
             &group,
+            &session,
             None,
             &execution.text,
             ArtifactKind::Transcript,
@@ -324,11 +334,13 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             &destinations,
             &assistant_name,
         )?;
+        let sidecars = self.refresh_session_sidecars(&group, &session, &destinations)?;
         let request_plane = task
             .request_plane
             .clone()
             .unwrap_or_else(default_request_plane);
         let created_at = Utc::now().to_rfc3339();
+        record_task_request(&sidecars, task, &prompt, &created_at)?;
         let task_signature = derive_task_signature(
             &prompt,
             &context_messages,
@@ -368,6 +380,7 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
         self.record_execution_log_artifact(&group, Some(&task.id), &session, &execution)?;
         let sent = self.deliver_response(
             &group,
+            &session,
             Some(&task.id),
             &execution.text,
             ArtifactKind::TaskResult,
@@ -389,11 +402,10 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
     }
 
     fn ensure_execution_session(&self, group: &Group) -> Result<ExecutionSession> {
-        let session_id = self
-            .app
-            .db
-            .session_for_group(&group.folder)?
-            .unwrap_or_else(|| format!("session-{}", Uuid::new_v4()));
+        let existing_session_id = self.app.db.session_for_group(&group.folder)?;
+        let is_new_session = existing_session_id.is_none();
+        let session_id =
+            existing_session_id.unwrap_or_else(|| format!("session-{}", Uuid::new_v4()));
         self.app.db.upsert_session(&group.folder, &session_id)?;
         let session = build_execution_session(
             &self.app.config.data_dir,
@@ -402,7 +414,28 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             &self.app.config.groups_dir.join(&group.folder),
         );
         session.ensure_layout()?;
+        let paths = ensure_session_sidecars(&session)?;
+        if is_new_session {
+            record_on_wake_message(&paths, group, "Session wake event.")?;
+        }
         Ok(session)
+    }
+
+    fn refresh_session_sidecars(
+        &self,
+        group: &Group,
+        session: &ExecutionSession,
+        destinations: &[DestinationEntry],
+    ) -> Result<SessionSidecarPaths> {
+        let paths = ensure_session_sidecars(session)?;
+        refresh_destinations(&paths, group, destinations)?;
+        self.app.db.record_destination_projection(
+            &group.folder,
+            &session.id,
+            &paths.inbound_db,
+            "runtime_session_refresh",
+        )?;
+        Ok(paths)
     }
 
     fn record_execution_log_artifact(
@@ -459,6 +492,7 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
     fn deliver_response(
         &mut self,
         group: &Group,
+        session: &ExecutionSession,
         task_id: Option<&str>,
         raw_text: &str,
         kind: ArtifactKind,
@@ -476,6 +510,7 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
         let assistant_name = runtime_config
             .assistant_name(&self.app.config.assistant_name)
             .to_string();
+        let sidecars = ensure_session_sidecars(session)?;
 
         let mut sent_any = false;
         for delivery in deliveries {
@@ -490,6 +525,21 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
                 continue;
             };
             sent_any = true;
+            record_outbound_message(
+                &sidecars,
+                &OutboundSidecarMessage {
+                    id: outbound.id.clone(),
+                    in_reply_to: task_id.map(str::to_string),
+                    timestamp: outbound.timestamp.clone(),
+                    kind: if task_id.is_some() {
+                        "task_result".to_string()
+                    } else {
+                        "message".to_string()
+                    },
+                    chat_jid: outbound.chat_jid.clone(),
+                    content: delivery.text.clone(),
+                },
+            )?;
             let bot_message = MessageRecord {
                 id: outbound.id.clone(),
                 chat_jid: outbound.chat_jid.clone(),

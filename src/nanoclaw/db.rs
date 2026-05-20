@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::foundation::{
     ExecutionLocation, ExecutionProvenanceRecord, ExecutionRunKind, ExecutionStatus,
@@ -537,6 +537,38 @@ impl NanoclawDb {
                 Err(err).with_context(|| format!("failed to read router_state for key {key}"))
             }
         }
+    }
+
+    pub fn record_destination_projection(
+        &self,
+        group_folder: &str,
+        session_id: &str,
+        inbound_db_path: &Path,
+        reason: &str,
+    ) -> Result<()> {
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        let value = json!({
+            "groupFolder": group_folder,
+            "sessionId": session_id,
+            "inboundDbPath": inbound_db_path.display().to_string(),
+            "reason": reason,
+            "updatedAt": updated_at,
+        });
+        self.upsert_router_state("destination_projection", &value.to_string())?;
+        self.upsert_router_state(
+            &format!("destination_projection:{group_folder}"),
+            &value.to_string(),
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_destination_projection(&self, reason: &str) -> Result<()> {
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        let value = json!({
+            "reason": reason,
+            "updatedAt": updated_at,
+        });
+        self.upsert_router_state("destination_projection", &value.to_string())
     }
 
     pub fn upsert_session(&self, group_folder: &str, session_id: &str) -> Result<()> {
@@ -4010,6 +4042,28 @@ mod tests {
 
         db.upsert_session("main", "session-2")?;
         assert_eq!(db.session_for_group("main")?, Some("session-2".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn records_destination_projection_state() -> Result<()> {
+        let dir = tempdir()?;
+        let db = NanoclawDb::open(dir.path().join("messages.db"))?;
+        db.record_destination_projection(
+            "main",
+            "session-1",
+            &dir.path().join("inbound.db"),
+            "runtime_session_refresh",
+        )?;
+
+        let global = db.router_state("destination_projection")?.unwrap();
+        assert!(global.contains("runtime_session_refresh"));
+        let group_state = db.router_state("destination_projection:main")?.unwrap();
+        assert!(group_state.contains("session-1"));
+
+        db.touch_destination_projection("group_registered")?;
+        let touched = db.router_state("destination_projection")?.unwrap();
+        assert!(touched.contains("group_registered"));
         Ok(())
     }
 

@@ -4,13 +4,14 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::foundation::{
-    ExecutionLane, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
+    ExecutionLane, Group, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
     TaskContextMode, TaskScheduleType, TaskStatus,
 };
 
 use super::dev_environment::DigitalOceanDevEnvironment;
 use super::executor::{
-    run_worker_daemon, run_worker_from_paths, run_worker_stdio, ExecutionLaneRouter,
+    build_execution_session, run_worker_daemon, run_worker_from_paths, run_worker_stdio,
+    ExecutionLaneRouter,
 };
 use super::github_webhook::{handle_github_webhook, GithubWebhookPayload};
 use super::group_runtime_config::GroupRuntimeConfig;
@@ -35,6 +36,7 @@ use super::remote_control::{build_remote_control_context, describe_remote_contro
 use super::runtime::LocalRuntime;
 use super::scheduler::TaskScheduleInput;
 use super::service_slack::{ensure_registered_group, send_recorded_slack_message};
+use super::session_storage::{ensure_session_sidecars, record_on_wake_message};
 use super::slack::SlackChannel;
 use super::slack_runtime::SlackRuntime;
 use super::swarm::{
@@ -46,7 +48,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|group-runtime <show|set>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -134,16 +136,61 @@ where
                 }
                 config.max_messages_per_prompt = Some(parsed);
             }
+            "--image-tag" => {
+                config.image_tag = Some(
+                    args.next()
+                        .context("missing value after --image-tag")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--cli-scope" => {
+                config.cli_scope = Some(
+                    args.next()
+                        .context("missing value after --cli-scope")?
+                        .trim()
+                        .to_string(),
+                );
+            }
             "--clear-provider" => config.provider = None,
             "--clear-backend" => config.backend = None,
             "--clear-model" => config.model = None,
             "--clear-effort" => config.effort = None,
             "--clear-assistant-name" => config.assistant_name = None,
             "--clear-max-messages-per-prompt" => config.max_messages_per_prompt = None,
+            "--clear-image-tag" => config.image_tag = None,
+            "--clear-cli-scope" => config.cli_scope = None,
             other => anyhow::bail!("unexpected group-runtime set argument '{}'", other),
         }
     }
     Ok(config)
+}
+
+fn group_by_folder(app: &NanoclawApp, group_folder: &str) -> Result<Group> {
+    app.groups()?
+        .into_iter()
+        .find(|group| group.folder == group_folder)
+        .with_context(|| format!("registered group not found: {group_folder}"))
+}
+
+fn ensure_cli_session(
+    app: &NanoclawApp,
+    group: &Group,
+) -> Result<super::executor::ExecutionSession> {
+    let session_id = app
+        .db
+        .session_for_group(&group.folder)?
+        .unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
+    app.db.upsert_session(&group.folder, &session_id)?;
+    let session = build_execution_session(
+        &app.config.data_dir,
+        &group.folder,
+        &session_id,
+        &app.config.groups_dir.join(&group.folder),
+    );
+    session.ensure_layout()?;
+    ensure_session_sidecars(&session)?;
+    Ok(session)
 }
 
 fn parse_host_os_action(action_kind: &str, args: &[String]) -> Result<HostOsControlAction> {
@@ -516,6 +563,46 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&runtime_config)?);
                 }
                 other => anyhow::bail!("unsupported group-runtime command '{}'", other),
+            }
+        }
+        "session" => {
+            let Some(session_command) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let Some(group_folder) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let app = NanoclawApp::open(config)?;
+            let group = group_by_folder(&app, &group_folder)?;
+            let session = ensure_cli_session(&app, &group)?;
+            let paths = ensure_session_sidecars(&session)?;
+            match session_command.as_str() {
+                "show" => {
+                    println!("session_id: {}", session.id);
+                    println!("session_root: {}", session.session_root);
+                    println!("inbound_db: {}", paths.inbound_db.display());
+                    println!("outbound_db: {}", paths.outbound_db.display());
+                }
+                "wake" => {
+                    let content = args.collect::<Vec<_>>().join(" ");
+                    let content = if content.trim().is_empty() {
+                        "Session wake event.".to_string()
+                    } else {
+                        content
+                    };
+                    let id = record_on_wake_message(&paths, &group, &content)?;
+                    app.db.record_destination_projection(
+                        &group.folder,
+                        &session.id,
+                        &paths.inbound_db,
+                        "session_on_wake",
+                    )?;
+                    println!("wake_message_id: {}", id);
+                    println!("inbound_db: {}", paths.inbound_db.display());
+                }
+                other => anyhow::bail!("unsupported session command '{}'", other),
             }
         }
         "gateway" => {

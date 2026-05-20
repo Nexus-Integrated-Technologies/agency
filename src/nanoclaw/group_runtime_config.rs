@@ -13,6 +13,8 @@ pub struct GroupRuntimeConfig {
     pub effort: Option<String>,
     pub assistant_name: Option<String>,
     pub max_messages_per_prompt: Option<usize>,
+    pub image_tag: Option<String>,
+    pub cli_scope: Option<String>,
 }
 
 impl GroupRuntimeConfig {
@@ -89,6 +91,30 @@ impl GroupRuntimeConfig {
                 max_messages.to_string(),
             );
         }
+        if let Some(image_tag) = self
+            .image_tag
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert(
+                "NANOCLAW_CONTAINER_IMAGE".to_string(),
+                image_tag.trim().to_string(),
+            );
+            env.insert(
+                "NANOCLAW_CONTAINER_IMAGE_TAG".to_string(),
+                image_tag.trim().to_string(),
+            );
+        }
+        if let Some(cli_scope) = self
+            .cli_scope
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert(
+                "NANOCLAW_CLI_SCOPE".to_string(),
+                cli_scope.trim().to_string(),
+            );
+        }
 
         env
     }
@@ -145,7 +171,7 @@ mod tests {
     #[test]
     fn maps_azure_model_to_provider_env() -> Result<()> {
         let config = GroupRuntimeConfig::from_json(Some(
-            r#"{"provider":"azure-openai","model":"gpt-4.1","effort":"medium","assistant_name":"CTO"}"#,
+            r#"{"provider":"azure-openai","model":"gpt-4.1","effort":"medium","assistant_name":"CTO","image_tag":"ghcr.io/nexus/nanoclaw:azure","cli_scope":"operator"}"#,
         ))?;
         assert_eq!(config.backend_override(), Some(WorkerBackend::AzureOpenAI));
         assert_eq!(config.assistant_name("Andy"), "CTO");
@@ -162,6 +188,14 @@ mod tests {
         assert_eq!(
             env.get("NANOCLAW_MODEL_EFFORT").map(String::as_str),
             Some("medium")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_CONTAINER_IMAGE").map(String::as_str),
+            Some("ghcr.io/nexus/nanoclaw:azure")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_CLI_SCOPE").map(String::as_str),
+            Some("operator")
         );
         Ok(())
     }
