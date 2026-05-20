@@ -311,13 +311,22 @@ Already active:
   active `SessionState` preserves the original objective, inserts a
   deterministic omitted-turn summary, and keeps recent turns without calling an
   LLM or reintroducing the old memory module dependency graph.
+- `nanoclaw runtime state` now reports `stateResidue`, a deterministic
+  active-vs-legacy inventory that separates active runtime roots from legacy
+  memory/vector/cache candidates such as `.fastembed_cache`, legacy
+  `memory.json` stores, old `agency_history.jsonl`, and legacy memory source
+  references.
+- `nanoclaw runtime cleanup --state-residue` can include the same residue
+  inventory beside stale-PID cleanup output, but the inventory is report-only:
+  cleanup still deletes only stale or invalid PID files, never runtime state or
+  legacy stores.
 
 Remaining work:
 
-- Decide which old stores under `store/`, `data/`, `.fastembed_cache/`, and
-  legacy memory paths should be ignored, migrated, or deleted.
-- Add a migration/cleanup command for stale local state that does not touch
-  active production controller data without an explicit operator action.
+- Convert the report-only residue inventory into explicit operator-approved
+  migration or purge actions for candidates that are safe to remove.
+- Decide which legacy memory source references should be clean-roomed further,
+  moved to graveyard, or deleted after capability adoption is complete.
 
 Exit criterion:
 
