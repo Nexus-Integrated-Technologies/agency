@@ -88,7 +88,12 @@ or clean-roomed into the active runtime.
 3. Tool contract: convert useful tools into typed runtime adapters with
    request-plane policy, approval gates, artifacts, and verification.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
-   the central DB without reintroducing heavyweight vector dependencies.
+   the central DB without reintroducing heavyweight vector dependencies. The
+   first clean-room slice is active: `SessionState::compact_with_summary`
+   deterministically preserves the first objective turn, records omitted-turn
+   counts and role distribution, and keeps recent turns for compact execution
+   metadata. This replaces the useful shape of legacy episodic compaction
+   without model calls or the old memory dependency graph.
 5. Safety hardening: map command/content/process/rate-limit checks into
    existing host OS control, executor, and request-plane gates.
 
