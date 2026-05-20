@@ -110,6 +110,7 @@ struct RuntimeServeArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RuntimeCleanupArgs {
     apply: bool,
+    include_state_residue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,16 +228,21 @@ where
     I: Iterator<Item = String>,
 {
     let mut apply = false;
+    let mut include_state_residue = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--apply" => apply = true,
             "--dry-run" => apply = false,
+            "--state-residue" => include_state_residue = true,
             other => anyhow::bail!("unexpected runtime cleanup argument '{}'", other),
         }
     }
 
-    Ok(RuntimeCleanupArgs { apply })
+    Ok(RuntimeCleanupArgs {
+        apply,
+        include_state_residue,
+    })
 }
 
 fn parse_runtime_health_args<I>(args: &mut I) -> Result<RuntimeHealthArgs>
@@ -555,7 +561,7 @@ fn runtime_cleanup_json(config: &NanoclawConfig, args: RuntimeCleanupArgs) -> Va
         candidates.push(candidate);
     }
 
-    json!({
+    let mut report = json!({
         "ok": errors.is_empty(),
         "applied": args.apply,
         "summary": {
@@ -567,7 +573,13 @@ fn runtime_cleanup_json(config: &NanoclawConfig, args: RuntimeCleanupArgs) -> Va
         "candidates": candidates,
         "removed": removed,
         "errors": errors,
-    })
+    });
+
+    if args.include_state_residue {
+        report["stateResidue"] = runtime_state_residue_json(config);
+    }
+
+    report
 }
 
 fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
@@ -944,6 +956,170 @@ fn dir_inventory_json(path: &Path) -> Value {
     }
 }
 
+fn runtime_state_residue_item_json(
+    key: &str,
+    classification: &str,
+    path: PathBuf,
+    active: bool,
+    recommendation: &str,
+) -> Value {
+    let inventory = if path.is_dir() {
+        dir_inventory_json(&path)
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "key": key,
+        "classification": classification,
+        "activeRuntimePath": active,
+        "recommendation": recommendation,
+        "state": path_state_json(&path),
+        "inventory": inventory,
+    })
+}
+
+fn runtime_state_residue_json(config: &NanoclawConfig) -> Value {
+    let active_roots = vec![
+        runtime_state_residue_item_json(
+            "central_db",
+            "active_central_db",
+            config.db_path.clone(),
+            true,
+            "preserve; active runtime database",
+        ),
+        runtime_state_residue_item_json(
+            "data_dir",
+            "active_runtime_data",
+            config.data_dir.clone(),
+            true,
+            "preserve; active runtime data root",
+        ),
+        runtime_state_residue_item_json(
+            "groups_dir",
+            "active_group_roots",
+            config.groups_dir.clone(),
+            true,
+            "preserve; active group runtime roots",
+        ),
+        runtime_state_residue_item_json(
+            "store_dir",
+            "active_store_root",
+            config.store_dir.clone(),
+            true,
+            "preserve; active store root containing the central DB",
+        ),
+        runtime_state_residue_item_json(
+            "runtime_control_dir",
+            "active_runtime_control",
+            runtime_control_dir(config),
+            true,
+            "preserve; PID cleanup is handled separately by runtime cleanup",
+        ),
+        runtime_state_residue_item_json(
+            "executor_sessions_dir",
+            "active_execution_sidecars",
+            config.data_dir.join("executor").join("sessions"),
+            true,
+            "preserve; active execution sidecar root",
+        ),
+        runtime_state_residue_item_json(
+            "container_cache_dir",
+            "active_execution_cache",
+            config.data_dir.join("executor").join("container-cache"),
+            true,
+            "preserve unless an operator explicitly purges execution cache",
+        ),
+    ];
+
+    let legacy_candidates = vec![
+        runtime_state_residue_item_json(
+            "fastembed_cache",
+            "legacy_vector_cache",
+            config.project_root.join(".fastembed_cache"),
+            false,
+            "legacy Agency vector cache; ignore or delete only after explicit operator approval",
+        ),
+        runtime_state_residue_item_json(
+            "root_memory_json",
+            "legacy_vector_store",
+            config.project_root.join("memory.json"),
+            false,
+            "legacy memory server store; migrate only if a runtime contract needs it",
+        ),
+        runtime_state_residue_item_json(
+            "store_memory_json",
+            "legacy_vector_store",
+            config.store_dir.join("memory.json"),
+            false,
+            "legacy memory store candidate; not used by the active NanoClaw runtime",
+        ),
+        runtime_state_residue_item_json(
+            "store_agency_memory_json",
+            "legacy_vector_store",
+            config.store_dir.join("agency_memory.json"),
+            false,
+            "legacy memory store candidate; not used by the active NanoClaw runtime",
+        ),
+        runtime_state_residue_item_json(
+            "store_embeddings_db",
+            "legacy_embedding_db",
+            config.store_dir.join("embeddings.db"),
+            false,
+            "legacy embedding DB candidate; not used by the active NanoClaw runtime",
+        ),
+        runtime_state_residue_item_json(
+            "agency_history_jsonl",
+            "legacy_history_jsonl",
+            config.data_dir.join("agency_history.jsonl"),
+            false,
+            "legacy history file; migrate into session sidecars only through an explicit migration",
+        ),
+        runtime_state_residue_item_json(
+            "src_memory",
+            "legacy_source_reference",
+            config.project_root.join("src").join("memory"),
+            false,
+            "source reference only; do not runtime-delete from cleanup commands",
+        ),
+        runtime_state_residue_item_json(
+            "src_services_memory",
+            "legacy_source_reference",
+            config
+                .project_root
+                .join("src")
+                .join("services")
+                .join("memory.rs"),
+            false,
+            "source reference only; do not runtime-delete from cleanup commands",
+        ),
+    ];
+    let present_legacy_candidates = legacy_candidates
+        .iter()
+        .filter(|item| {
+            item.get("state")
+                .and_then(|state| state.get("exists"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .count();
+
+    json!({
+        "policy": {
+            "destructiveCleanup": "manual-only",
+            "cleanupCommandDeletesState": false,
+            "note": "This inventory is report-only; runtime cleanup only removes stale or invalid PID files.",
+        },
+        "summary": {
+            "activeRoots": active_roots.len(),
+            "legacyCandidates": legacy_candidates.len(),
+            "presentLegacyCandidates": present_legacy_candidates,
+        },
+        "activeRoots": active_roots,
+        "legacyCandidates": legacy_candidates,
+    })
+}
+
 fn sqlite_table_count_json(path: &Path, table: &str) -> Value {
     if !path.exists() {
         return json!({
@@ -1142,6 +1318,7 @@ fn runtime_state_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
             "orphanShown": orphan_session_dirs.len(),
             "orphanItems": orphan_session_dirs,
         },
+        "stateResidue": runtime_state_residue_json(&app.config),
         "queuedTasks": {
             "total": tasks.len(),
             "due": due_tasks.len(),
@@ -1398,7 +1575,22 @@ mod tests {
         let mut args = vec!["--apply".to_string()].into_iter();
         assert_eq!(
             parse_runtime_cleanup_args(&mut args).unwrap(),
-            RuntimeCleanupArgs { apply: true }
+            RuntimeCleanupArgs {
+                apply: true,
+                include_state_residue: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_cleanup_state_residue_report() {
+        let mut args = vec!["--state-residue".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_cleanup_args(&mut args).unwrap(),
+            RuntimeCleanupArgs {
+                apply: false,
+                include_state_residue: true,
+            }
         );
     }
 
@@ -1513,7 +1705,13 @@ mod tests {
         let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Slack);
         fs::write(&pid_path, "not-a-pid\n")?;
 
-        let report = runtime_cleanup_json(&config, RuntimeCleanupArgs { apply: false });
+        let report = runtime_cleanup_json(
+            &config,
+            RuntimeCleanupArgs {
+                apply: false,
+                include_state_residue: false,
+            },
+        );
 
         assert_eq!(report["ok"], true);
         assert_eq!(report["applied"], false);
@@ -1532,12 +1730,48 @@ mod tests {
         let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Webhook);
         fs::write(&pid_path, "not-a-pid\n")?;
 
-        let report = runtime_cleanup_json(&config, RuntimeCleanupArgs { apply: true });
+        let report = runtime_cleanup_json(
+            &config,
+            RuntimeCleanupArgs {
+                apply: true,
+                include_state_residue: false,
+            },
+        );
 
         assert_eq!(report["ok"], true);
         assert_eq!(report["applied"], true);
         assert_eq!(report["summary"]["removed"], 1);
         assert!(!pid_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_residue_inventory_is_report_only() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(temp.path().join(".fastembed_cache"))?;
+        fs::create_dir_all(&config.data_dir)?;
+        fs::write(config.data_dir.join("agency_history.jsonl"), "{}\n")?;
+
+        let report = runtime_state_residue_json(&config);
+
+        assert_eq!(report["policy"]["cleanupCommandDeletesState"], false);
+        assert_eq!(report["summary"]["presentLegacyCandidates"], 2);
+        let legacy_keys = report["legacyCandidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["key"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(legacy_keys.contains("fastembed_cache"));
+        assert!(legacy_keys.contains("agency_history_jsonl"));
+        assert!(temp.path().join(".fastembed_cache").exists());
+        assert!(config.data_dir.join("agency_history.jsonl").exists());
         Ok(())
     }
 

@@ -83,8 +83,13 @@ or clean-roomed into the active runtime.
    `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
    now owns the basic lifecycle surface with NanoClaw PID files, deterministic
    state inventory, health checks, local health notifications, and explicit
-   stale-PID cleanup. Remaining work is to connect health alerts to
-   remote/operator channels when those channels are configured.
+   stale-PID cleanup. `runtime state` and `runtime cleanup --state-residue`
+   now expose a report-only active-vs-legacy state residue inventory so
+   `.fastembed_cache`, legacy memory stores, and old history files can be
+   reviewed without deleting active production controller data. Remaining work
+   is to connect health alerts to remote/operator channels when those channels
+   are configured and convert safe residue candidates into explicit
+   operator-approved purge or migration actions.
 3. Tool contract: convert useful tools into typed runtime adapters with
    request-plane policy, approval gates, artifacts, and verification.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
