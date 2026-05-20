@@ -104,7 +104,11 @@ or clean-roomed into the active runtime.
    and operator visibility. Host OS control adapters require explicit
    approval, request-plane tools must declare matching capabilities, and
    completion-capable adapters must declare artifacts and verification before
-   they can be treated as active runtime hands.
+   they can be treated as active runtime hands. The built-in runtime hands are
+   now registered in `src/nanoclaw/tool_registry.rs` for Codex-local,
+   OpenClaw gateway, OMX gateway, host shell, HTTP request, Workers AI advisory,
+   and host OS control lanes, with unit coverage proving the registry satisfies
+   the contract.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
    the central DB without reintroducing heavyweight vector dependencies. The
    first clean-room slice is active: `SessionState::compact_with_summary`
