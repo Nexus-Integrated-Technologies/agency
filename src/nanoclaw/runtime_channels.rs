@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::Path;
+
 use serde::Serialize;
 
 use super::NanoclawConfig;
@@ -71,6 +74,8 @@ pub struct RuntimeChannelDescriptor {
     pub status_message: String,
     pub config_source: String,
     pub auth: RuntimeChannelAuthPosture,
+    pub required_config: Vec<String>,
+    pub missing_config: Vec<String>,
     pub serve_profiles: Vec<String>,
     pub operator_visible: bool,
     pub legacy: bool,
@@ -151,6 +156,8 @@ fn descriptor(
     status: RuntimeChannelStatus,
     config_source: impl Into<String>,
     auth: RuntimeChannelAuthPosture,
+    required_config: Vec<&str>,
+    missing_config: Vec<String>,
     serve_profiles: Vec<&str>,
     operator_visible: bool,
     legacy: bool,
@@ -164,6 +171,8 @@ fn descriptor(
         status_message: status.message().to_string(),
         config_source: config_source.into(),
         auth,
+        required_config: required_config.into_iter().map(str::to_string).collect(),
+        missing_config,
         serve_profiles: serve_profiles.into_iter().map(str::to_string).collect(),
         operator_visible,
         legacy,
@@ -184,6 +193,8 @@ fn local_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
             .display()
             .to_string(),
         RuntimeChannelAuthPosture::not_required("local_filesystem"),
+        vec![],
+        vec![],
         vec!["poll", "full"],
         true,
         false,
@@ -199,6 +210,8 @@ fn scheduler_channel() -> RuntimeChannelDescriptor {
         RuntimeChannelStatus::Ready,
         "runtime database scheduled_tasks table",
         RuntimeChannelAuthPosture::not_required("local_control_plane"),
+        vec![],
+        vec![],
         vec!["poll", "full"],
         true,
         false,
@@ -211,12 +224,9 @@ fn slack_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
         .slack_env_file
         .as_ref()
         .map(|path| path.display().to_string());
-    let env_file_exists = config
-        .slack_env_file
-        .as_ref()
-        .map(|path| path.exists())
-        .unwrap_or(false);
-    let status = match (&env_file, env_file_exists) {
+    let missing_config = slack_missing_config(config.slack_env_file.as_deref());
+    let auth_configured = config.slack_env_file.is_some() && missing_config.is_empty();
+    let status = match (&env_file, missing_config.is_empty()) {
         (Some(_), true) => RuntimeChannelStatus::Ready,
         (Some(_), false) => RuntimeChannelStatus::Misconfigured,
         (None, _) => RuntimeChannelStatus::Disabled,
@@ -229,17 +239,60 @@ fn slack_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
         status,
         env_file.unwrap_or_else(|| "NANOCLAW_SLACK_ENV_FILE or project .env".to_string()),
         RuntimeChannelAuthPosture::required(
-            env_file_exists,
+            auth_configured,
             vec![
                 "slack_bot_token_from_env_file".to_string(),
                 "slack_app_token_from_env_file".to_string(),
             ],
         ),
+        vec![
+            "NANOCLAW_SLACK_ENV_FILE or project .env",
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+        ],
+        missing_config,
         vec!["full", "slack"],
         true,
         false,
         vec!["Socket Mode runtime channel; secrets are not read by status reporting"],
     )
+}
+
+fn slack_missing_config(env_file: Option<&Path>) -> Vec<String> {
+    let Some(env_file) = env_file else {
+        return vec!["NANOCLAW_SLACK_ENV_FILE or project .env".to_string()];
+    };
+    if !env_file.exists() {
+        return vec![format!("readable Slack env file: {}", env_file.display())];
+    }
+
+    let content = match fs::read_to_string(env_file) {
+        Ok(content) => content,
+        Err(error) => {
+            return vec![format!(
+                "readable Slack env file: {} ({error})",
+                env_file.display()
+            )]
+        }
+    };
+    ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"]
+        .iter()
+        .filter(|key| !env_file_defines_key(&content, key))
+        .map(|key| (*key).to_string())
+        .collect()
+}
+
+fn env_file_defines_key(content: &str, key: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        let Some((line_key, value)) = trimmed.split_once('=') else {
+            return false;
+        };
+        line_key.trim() == key && !value.trim().trim_matches('"').trim_matches('\'').is_empty()
+    })
 }
 
 fn webhook_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
@@ -269,6 +322,13 @@ fn webhook_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
     if mechanisms.is_empty() {
         mechanisms.push("not_configured".to_string());
     }
+    let mut missing_config = Vec::new();
+    if enabled && !auth_configured {
+        missing_config.push("GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN".to_string());
+        if config.linear_legacy_enabled {
+            missing_config.push("LINEAR_WEBHOOK_SECRET".to_string());
+        }
+    }
 
     descriptor(
         "webhook",
@@ -280,6 +340,11 @@ fn webhook_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
             config.linear_webhook_port
         ),
         RuntimeChannelAuthPosture::required(auth_configured, mechanisms),
+        vec![
+            "LINEAR_WEBHOOK_PORT",
+            "GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN",
+        ],
+        missing_config,
         vec!["full", "webhook"],
         true,
         false,
@@ -290,6 +355,13 @@ fn webhook_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
 fn openclaw_gateway_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
     let port_configured = config.openclaw_gateway_port > 0;
     let token_configured = !config.openclaw_gateway_token.trim().is_empty();
+    let mut missing_config = Vec::new();
+    if !port_configured {
+        missing_config.push("NANOCLAW_OPENCLAW_GATEWAY_PORT".to_string());
+    }
+    if !token_configured {
+        missing_config.push("NANOCLAW_OPENCLAW_GATEWAY_TOKEN".to_string());
+    }
     let status = match (port_configured, token_configured) {
         (true, true) => RuntimeChannelStatus::Ready,
         (true, false) => RuntimeChannelStatus::Misconfigured,
@@ -307,6 +379,11 @@ fn openclaw_gateway_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor
             config.openclaw_gateway_port
         ),
         RuntimeChannelAuthPosture::required(token_configured, vec!["x-openclaw-token".to_string()]),
+        vec![
+            "NANOCLAW_OPENCLAW_GATEWAY_PORT",
+            "NANOCLAW_OPENCLAW_GATEWAY_TOKEN",
+        ],
+        missing_config,
         vec!["full", "gateway"],
         true,
         false,
@@ -317,15 +394,29 @@ fn openclaw_gateway_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor
 fn pm_automation_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
     let chat_configured = !config.linear_chat_jid.trim().is_empty();
     let enabled = config.linear_legacy_enabled && chat_configured;
+    let auth_configured =
+        !config.linear_api_key.trim().is_empty() || !config.linear_write_api_key.trim().is_empty();
+    let mut missing_config = Vec::new();
+    if !config.linear_legacy_enabled {
+        missing_config.push("NANOCLAW_LINEAR_LEGACY_ENABLED=true".to_string());
+    }
+    if !chat_configured {
+        missing_config.push("LINEAR_CHAT_JID".to_string());
+    }
+    if config.linear_legacy_enabled && !auth_configured {
+        missing_config.push("LINEAR_API_KEY or LINEAR_WRITE_API_KEY".to_string());
+    }
     let status = if enabled {
-        RuntimeChannelStatus::Ready
+        if auth_configured {
+            RuntimeChannelStatus::Ready
+        } else {
+            RuntimeChannelStatus::Misconfigured
+        }
     } else if config.linear_legacy_enabled {
         RuntimeChannelStatus::Misconfigured
     } else {
         RuntimeChannelStatus::LegacyDisabled
     };
-    let auth_configured =
-        !config.linear_api_key.trim().is_empty() || !config.linear_write_api_key.trim().is_empty();
 
     descriptor(
         "pm_automation",
@@ -340,6 +431,12 @@ fn pm_automation_channel(config: &NanoclawConfig) -> RuntimeChannelDescriptor {
                 "linear_write_api_key".to_string(),
             ],
         ),
+        vec![
+            "NANOCLAW_LINEAR_LEGACY_ENABLED=true",
+            "LINEAR_CHAT_JID",
+            "LINEAR_API_KEY or LINEAR_WRITE_API_KEY",
+        ],
+        missing_config,
         vec!["pm"],
         true,
         true,

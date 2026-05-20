@@ -133,6 +133,10 @@ cargo run --quiet --bin nanoclaw -- runtime serve --profile full
 cargo run --quiet --bin nanoclaw -- runtime serve --profile gateway
 ```
 
+Startup uses the same `runtimeChannels` registry reported by status and health.
+Misconfigured profile channels fail before PID-file creation with
+`runtime_channel_misconfigured` and the missing config/auth fields.
+
 Stop or signal a running profile through the NanoClaw entrypoint:
 
 ```bash
