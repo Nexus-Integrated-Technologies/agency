@@ -275,13 +275,15 @@ Already active:
 - per-session sidecar `inbound.db` and `outbound.db`
 - group runtime config
 - destination projection records
+- `nanoclaw runtime state --limit <n>` reports the active central DB, runtime
+  roots, local inbox/outbox/processed directories, linked session sidecars,
+  orphan session directories, group roots, and queued task counts without
+  deleting or migrating anything.
 
 Remaining work:
 
 - Decide which old stores under `store/`, `data/`, `.fastembed_cache/`, and
   legacy memory paths should be ignored, migrated, or deleted.
-- Add a state-inspection command that reports the active central DB, session
-  sidecars, group roots, outbox, and queued tasks.
 - Add a migration/cleanup command for stale local state that does not touch
   active production controller data without an explicit operator action.
 

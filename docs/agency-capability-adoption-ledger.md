@@ -67,11 +67,11 @@ or clean-roomed into the active runtime.
    execution evidence. Remaining work is to extend the same contract to future
    external adapter plugins as they are registered.
 2. Runtime supervisor:
-   `nanoclaw runtime status|inspect|health|cleanup|poll|serve|stop|reload` now
-   owns the basic lifecycle surface with NanoClaw PID files, deterministic
-   health checks, local health notifications, and explicit stale-PID cleanup.
-   Remaining work is to connect health alerts to remote/operator channels when
-   those channels are configured.
+   `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
+   now owns the basic lifecycle surface with NanoClaw PID files, deterministic
+   state inventory, health checks, local health notifications, and explicit
+   stale-PID cleanup. Remaining work is to connect health alerts to
+   remote/operator channels when those channels are configured.
 3. Tool contract: convert useful tools into typed runtime adapters with
    request-plane policy, approval gates, artifacts, and verification.
 4. Session memory: adopt episodic/history/compaction into session sidecars or
