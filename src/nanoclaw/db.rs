@@ -831,6 +831,13 @@ impl NanoclawDb {
                   secret_handles_used_json,
                   fallback_reason,
                   sync_scope_json,
+                  task_signature_json,
+                  boundary_claims_json,
+                  gate_decision,
+                  gate_evaluation_json,
+                  assurance_json,
+                  symbol_carriers_json,
+                  provenance_edges_json,
                   status,
                   created_at,
                   updated_at,
@@ -4297,6 +4304,7 @@ mod tests {
         assert_eq!(stored.execution_location, ExecutionLocation::Host);
         assert_eq!(stored.mount_summary.len(), 1);
         assert_eq!(db.list_execution_provenance(Some("main"), 10)?.len(), 1);
+        assert_eq!(db.list_execution_provenance(None, 10)?.len(), 1);
         Ok(())
     }
 

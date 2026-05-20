@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -49,7 +50,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|poll|serve>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|poll|serve>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -128,6 +129,29 @@ where
     })
 }
 
+fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = default_limit;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid {label} --limit value {value}"))?
+                    .max(1);
+            }
+            other => anyhow::bail!("unexpected {label} argument '{}'", other),
+        }
+    }
+    Ok(limit)
+}
+
 fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
     json!({
         "ok": true,
@@ -176,6 +200,47 @@ fn print_runtime_status(config: &NanoclawConfig) -> Result<()> {
     Ok(())
 }
 
+fn runtime_inspect_json(app: &NanoclawApp, limit: usize) -> Result<serde_json::Value> {
+    let counts = app.db.counts()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_tasks = tasks.iter().take(limit).cloned().collect::<Vec<_>>();
+    let recent_provenance = app.db.list_execution_provenance(None, limit)?;
+    let mut task_status_counts = BTreeMap::<String, usize>::new();
+    for task in &tasks {
+        *task_status_counts
+            .entry(task.status.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "runtime": runtime_status_json(&app.config),
+        "counts": {
+            "chats": counts.chats,
+            "messages": counts.messages,
+            "scheduledTasks": counts.scheduled_tasks,
+            "registeredGroups": counts.registered_groups,
+        },
+        "tasks": {
+            "total": tasks.len(),
+            "due": due_tasks.len(),
+            "byStatus": task_status_counts,
+            "recent": recent_tasks,
+        },
+        "recentExecutionProvenance": recent_provenance,
+    }))
+}
+
+fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_inspect_json(&app, limit)?)?
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +280,12 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported runtime serve profile"));
+    }
+
+    #[test]
+    fn parses_runtime_inspect_limit() {
+        let mut args = vec!["--limit".to_string(), "5".to_string()].into_iter();
+        assert_eq!(parse_limit_args(&mut args, 10, "runtime inspect").unwrap(), 5);
     }
 }
 
@@ -798,6 +869,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
             };
             match runtime_command.as_str() {
                 "status" => print_runtime_status(&config)?,
+                "inspect" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime inspect")?;
+                    print_runtime_inspect(config, limit)?;
+                }
                 "poll" => {
                     let lane_override = parse_lane_override(&mut args)?;
                     run_runtime_poll(config, lane_override)?;

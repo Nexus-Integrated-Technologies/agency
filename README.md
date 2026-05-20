@@ -69,6 +69,12 @@ Inspect the active runtime channel set:
 cargo run --quiet --bin nanoclaw -- runtime status
 ```
 
+Inspect runtime state, recent tasks, and recent execution provenance:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime inspect --limit 5
+```
+
 Poll the local control-plane runtime once:
 
 ```bash

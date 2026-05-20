@@ -188,6 +188,8 @@ Current unified entrypoint:
 
 - `nanoclaw runtime status` reports local, Slack, webhook, PM automation, and
   OpenClaw gateway readiness from one configuration model.
+- `nanoclaw runtime inspect` reports runtime counts, task distribution, recent
+  tasks, and recent execution provenance for lifecycle inspection.
 - `nanoclaw runtime poll` runs one local control-plane pump.
 - `nanoclaw runtime serve --profile full|gateway|webhook|pm|slack` starts the
   selected runtime profile without legacy Agency startup scripts.
@@ -274,8 +276,8 @@ Exit criterion:
    `src/orchestrator/`, `src/agent/`, and `src/tools/`.
 5. Clean-room useful Agency concepts into `foundation` or `nanoclaw`; move only
    non-adopted holonic/governance material into `graveyard/holonic/`.
-6. Expand the unified `nanoclaw runtime` command from status/poll/serve into
-   richer lifecycle inspection and stop/reload operations.
+6. Expand the unified `nanoclaw runtime` command from status/inspect/poll/serve
+   into stop/reload operations and richer health-loop reporting.
 7. Add structured execution evidence as the closure gate for every lane.
 8. Add state-inspection and safe cleanup commands.
 
