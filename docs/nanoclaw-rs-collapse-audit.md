@@ -215,11 +215,14 @@ Already active:
   relying only on summary prose.
 - `ExecutionLaneRouter` validates evidence before returning a successful
   response; code, shell, and gateway modes must include artifacts.
+- Scheduled task completion now calls a runtime closure gate: an executed task
+  can only transition to completed from successful validated execution
+  evidence.
 
 Remaining work:
 
-- Thread the evidence validator into higher-level issue/task closure decisions
-  so completed work cannot bypass the runtime contract.
+- Thread the same closure gate into every issue/writeback surface outside the
+  local scheduled-task path.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
 - Extend failure paths so nonzero shell, timeout, and cancelled runs return

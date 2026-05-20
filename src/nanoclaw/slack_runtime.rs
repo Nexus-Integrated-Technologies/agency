@@ -11,7 +11,7 @@ use crate::foundation::{
     Group, MessageRecord, ScheduledTask, TaskContextMode,
 };
 
-use super::app::NanoclawApp;
+use super::app::{validate_task_execution_completion_evidence, NanoclawApp};
 use super::db::StoredExecutionEvidence;
 use super::executor::{
     build_execution_session, ExecutionRequest, ExecutionSession, ExecutorBoundary,
@@ -378,6 +378,7 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             boundary_claims,
             gate_evaluation: None,
         })?;
+        validate_task_execution_completion_evidence(&task.id, &execution)?;
         self.record_execution_provenance(&execution)?;
         self.record_execution_log_artifact(&group, Some(&task.id), &session, &execution)?;
         self.record_execution_evidence_artifact(&group, Some(&task.id), &session, &execution)?;
@@ -388,18 +389,18 @@ impl<E: ExecutorBoundary> SlackRuntime<E> {
             &execution.text,
             ArtifactKind::TaskResult,
             format!("Scheduled task result for {}", group.name),
-            execution.boundary,
+            execution.boundary.clone(),
         )?;
         let summary = if sent {
-            Some(execution.text)
+            Some(execution.text.clone())
         } else {
             Some("Task completed without outbound text.".to_string())
         };
-        self.app.complete_task_run(
+        self.app.complete_task_run_from_execution(
             &task.id,
             started.elapsed().as_millis() as i64,
             summary,
-            None,
+            &execution,
         )?;
         Ok(sent)
     }

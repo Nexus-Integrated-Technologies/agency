@@ -1,18 +1,21 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::foundation::{
     ArtifactKind, ArtifactRecord, ArtifactStore, EventLog, ExecutionBoundary,
-    ExecutionBoundaryKind, ExecutionContext, FoundationEvent, FoundationStore, Group,
-    ScheduledTask, TaskStatus,
+    ExecutionBoundaryKind, ExecutionContext, ExecutionStatus, FoundationEvent, FoundationStore,
+    Group, ScheduledTask, TaskStatus,
 };
 
 use super::config::NanoclawConfig;
 use super::db::{NanoclawDb, NanoclawDbCounts};
 use super::dev_environment::DigitalOceanDevEnvironment;
+use super::executor::{
+    validate_execution_response_evidence, ExecutionEvidenceStatus, ExecutionResponse,
+};
 use super::group_runtime_config::GroupRuntimeConfig;
 use super::queue::GroupQueue;
 use super::scheduler::{build_run_log, build_scheduled_task, compute_next_run, TaskScheduleInput};
@@ -193,6 +196,17 @@ impl NanoclawApp {
         self.db.get_task_by_id(task_id)
     }
 
+    pub fn complete_task_run_from_execution(
+        &mut self,
+        task_id: &str,
+        duration_ms: i64,
+        result: Option<String>,
+        execution: &ExecutionResponse,
+    ) -> Result<Option<ScheduledTask>> {
+        validate_task_execution_completion_evidence(task_id, execution)?;
+        self.complete_task_run(task_id, duration_ms, result, None)
+    }
+
     pub fn task(&self, task_id: &str) -> Result<Option<ScheduledTask>> {
         self.db.get_task_by_id(task_id)
     }
@@ -276,6 +290,44 @@ impl NanoclawApp {
     pub fn events(&self) -> &[FoundationEvent] {
         &self.events
     }
+}
+
+pub fn validate_task_execution_completion_evidence(
+    task_id: &str,
+    execution: &ExecutionResponse,
+) -> Result<()> {
+    validate_execution_response_evidence(execution)?;
+    let Some(evidence) = execution.evidence.as_ref() else {
+        bail!("task completion evidence missing for task {}", task_id);
+    };
+    if !matches!(evidence.status, ExecutionEvidenceStatus::Succeeded) {
+        bail!(
+            "task {} cannot complete from execution evidence with status {}",
+            task_id,
+            evidence.status.as_str()
+        );
+    }
+    if let Some(provenance) = execution.provenance.as_ref() {
+        if !matches!(provenance.status, ExecutionStatus::Success) {
+            bail!(
+                "task {} cannot complete from provenance status {}",
+                task_id,
+                provenance.status.as_str()
+            );
+        }
+        let claimed_task_ids = provenance
+            .boundary_claims
+            .iter()
+            .filter_map(|claim| claim.task_id.as_deref())
+            .collect::<Vec<_>>();
+        if !claimed_task_ids.is_empty() && !claimed_task_ids.iter().any(|claim| *claim == task_id) {
+            bail!(
+                "task {} cannot complete from execution evidence tied to another task",
+                task_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ensure_runtime_layout(config: &NanoclawConfig) -> Result<()> {
@@ -401,12 +453,69 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::NanoclawApp;
+    use super::{validate_task_execution_completion_evidence, NanoclawApp};
     use crate::foundation::{
-        ArtifactKind, FoundationEvent, TaskContextMode, TaskScheduleType, TaskStatus,
+        ArtifactKind, ExecutionBoundary, ExecutionBoundaryKind, FoundationEvent, TaskContextMode,
+        TaskScheduleType, TaskStatus,
     };
     use crate::nanoclaw::config::NanoclawConfig;
+    use crate::nanoclaw::executor::{
+        build_execution_evidence, BuildExecutionEvidenceInput, ExecutionArtifactRef,
+        ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionResponse,
+    };
     use crate::nanoclaw::scheduler::TaskScheduleInput;
+
+    #[test]
+    fn task_completion_requires_successful_execution_evidence() -> Result<()> {
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some("/tmp/workspace".to_string()),
+            isolated: true,
+        };
+        let mut response = ExecutionResponse {
+            text: "ok".to_string(),
+            boundary: boundary.clone(),
+            session_id: "session-1".to_string(),
+            log_path: None,
+            log_body: None,
+            provenance: None,
+            metadata: None,
+            evidence: None,
+        };
+        assert!(validate_task_execution_completion_evidence("task-1", &response).is_err());
+
+        let mut evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-1",
+            status: ExecutionEvidenceStatus::Failed,
+            session_id: "session-1",
+            group_folder: Some("main"),
+            workspace_root: Some("/tmp/workspace"),
+            boundary: &boundary,
+            log_path: None,
+            log_body: None,
+            metadata: None,
+            provenance_id: None,
+            blockers: Vec::new(),
+        });
+        response.evidence = Some(evidence.clone());
+        assert!(validate_task_execution_completion_evidence("task-1", &response).is_err());
+
+        evidence.status = ExecutionEvidenceStatus::Succeeded;
+        response.evidence = Some(evidence.clone());
+        assert!(validate_task_execution_completion_evidence("task-1", &response).is_err());
+
+        evidence.artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: "log".to_string(),
+            location: Some("/tmp/exec.log".to_string()),
+            body: None,
+        });
+        response.evidence = Some(evidence);
+        validate_task_execution_completion_evidence("task-1", &response)?;
+        Ok(())
+    }
 
     #[test]
     fn bootstrap_creates_foundation_lineage() -> Result<()> {
