@@ -184,12 +184,15 @@ Already active:
   heartbeat reporting
 - `runtime cleanup` for report-only stale/invalid PID-file cleanup, with
   mutation gated behind `--apply`
+- a typed `runtimeChannels` registry that declares local, scheduler, Slack,
+  webhook, OpenClaw gateway, and discontinued legacy PM automation ownership
+  from the same configuration model used by status, inspect, and health reports
 
 Remaining work:
 
-- Keep refining channel ownership docs as runtime profiles mature.
 - Confirm webhook server, Slack runtime, local runtime, and OpenClaw gateway can
-  run from the same NanoClaw configuration model without hidden script state.
+  run from the same NanoClaw configuration model without hidden script state in
+  long-lived production profiles.
 
 Exit criterion:
 
@@ -199,14 +202,18 @@ Exit criterion:
 Current unified entrypoint:
 
 - `nanoclaw runtime status` reports local, Slack, webhook, PM automation, and
-  OpenClaw gateway readiness from one configuration model.
+  OpenClaw gateway readiness from one configuration model, with a typed
+  `runtimeChannels` aggregate for enabled state, auth posture, serve profiles,
+  operator visibility, and legacy/discontinued status.
 - `nanoclaw runtime inspect` reports runtime counts, task distribution, recent
-  tasks, and recent execution provenance for lifecycle inspection.
+  tasks, recent execution provenance, and the same runtime-channel registry for
+  lifecycle inspection.
 - `nanoclaw runtime health --limit <n> [--strict] [--notify-local <chat>]`
   reports operator health checks without invoking model inference or legacy
-  supervisor code; strict mode exits nonzero when the report is unhealthy, and
-  local notifications write to the NanoClaw local outbox only when attention is
-  needed unless `--notify-always` is set.
+  supervisor code; it now fails enabled channels with missing auth/config,
+  warns on degraded channel posture, and local notifications write to the
+  NanoClaw local outbox only when attention is needed unless
+  `--notify-always` is set.
 - `nanoclaw runtime cleanup [--apply]` reports stale or invalid runtime PID
   files and removes only those files when explicitly applied.
 - `nanoclaw runtime poll` runs one local control-plane pump.

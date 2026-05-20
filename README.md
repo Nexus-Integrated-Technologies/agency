@@ -69,9 +69,11 @@ Inspect the active runtime channel set:
 cargo run --quiet --bin nanoclaw -- runtime status
 ```
 
-The status report includes runtime PID files under `data/runtime/`, so local
-production profiles can be inspected and controlled without the old Agency
-service scripts.
+The status report includes a typed `runtimeChannels` registry covering local,
+scheduler, Slack, webhook, OpenClaw gateway, and discontinued legacy PM
+automation ownership. It also includes runtime PID files under `data/runtime/`,
+so local production profiles can be inspected and controlled without the old
+Agency service scripts.
 
 Inspect runtime state, recent tasks, and recent execution provenance:
 
@@ -95,7 +97,8 @@ cargo run --quiet --bin nanoclaw -- runtime cleanup --state-residue
 ```
 
 Get a deterministic health report over runtime directories, PID files,
-gateway/webhook auth posture, task backlog, and recent execution evidence:
+runtime-channel ownership, gateway/webhook auth posture, task backlog, and
+recent execution evidence:
 
 ```bash
 cargo run --quiet --bin nanoclaw -- runtime health --limit 5

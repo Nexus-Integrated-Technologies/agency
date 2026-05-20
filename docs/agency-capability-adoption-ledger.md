@@ -95,7 +95,11 @@ or clean-roomed into the active runtime.
    migration, purge-candidate, preserve-reference, or review while keeping the
    safe default as leave-in-place. Remaining work is to connect health alerts to
    remote/operator channels when those channels are configured and add apply
-   commands only for migration or purge actions with a runtime contract.
+   commands only for migration or purge actions with a runtime contract. A
+   typed `runtimeChannels` registry now makes local, scheduler, Slack, webhook,
+   OpenClaw gateway, and legacy PM ownership visible in status, inspect, and
+   health output instead of leaving those responsibilities as scattered CLI
+   branches.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring
