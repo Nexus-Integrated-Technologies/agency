@@ -31,8 +31,8 @@ The active Rust runtime boundary is narrow and concrete:
 
 - `src/lib.rs` exposes only `foundation` and `nanoclaw`.
 - `src/bin/nanoclaw.rs` is the explicit binary target.
-- `src/main.rs` is no longer needed as a Cargo-discovered binary once the target
-  graph is explicit.
+- old root-level Rust files such as `src/main.rs`, `src/desktop.rs`, and
+  `src/server.rs` are parked under `graveyard/agency-harness/src-root/`.
 - `src/foundation/` contains the reusable domain layer.
 - `src/nanoclaw/` contains the control-plane runtime: DB, queue, scheduler,
   local and Slack runtimes, OpenClaw gateway, OMX/provider routing, group
@@ -94,9 +94,9 @@ Remaining work:
 
 - Keep `cargo check --all-targets` passing with only the explicit NanoClaw
   binary and library targets.
-- Decide whether `src/main.rs` should be deleted or kept only as a thin parked
-  reference. The runtime should not depend on it once `nanoclaw` is the explicit
-  binary.
+- Keep old root-level Rust files parked under
+  `graveyard/agency-harness/src-root/` unless a smaller replacement is
+  clean-roomed into the active runtime.
 - Keep CI aligned with the same active-target gates in
   `.github/workflows/rust-nanoclaw.yml`:
   - `cargo check --all-targets`

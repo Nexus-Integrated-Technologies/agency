@@ -24,8 +24,9 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
 
 - A standalone `nanoclaw` Rust bootstrap binary that does not depend on the
   current `agency` runtime.
-- The default runtime entrypoints (`cargo run`, `src/main.rs`) now route to the
-  NanoClaw CLI surface instead of the legacy Agency runtime.
+- The default runtime entrypoint is the explicit `nanoclaw` binary in
+  `src/bin/nanoclaw.rs`; old root-level Rust entrypoints are parked under
+  `graveyard/agency-harness/src-root/`.
 - A canonical domain base now lives in `src/foundation/`, with `nanoclaw` as
   the first runtime descendant rather than a separate ontology.
 - The DigitalOcean VM dev environment is now modeled as a first-class
