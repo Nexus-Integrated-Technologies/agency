@@ -78,11 +78,11 @@ or clean-roomed into the active runtime.
    task status updates now reject `Completed`, forcing writeback callers that
    use the app API through execution evidence or a manual override. The DB
    status helper also rejects raw `Completed` transitions, leaving durable
-   completion to run-completion update paths. Linear is parked as a discontinued
-   legacy integration and is disabled by default. Remaining
-   work is to extend the same contract to active Nexus/Paperclip/GitHub
-   writeback surfaces and future external adapter plugins as they are
-   registered.
+   completion to run-completion update paths. `make verify` now includes a
+   source guard that rejects new `set_task_status` callsites outside the narrow
+   app/DB/CLI/port boundary. Linear is parked as a discontinued legacy
+   integration and is disabled by default. Remaining work is to extend the same
+   contract to future external adapter plugins as they are registered.
 2. Runtime supervisor:
    `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
    now owns the basic lifecycle surface with NanoClaw PID files, deterministic
