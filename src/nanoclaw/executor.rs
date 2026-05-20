@@ -956,6 +956,9 @@ impl ExecutorBoundary for ContainerExecutor {
             root: Some(payload.session.workspace_root.clone()),
             isolated: true,
         };
+        if let Some(evidence) = response.evidence.as_mut() {
+            evidence.boundary = response.boundary.clone();
+        }
         Ok(response)
     }
 }
@@ -1007,6 +1010,9 @@ impl ExecutorBoundary for RemoteWorkerExecutor {
             root: Some(payload.session.workspace_root.clone()),
             isolated: true,
         };
+        if let Some(evidence) = response.evidence.as_mut() {
+            evidence.boundary = response.boundary.clone();
+        }
         Ok(response)
     }
 }
@@ -1870,9 +1876,38 @@ fn build_blocked_worker_response(
     session_state: Option<SessionState>,
     execution_location: ExecutionLocation,
 ) -> WorkerResponse {
+    build_blocked_worker_response_with_context(
+        request,
+        backend.as_str(),
+        execution_mode_for_backend(backend, request.script.is_some()),
+        run_kind_for_backend(backend, request.script.is_some()),
+        "adapter_error",
+        message,
+        log_path,
+        log_body,
+        session_state,
+        execution_location,
+        ExecutionBoundaryKind::Host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_blocked_worker_response_with_context(
+    request: &WorkerRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    run_kind: ExecutionRunKind,
+    blocker_kind: &str,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> WorkerResponse {
     let completed_at = Utc::now().to_rfc3339();
     let boundary = ExecutionBoundary {
-        kind: ExecutionBoundaryKind::Host,
+        kind: boundary_kind,
         root: Some(request.session.workspace_root.clone()),
         isolated: true,
     };
@@ -1881,7 +1916,7 @@ fn build_blocked_worker_response(
     let gate_evaluation = request.gate_evaluation.clone();
     let assurance = task_signature.as_ref().map(|signature| {
         derive_assurance(
-            backend.as_str(),
+            adapter_type,
             signature,
             gate_evaluation.as_ref(),
             request.script.is_some(),
@@ -1893,7 +1928,7 @@ fn build_blocked_worker_response(
         derive_provenance_edges(&request.invocation_id, &symbol_carriers, &boundary_claims);
     let provenance = build_execution_provenance_record(BuildExecutionProvenanceInput {
         id: request.invocation_id.clone(),
-        run_kind: run_kind_for_backend(backend, request.script.is_some()),
+        run_kind,
         group_folder: request.session.group_folder.clone(),
         chat_jid: Some(request.group.jid.clone()),
         execution_location,
@@ -1924,7 +1959,7 @@ fn build_blocked_worker_response(
         completed_at: Some(completed_at),
     });
     let metadata = ExecutionMetadata {
-        backend: Some(backend.as_str().to_string()),
+        backend: Some(adapter_type.to_string()),
         routing_decision: request.routing_decision.clone(),
         objective: request.objective.clone(),
         plan: request.plan.clone(),
@@ -1937,8 +1972,8 @@ fn build_blocked_worker_response(
     };
     let log_path_string = log_path.display().to_string();
     let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
-        adapter_type: backend.as_str(),
-        mode: execution_mode_for_backend(backend, request.script.is_some()),
+        adapter_type,
+        mode,
         run_id: request.invocation_id.as_str(),
         status: ExecutionEvidenceStatus::Failed,
         session_id: request.session.id.as_str(),
@@ -1951,8 +1986,8 @@ fn build_blocked_worker_response(
         provenance_id: Some(provenance.id.as_str()),
         verification: Vec::new(),
         blockers: vec![ExecutionBlockerRef {
-            kind: "adapter_error".to_string(),
-            source: Some(backend.as_str().to_string()),
+            kind: blocker_kind.to_string(),
+            source: Some(adapter_type.to_string()),
             message: message.to_string(),
         }],
     });
@@ -1966,6 +2001,19 @@ fn build_blocked_worker_response(
         provenance: Some(provenance),
         metadata: Some(metadata),
         evidence: Some(evidence),
+    }
+}
+
+fn blocked_worker_response_into_execution_response(response: WorkerResponse) -> ExecutionResponse {
+    ExecutionResponse {
+        text: response.text,
+        boundary: response.boundary,
+        session_id: response.session_id,
+        log_path: response.log_path,
+        log_body: response.log_body,
+        provenance: response.provenance,
+        metadata: response.metadata,
+        evidence: response.evidence,
     }
 }
 
@@ -2016,43 +2064,101 @@ fn decode_worker_outcome(outcome: WorkerOutcome) -> Result<ExecutionResponse> {
         _ => bail!("worker returned an empty response"),
     };
 
-    Ok(ExecutionResponse {
-        text: response.text,
-        boundary: response.boundary,
-        session_id: response.session_id,
-        log_path: response.log_path,
-        log_body: response.log_body,
-        provenance: response.provenance,
-        metadata: response.metadata,
-        evidence: response.evidence,
-    })
+    Ok(blocked_worker_response_into_execution_response(response))
 }
 
 fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<ExecutionResponse> {
     let stdin = serde_json::to_vec(payload).context("failed to encode worker request")?;
-    let output = command
+    let command_description = describe_command(command);
+    let output = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to spawn {}", describe_command(command)))?;
-    let output = write_and_wait_for_output(output, &stdin, command)?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(build_worker_process_failure_response(
+                payload,
+                &command_description,
+                &format!("failed to spawn {command_description}: {error}"),
+                "",
+                "",
+            ));
+        }
+    };
+    let output = match write_and_wait_for_output(output, &stdin, command) {
+        Ok(output) => output,
+        Err(error) => {
+            return Ok(build_worker_process_failure_response(
+                payload,
+                &command_description,
+                &error.to_string(),
+                "",
+                "",
+            ));
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "{} exited with status {}{}",
-            describe_command(command),
-            output.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok(build_worker_process_failure_response(
+            payload,
+            &command_description,
+            &format!(
+                "{} exited with status {}{}",
+                command_description,
+                output.status,
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            ),
+            &stdout,
+            &stderr,
+        ));
     }
     let outcome: WorkerOutcome =
         serde_json::from_slice(&output.stdout).context("failed to parse worker outcome")?;
     decode_worker_outcome(outcome)
+}
+
+fn build_worker_process_failure_response(
+    payload: &WorkerRequest,
+    command_description: &str,
+    message: &str,
+    stdout: &str,
+    stderr: &str,
+) -> ExecutionResponse {
+    let log_path = Path::new(&payload.session.logs_root)
+        .join(format!("{}.process.log", payload.invocation_id));
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\nstatus=error\ncommand={}\nerror={}\nstdout={}\nstderr={}\n",
+        payload.invocation_id,
+        payload.session.id,
+        payload.session.workspace_root,
+        command_description,
+        message,
+        stdout,
+        stderr
+    );
+    let _ = fs::create_dir_all(Path::new(&payload.session.logs_root));
+    let _ = fs::write(&log_path, &log_body);
+    let response = build_blocked_worker_response_with_context(
+        payload,
+        "worker_process",
+        ExecutionEvidenceMode::Shell,
+        ExecutionRunKind::Custom("worker_process".to_string()),
+        "worker_process_error",
+        message,
+        log_path.as_path(),
+        log_body,
+        None,
+        ExecutionLocation::LocalContainer,
+        ExecutionBoundaryKind::Container,
+    );
+    blocked_worker_response_into_execution_response(response)
 }
 
 fn write_and_wait_for_output(
@@ -4663,7 +4769,7 @@ mod tests {
         detect_paperclip_control_plane_blocker, execute_worker_request, extract_azure_openai_text,
         is_codex_usage_limit_error, normalize_azure_openai_fallback_backend, normalize_branch_name,
         normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
-        parse_git_status_porcelain, read_json, resolve_container_image,
+        parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
         run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
         should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
         write_json, BackendExecutionMetadata, BackendExecutionResult, BuildExecutionEvidenceInput,
@@ -5304,6 +5410,60 @@ mod tests {
             .provenance
             .as_ref()
             .is_some_and(|provenance| matches!(provenance.status, ExecutionStatus::Error)));
+    }
+
+    #[test]
+    fn worker_process_failures_return_structured_failed_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-process-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf stdout; printf stderr >&2; exit 42");
+
+        let response = run_worker_command(&mut command, &payload).unwrap();
+        let evidence = response.evidence.as_ref().expect("process emits evidence");
+        assert_eq!(response.boundary.kind, ExecutionBoundaryKind::Container);
+        assert_eq!(evidence.boundary.kind, ExecutionBoundaryKind::Container);
+        assert_eq!(evidence.adapter_type, "worker_process");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "worker_process_error");
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stdout=stdout"));
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stderr=stderr"));
     }
 
     #[test]

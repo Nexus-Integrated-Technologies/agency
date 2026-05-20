@@ -66,10 +66,11 @@ or clean-roomed into the active runtime.
    artifacts, and blockers, and built-in swarm lanes gate completion on valid
    execution evidence. Unsupported worker backends and custom execution lanes
    now produce failed evidence with blockers, and scheduled-task runtime loops
-   persist evidence before rejecting failed completion. Remaining work is to
-   extend the same contract to future external adapter plugins as they are
-   registered and to catch lower-level process exits before a worker outcome
-   exists.
+   persist evidence before rejecting failed completion. Container worker
+   process failures now emit `worker_process` evidence with stdout/stderr
+   artifacts instead of opaque process errors. Remaining work is to extend the
+   same contract to future external adapter plugins as they are registered and
+   to catch remote/process exits before a worker outcome exists.
 2. Runtime supervisor:
    `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
    now owns the basic lifecycle surface with NanoClaw PID files, deterministic
