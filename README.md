@@ -63,6 +63,25 @@ Show the resolved runtime configuration:
 cargo run --quiet --bin nanoclaw -- show-config
 ```
 
+Inspect the active runtime channel set:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime status
+```
+
+Poll the local control-plane runtime once:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime poll
+```
+
+Serve a selected production profile through the NanoClaw entrypoint:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime serve --profile full
+cargo run --quiet --bin nanoclaw -- runtime serve --profile gateway
+```
+
 List available commands:
 
 ```bash

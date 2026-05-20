@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde_json::json;
 
 use crate::foundation::{
     ExecutionLane, Group, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
@@ -48,8 +49,253 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|poll|serve>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeServeProfile {
+    Full,
+    Gateway,
+    Webhook,
+    Pm,
+    Slack,
+}
+
+impl RuntimeServeProfile {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "full" => Ok(Self::Full),
+            "gateway" => Ok(Self::Gateway),
+            "webhook" => Ok(Self::Webhook),
+            "pm" => Ok(Self::Pm),
+            "slack" => Ok(Self::Slack),
+            other => anyhow::bail!("unsupported runtime serve profile '{}'", other),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Gateway => "gateway",
+            Self::Webhook => "webhook",
+            Self::Pm => "pm",
+            Self::Slack => "slack",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeServeArgs {
+    profile: RuntimeServeProfile,
+    lane_override: Option<ExecutionLane>,
+    read_only: bool,
+}
+
+fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut profile = RuntimeServeProfile::Full;
+    let mut lane_override = None::<ExecutionLane>;
+    let mut read_only = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                profile = RuntimeServeProfile::parse(&value)?;
+            }
+            "--lane" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                lane_override = Some(ExecutionLane::parse(&value));
+            }
+            "--read-only" => read_only = true,
+            other => anyhow::bail!("unexpected runtime serve argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeServeArgs {
+        profile,
+        lane_override,
+        read_only,
+    })
+}
+
+fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "activeBinary": "nanoclaw",
+        "dataDir": config.data_dir.display().to_string(),
+        "storeDir": config.store_dir.display().to_string(),
+        "local": {
+            "enabled": true,
+            "mode": "poll",
+            "inboxDir": config.data_dir.join("channels").join("local").join("inbox").display().to_string(),
+            "outboxDir": config.data_dir.join("channels").join("local").join("outbox").display().to_string(),
+        },
+        "slack": {
+            "envFile": config
+                .slack_env_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "pollIntervalMs": config.slack_poll_interval_ms,
+        },
+        "webhook": {
+            "enabled": config.linear_webhook_port > 0,
+            "port": config.linear_webhook_port,
+            "linearSignatureRequired": !config.linear_webhook_secret.trim().is_empty(),
+            "githubSignatureRequired": !config.github_webhook_secret.trim().is_empty(),
+            "observabilityTokenConfigured": !config.observability_webhook_token.trim().is_empty(),
+        },
+        "pmAutomation": {
+            "enabled": !config.linear_chat_jid.trim().is_empty(),
+            "linearChatJidConfigured": !config.linear_chat_jid.trim().is_empty(),
+            "teamKeysConfigured": !config.linear_pm_team_keys.is_empty(),
+        },
+        "openclawGateway": describe_openclaw_gateway_readiness(config),
+        "execution": {
+            "defaultLane": config.execution_lane.as_str(),
+            "gatewayLane": config.openclaw_gateway_execution_lane.as_str(),
+        },
+        "serveProfiles": ["full", "gateway", "webhook", "pm", "slack"],
+    })
+}
+
+fn print_runtime_status(config: &NanoclawConfig) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_status_json(config))?
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_default_runtime_serve_profile() {
+        let mut args = Vec::<String>::new().into_iter();
+        let parsed = parse_runtime_serve_args(&mut args).unwrap();
+
+        assert_eq!(parsed.profile, RuntimeServeProfile::Full);
+        assert_eq!(parsed.lane_override, None);
+        assert!(!parsed.read_only);
+    }
+
+    #[test]
+    fn parses_runtime_serve_profile_lane_and_read_only() {
+        let mut args = vec![
+            "--profile".to_string(),
+            "gateway".to_string(),
+            "--lane".to_string(),
+            "omx".to_string(),
+            "--read-only".to_string(),
+        ]
+        .into_iter();
+        let parsed = parse_runtime_serve_args(&mut args).unwrap();
+
+        assert_eq!(parsed.profile, RuntimeServeProfile::Gateway);
+        assert_eq!(parsed.lane_override, Some(ExecutionLane::Omx));
+        assert!(parsed.read_only);
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_serve_profile() {
+        let mut args = vec!["--profile".to_string(), "legacy".to_string()].into_iter();
+        let error = parse_runtime_serve_args(&mut args).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported runtime serve profile"));
+    }
+}
+
+fn print_runtime_poll_summary(summary: super::runtime::RuntimePumpSummary) {
+    println!("inbound_messages: {}", summary.inbound_messages);
+    println!("processed_groups: {}", summary.processed_groups);
+    println!("scheduled_tasks_run: {}", summary.scheduled_tasks_run);
+    println!("scheduled_task_errors: {}", summary.scheduled_task_errors);
+    println!("swarm_tasks_run: {}", summary.swarm_tasks_run);
+    println!("swarm_task_errors: {}", summary.swarm_task_errors);
+    println!("outbound_messages: {}", summary.outbound_messages);
+}
+
+fn run_runtime_poll(config: NanoclawConfig, lane_override: Option<ExecutionLane>) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    let executor = ExecutionLaneRouter::from_config(&app.config, lane_override)?;
+    let mut runtime = LocalRuntime::new(app, executor)?;
+    let summary = runtime.poll_once()?;
+    print_runtime_poll_summary(summary);
+    Ok(())
+}
+
+fn park_runtime(profile: RuntimeServeProfile) -> ! {
+    eprintln!("nanoclaw runtime profile '{}' is running", profile.as_str());
+    loop {
+        std::thread::park();
+    }
+}
+
+fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
+    match serve_args.profile {
+        RuntimeServeProfile::Full => {
+            let app = NanoclawApp::open(config.clone())?;
+            if !serve_args.read_only {
+                start_webhook_server(app.config.clone())?;
+                start_pm_automation_loop(app.config.clone())?;
+                start_openclaw_gateway_server(app.config.clone())?;
+            }
+            let executor = ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override)?;
+            let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let mut runtime = SlackRuntime::new(app, channel, executor);
+            runtime.run_forever()?;
+        }
+        RuntimeServeProfile::Gateway => {
+            if config.openclaw_gateway_port == 0 {
+                anyhow::bail!(
+                    "runtime gateway profile is disabled: set NANOCLAW_OPENCLAW_GATEWAY_PORT"
+                );
+            }
+            if config.openclaw_gateway_token.trim().is_empty() {
+                anyhow::bail!(
+                    "runtime gateway profile is disabled: set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"
+                );
+            }
+            let _app = NanoclawApp::open(config.clone())?;
+            start_openclaw_gateway_server(config)?;
+            park_runtime(RuntimeServeProfile::Gateway);
+        }
+        RuntimeServeProfile::Webhook => {
+            if config.linear_webhook_port == 0 {
+                anyhow::bail!("runtime webhook profile is disabled: set LINEAR_WEBHOOK_PORT");
+            }
+            start_webhook_server(config)?;
+            park_runtime(RuntimeServeProfile::Webhook);
+        }
+        RuntimeServeProfile::Pm => {
+            if config.linear_chat_jid.trim().is_empty() {
+                anyhow::bail!("runtime pm profile is disabled: set LINEAR_CHAT_JID");
+            }
+            start_pm_automation_loop(config)?;
+            park_runtime(RuntimeServeProfile::Pm);
+        }
+        RuntimeServeProfile::Slack => {
+            let app = NanoclawApp::open(config)?;
+            let executor = ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override)?;
+            let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let mut runtime = SlackRuntime::new(app, channel, executor);
+            runtime.run_forever()?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_lane_override<I>(args: &mut I) -> Result<Option<ExecutionLane>>
@@ -358,6 +604,10 @@ fn notify_host_os_record(app: &mut NanoclawApp, chat_jid: Option<&str>, body: &s
 pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
     let mut args = args.into_iter();
     let command = args.next().unwrap_or_else(|| "bootstrap".to_string());
+    if matches!(command.as_str(), "--help" | "-h" | "help") {
+        print_usage();
+        return Ok(());
+    }
     if command == "exec-worker" {
         let Some(request_path) = args.next() else {
             print_usage();
@@ -540,6 +790,24 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     .as_deref()
                     .unwrap_or("-")
             );
+        }
+        "runtime" => {
+            let Some(runtime_command) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            match runtime_command.as_str() {
+                "status" => print_runtime_status(&config)?,
+                "poll" => {
+                    let lane_override = parse_lane_override(&mut args)?;
+                    run_runtime_poll(config, lane_override)?;
+                }
+                "serve" => {
+                    let serve_args = parse_runtime_serve_args(&mut args)?;
+                    run_runtime_serve(config, serve_args)?;
+                }
+                other => anyhow::bail!("unsupported runtime command '{}'", other),
+            }
         }
         "group-runtime" => {
             let Some(group_command) = args.next() else {

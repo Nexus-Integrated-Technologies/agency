@@ -1,6 +1,6 @@
 # Makefile - Nexus Rust NanoClaw runtime gates
 
-.PHONY: build check test verify show-config clean
+.PHONY: build check test verify show-config runtime-status clean
 
 build:
 	cargo build --bin nanoclaw
@@ -14,7 +14,10 @@ test:
 show-config:
 	cargo run --quiet --bin nanoclaw -- show-config
 
-verify: check test show-config
+runtime-status:
+	cargo run --quiet --bin nanoclaw -- runtime status
+
+verify: check test show-config runtime-status
 	git diff --check
 
 clean:

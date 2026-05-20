@@ -162,7 +162,7 @@ Exit criterion:
 
 ### 4. Finish Runtime Channel Ownership
 
-Status: partially done.
+Status: started, with a unified CLI facade in place.
 
 Already active:
 
@@ -175,9 +175,7 @@ Already active:
 
 Remaining work:
 
-- Make channel ownership explicit in docs and CLI help.
-- Add a single runtime command that can run the selected production channel set
-  without requiring old scripts.
+- Keep refining channel ownership docs as runtime profiles mature.
 - Confirm webhook server, Slack runtime, local runtime, and OpenClaw gateway can
   run from the same NanoClaw configuration model without hidden script state.
 
@@ -185,6 +183,14 @@ Exit criterion:
 
 - The Rust runtime can be started, inspected, and stopped through NanoClaw
   commands only.
+
+Current unified entrypoint:
+
+- `nanoclaw runtime status` reports local, Slack, webhook, PM automation, and
+  OpenClaw gateway readiness from one configuration model.
+- `nanoclaw runtime poll` runs one local control-plane pump.
+- `nanoclaw runtime serve --profile full|gateway|webhook|pm|slack` starts the
+  selected runtime profile without legacy Agency startup scripts.
 
 ### 5. Normalize Execution Evidence Across Lanes
 
@@ -268,8 +274,8 @@ Exit criterion:
    `src/orchestrator/`, `src/agent/`, and `src/tools/`.
 5. Clean-room useful Agency concepts into `foundation` or `nanoclaw`; move only
    non-adopted holonic/governance material into `graveyard/holonic/`.
-6. Add a unified `nanoclaw runtime` command for local, Slack, webhook, and
-   OpenClaw operation.
+6. Expand the unified `nanoclaw runtime` command from status/poll/serve into
+   richer lifecycle inspection and stop/reload operations.
 7. Add structured execution evidence as the closure gate for every lane.
 8. Add state-inspection and safe cleanup commands.
 
