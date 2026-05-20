@@ -54,7 +54,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -118,6 +118,50 @@ struct RuntimeHealthArgs {
     strict: bool,
     notify_local: Option<String>,
     notify_always: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskCompleteArgs {
+    task_id: String,
+    result: Option<String>,
+}
+
+fn parse_task_complete_args<I>(args: &mut I) -> Result<TaskCompleteArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut manual_override = false;
+    let mut values = Vec::<String>::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--manual-override" => manual_override = true,
+            other if other.starts_with("--") => {
+                anyhow::bail!("unexpected task complete argument '{}'", other)
+            }
+            _ => values.push(arg),
+        }
+    }
+
+    if !manual_override {
+        anyhow::bail!(
+            "task complete requires --manual-override; execution-driven completion must use structured execution evidence"
+        );
+    }
+    let Some(task_id) = values.first().cloned() else {
+        anyhow::bail!("task complete requires a task id");
+    };
+    let result = values
+        .get(1..)
+        .unwrap_or_default()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    Ok(TaskCompleteArgs {
+        task_id,
+        result: (!result.is_empty()).then_some(result),
+    })
 }
 
 fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
@@ -1390,6 +1434,29 @@ mod tests {
                 notify_always: true,
             }
         );
+    }
+
+    #[test]
+    fn task_complete_requires_manual_override() {
+        let mut args = vec!["task-1".to_string(), "done".to_string()].into_iter();
+        let error = parse_task_complete_args(&mut args).unwrap_err();
+
+        assert!(error.to_string().contains("requires --manual-override"));
+    }
+
+    #[test]
+    fn parses_task_complete_manual_override() {
+        let mut args = vec![
+            "--manual-override".to_string(),
+            "task-1".to_string(),
+            "operator".to_string(),
+            "verified".to_string(),
+        ]
+        .into_iter();
+        let parsed = parse_task_complete_args(&mut args).unwrap();
+
+        assert_eq!(parsed.task_id, "task-1");
+        assert_eq!(parsed.result.as_deref(), Some("operator verified"));
     }
 
     #[test]
@@ -2906,27 +2973,15 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     println!("deleted: {}", task_id);
                 }
                 "complete" => {
-                    let Some(task_id) = args.next() else {
-                        print_usage();
-                        std::process::exit(2);
-                    };
-                    let result = args.collect::<Vec<_>>().join(" ");
-                    let updated = app.complete_task_run(
-                        &task_id,
-                        0,
-                        if result.trim().is_empty() {
-                            None
-                        } else {
-                            Some(result)
-                        },
-                        None,
-                    )?;
+                    let parsed = parse_task_complete_args(&mut args)?;
+                    let updated =
+                        app.complete_task_run_manual_override(&parsed.task_id, parsed.result)?;
                     if let Some(task) = updated {
                         println!("completed: {}", task.id);
                         println!("status: {}", task.status.as_str());
                         println!("next_run: {}", task.next_run.as_deref().unwrap_or("-"));
                     } else {
-                        println!("task_not_found: {}", task_id);
+                        println!("task_not_found: {}", parsed.task_id);
                     }
                 }
                 "run-due" => {

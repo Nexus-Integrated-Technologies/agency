@@ -172,7 +172,7 @@ impl NanoclawApp {
         self.db.delete_task(task_id)
     }
 
-    pub fn complete_task_run(
+    fn complete_task_run(
         &mut self,
         task_id: &str,
         duration_ms: i64,
@@ -205,6 +205,19 @@ impl NanoclawApp {
     ) -> Result<Option<ScheduledTask>> {
         validate_task_execution_completion_evidence(task_id, execution)?;
         self.complete_task_run(task_id, duration_ms, result, None)
+    }
+
+    pub fn complete_task_run_manual_override(
+        &mut self,
+        task_id: &str,
+        result: Option<String>,
+    ) -> Result<Option<ScheduledTask>> {
+        let result = result
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("Manual completion override: {value}"))
+            .unwrap_or_else(|| "Manual completion override.".to_string());
+        self.complete_task_run(task_id, 0, Some(result), None)
     }
 
     pub fn record_failed_task_run(

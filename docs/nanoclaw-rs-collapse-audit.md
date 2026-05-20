@@ -265,11 +265,15 @@ Already active:
   outcome, and cancellation-before-evidence paths now return structured
   `worker_transport` evidence with `failed`, `timed_out`, or `cancelled`
   status before the run reaches closure validation.
+- The `nanoclaw task complete` operator command now requires
+  `--manual-override` and records a manual completion override, while
+  execution-driven completion remains gated through structured execution
+  evidence.
 
 Remaining work:
 
-- Thread the same closure gate into every issue/writeback surface outside the
-  local scheduled-task path.
+- Thread the same closure gate into external issue/writeback surfaces that can
+  transition third-party work states.
 - Add explicit verification command records instead of the current adapter
   status sentinel.
 - Extend this transport/error normalization to future external adapter plugins
