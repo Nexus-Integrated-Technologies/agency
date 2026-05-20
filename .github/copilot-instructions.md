@@ -44,8 +44,11 @@ Current commands:
 
 ```bash
 cargo run --quiet --bin nanoclaw -- show-config
-cargo run --quiet --bin nanoclaw -- gateway serve
-cargo run --quiet --bin nanoclaw -- local run
+cargo run --quiet --bin nanoclaw -- runtime status
+cargo run --quiet --bin nanoclaw -- runtime state --limit 5
+cargo run --quiet --bin nanoclaw -- runtime inspect --limit 5
+cargo run --quiet --bin nanoclaw -- runtime health --limit 5
+cargo run --quiet --bin nanoclaw -- runtime cleanup --state-residue
 ```
 
 `start_agency.sh` is a compatibility guard only. It must not launch the old
