@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::foundation::{
     ExecutionLane, Group, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
@@ -330,6 +333,10 @@ fn runtime_pid_path(config: &NanoclawConfig, profile: RuntimeServeProfile) -> Pa
     runtime_control_dir(config).join(format!("{}.pid", profile.as_str()))
 }
 
+fn runtime_startup_events_path(config: &NanoclawConfig) -> PathBuf {
+    runtime_control_dir(config).join("startup-events.jsonl")
+}
+
 fn runtime_pid_status_json(config: &NanoclawConfig) -> serde_json::Value {
     let mut profiles = serde_json::Map::new();
     for profile in RuntimeServeProfile::all() {
@@ -522,6 +529,103 @@ fn runtime_pid_profile_state_json(config: &NanoclawConfig, profile: RuntimeServe
             "pid": null,
             "state": "invalid",
             "running": false,
+        }),
+    }
+}
+
+fn append_runtime_startup_event(config: &NanoclawConfig, event: &Value) -> Result<()> {
+    let control_dir = runtime_control_dir(config);
+    fs::create_dir_all(&control_dir)
+        .with_context(|| format!("failed to create {}", control_dir.display()))?;
+    let path = runtime_startup_events_path(config);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(event)?)
+        .with_context(|| format!("failed to append {}", path.display()))?;
+    Ok(())
+}
+
+fn record_runtime_startup_event(
+    config: &NanoclawConfig,
+    serve_args: &RuntimeServeArgs,
+    phase: &str,
+    status: &str,
+    message: impl Into<String>,
+    evidence: Value,
+) -> Result<Value> {
+    let event = json!({
+        "schemaVersion": "2026-05-20",
+        "eventId": Uuid::new_v4().to_string(),
+        "timestamp": Utc::now().to_rfc3339(),
+        "profile": serve_args.profile.as_str(),
+        "phase": phase,
+        "status": status,
+        "readOnly": serve_args.read_only,
+        "laneOverride": serve_args.lane_override.as_ref().map(ExecutionLane::as_str),
+        "processId": std::process::id(),
+        "message": message.into(),
+        "evidence": evidence,
+    });
+    append_runtime_startup_event(config, &event)?;
+    Ok(event)
+}
+
+fn runtime_startup_events_json(config: &NanoclawConfig, limit: usize) -> Value {
+    let path = runtime_startup_events_path(config);
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let mut total_records = 0usize;
+            let mut invalid_records = 0usize;
+            let mut recent = Vec::<Value>::new();
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                total_records += 1;
+                match serde_json::from_str::<Value>(line) {
+                    Ok(value) => {
+                        recent.push(value);
+                    }
+                    Err(error) => {
+                        invalid_records += 1;
+                        recent.push(json!({
+                            "schemaVersion": "2026-05-20",
+                            "status": "invalid",
+                            "message": "runtime startup event record could not be parsed",
+                            "error": error.to_string(),
+                        }));
+                    }
+                }
+                if recent.len() > limit {
+                    recent.remove(0);
+                }
+            }
+            json!({
+                "file": path_state_json(&path),
+                "totalRecords": total_records,
+                "invalidRecords": invalid_records,
+                "shown": recent.len(),
+                "recent": recent,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+            "file": path_state_json(&path),
+            "totalRecords": 0,
+            "invalidRecords": 0,
+            "shown": 0,
+            "recent": [],
+        }),
+        Err(error) => json!({
+            "file": path_state_json(&path),
+            "totalRecords": null,
+            "invalidRecords": null,
+            "shown": 0,
+            "recent": [],
+            "error": error.to_string(),
         }),
     }
 }
@@ -1467,6 +1571,7 @@ fn runtime_state_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
         "runtime": {
             "activeBinary": "nanoclaw",
             "control": runtime_pid_status_json(&app.config),
+            "startupEvents": runtime_startup_events_json(&app.config, limit),
         },
         "roots": {
             "projectRoot": path_state_json(&app.config.project_root),
@@ -2003,6 +2108,15 @@ mod tests {
         assert!(error.contains("profile=gateway"));
         assert!(error.contains("channel=openclaw_gateway"));
         assert!(error.contains("NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+
+        let events = runtime_startup_events_json(&config, 5);
+        assert_eq!(events["totalRecords"], 1);
+        assert_eq!(events["recent"][0]["phase"], "preflight");
+        assert_eq!(events["recent"][0]["status"], "failed");
+        assert_eq!(events["recent"][0]["profile"], "gateway");
+        assert!(events["recent"][0]["evidence"]["failures"]
+            .to_string()
+            .contains("NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
         Ok(())
     }
 
@@ -2376,6 +2490,50 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn runtime_state_reports_startup_event_ledger() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: Some(ExecutionLane::Host),
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "startup",
+            "failed",
+            "synthetic startup failure",
+            json!({
+                "reason": "unit_test",
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let state = runtime_state_json(&app, 5)?;
+
+        assert_eq!(state["runtime"]["startupEvents"]["totalRecords"], 1);
+        assert_eq!(
+            state["runtime"]["startupEvents"]["recent"][0]["profile"],
+            "gateway"
+        );
+        assert_eq!(
+            state["runtime"]["startupEvents"]["recent"][0]["status"],
+            "failed"
+        );
+        assert_eq!(
+            state["runtime"]["startupEvents"]["recent"][0]["evidence"]["reason"],
+            "unit_test"
+        );
+        Ok(())
+    }
 }
 
 fn print_runtime_poll_summary(summary: super::runtime::RuntimePumpSummary) {
@@ -2414,6 +2572,30 @@ fn runtime_serve_required_channel_ids(profile: RuntimeServeProfile) -> &'static 
     }
 }
 
+fn runtime_serve_channel_evidence(
+    registry: &RuntimeChannelRegistry,
+    profile: RuntimeServeProfile,
+) -> Value {
+    let profile_name = profile.as_str();
+    let required_channel_ids = runtime_serve_required_channel_ids(profile);
+    let channels = registry
+        .channels
+        .iter()
+        .filter(|channel| {
+            required_channel_ids.contains(&channel.id.as_str())
+                || channel
+                    .serve_profiles
+                    .iter()
+                    .any(|candidate| candidate == profile_name)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "summary": &registry.summary,
+        "requiredChannelIds": required_channel_ids,
+        "profileChannels": channels,
+    })
+}
+
 fn runtime_serve_preflight(config: &NanoclawConfig, serve_args: &RuntimeServeArgs) -> Result<()> {
     let registry = runtime_channel_registry(config);
     let failures = runtime_serve_preflight_failures(&registry, serve_args);
@@ -2421,10 +2603,22 @@ fn runtime_serve_preflight(config: &NanoclawConfig, serve_args: &RuntimeServeArg
         return Ok(());
     }
 
-    anyhow::bail!(
-        "{}",
-        format_runtime_channel_preflight_error(serve_args.profile, &failures)
-    )
+    let message = format_runtime_channel_preflight_error(serve_args.profile, &failures);
+    if let Err(error) = record_runtime_startup_event(
+        config,
+        serve_args,
+        "preflight",
+        "failed",
+        message.clone(),
+        json!({
+            "runtimeChannels": runtime_serve_channel_evidence(&registry, serve_args.profile),
+            "failures": failures,
+        }),
+    ) {
+        eprintln!("warning: failed to record runtime startup preflight evidence: {error}");
+    }
+
+    anyhow::bail!("{}", message)
 }
 
 fn runtime_serve_preflight_failures<'a>(
@@ -2491,8 +2685,29 @@ fn format_runtime_channel_preflight_error(
     )
 }
 
-fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
-    runtime_serve_preflight(&config, &serve_args)?;
+fn record_runtime_profile_running(
+    config: &NanoclawConfig,
+    serve_args: &RuntimeServeArgs,
+) -> Result<()> {
+    let registry = runtime_channel_registry(config);
+    record_runtime_startup_event(
+        config,
+        serve_args,
+        "startup",
+        "running",
+        format!(
+            "runtime profile '{}' entered its serving loop",
+            serve_args.profile.as_str()
+        ),
+        json!({
+            "control": runtime_pid_profile_state_json(config, serve_args.profile),
+            "runtimeChannels": runtime_serve_channel_evidence(&registry, serve_args.profile),
+        }),
+    )?;
+    Ok(())
+}
+
+fn run_runtime_serve_profile(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
     let _pid_guard = write_runtime_pid_file(&config, serve_args.profile)?;
     match serve_args.profile {
         RuntimeServeProfile::Full => {
@@ -2502,33 +2717,84 @@ fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Re
                 start_pm_automation_loop(app.config.clone())?;
                 start_openclaw_gateway_server(app.config.clone())?;
             }
-            let executor = ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override)?;
+            let executor =
+                ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override.clone())?;
             let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let running_config = app.config.clone();
             let mut runtime = SlackRuntime::new(app, channel, executor);
+            record_runtime_profile_running(&running_config, &serve_args)?;
             runtime.run_forever()?;
         }
         RuntimeServeProfile::Gateway => {
+            let running_config = config.clone();
             let _app = NanoclawApp::open(config.clone())?;
             start_openclaw_gateway_server(config)?;
+            record_runtime_profile_running(&running_config, &serve_args)?;
             park_runtime(RuntimeServeProfile::Gateway);
         }
         RuntimeServeProfile::Webhook => {
+            let running_config = config.clone();
             start_webhook_server(config)?;
+            record_runtime_profile_running(&running_config, &serve_args)?;
             park_runtime(RuntimeServeProfile::Webhook);
         }
         RuntimeServeProfile::Pm => {
+            let running_config = config.clone();
             start_pm_automation_loop(config)?;
+            record_runtime_profile_running(&running_config, &serve_args)?;
             park_runtime(RuntimeServeProfile::Pm);
         }
         RuntimeServeProfile::Slack => {
             let app = NanoclawApp::open(config)?;
-            let executor = ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override)?;
+            let executor =
+                ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override.clone())?;
             let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let running_config = app.config.clone();
             let mut runtime = SlackRuntime::new(app, channel, executor);
+            record_runtime_profile_running(&running_config, &serve_args)?;
             runtime.run_forever()?;
         }
     }
     Ok(())
+}
+
+fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
+    runtime_serve_preflight(&config, &serve_args)?;
+    let registry = runtime_channel_registry(&config);
+    record_runtime_startup_event(
+        &config,
+        &serve_args,
+        "startup",
+        "starting",
+        format!(
+            "runtime profile '{}' passed preflight and is starting",
+            serve_args.profile.as_str()
+        ),
+        json!({
+            "runtimeChannels": runtime_serve_channel_evidence(&registry, serve_args.profile),
+        }),
+    )?;
+
+    let result = run_runtime_serve_profile(config.clone(), serve_args.clone());
+    if let Err(error) = &result {
+        if let Err(record_error) = record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "startup",
+            "failed",
+            error.to_string(),
+            json!({
+                "control": runtime_pid_profile_state_json(&config, serve_args.profile),
+                "runtimeChannels": runtime_serve_channel_evidence(
+                    &runtime_channel_registry(&config),
+                    serve_args.profile
+                ),
+            }),
+        ) {
+            eprintln!("warning: failed to record runtime startup failure evidence: {record_error}");
+        }
+    }
+    result
 }
 
 fn parse_lane_override<I>(args: &mut I) -> Result<Option<ExecutionLane>>
