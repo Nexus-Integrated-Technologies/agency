@@ -277,6 +277,9 @@ Already active:
 - App-level task status updates now reject raw `Completed` transitions through
   `set_task_status`, so active writeback surfaces that use the app API must use
   execution evidence or an explicit manual completion override.
+- The lower-level DB `set_task_status` helper also rejects raw `Completed`
+  transitions; durable completion remains available only through run-completion
+  update paths that the app gates with execution evidence or manual override.
 - Linear is no longer an active issue/writeback surface for this instance.
   Legacy Linear CLI and webhook paths are disabled by default and require
   `NANOCLAW_LINEAR_LEGACY_ENABLED=true` only for controlled migration/reference

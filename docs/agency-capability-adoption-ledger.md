@@ -76,8 +76,10 @@ or clean-roomed into the active runtime.
    completion now requires an explicit `--manual-override`, keeping
    execution-driven closure on the structured evidence path. App-level raw
    task status updates now reject `Completed`, forcing writeback callers that
-   use the app API through execution evidence or a manual override. Linear is
-   parked as a discontinued legacy integration and is disabled by default. Remaining
+   use the app API through execution evidence or a manual override. The DB
+   status helper also rejects raw `Completed` transitions, leaving durable
+   completion to run-completion update paths. Linear is parked as a discontinued
+   legacy integration and is disabled by default. Remaining
    work is to extend the same contract to active Nexus/Paperclip/GitHub
    writeback surfaces and future external adapter plugins as they are
    registered.

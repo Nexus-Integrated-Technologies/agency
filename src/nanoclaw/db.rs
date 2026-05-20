@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};
 
@@ -2602,6 +2602,11 @@ impl NanoclawDb {
     }
 
     pub fn set_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
+        if matches!(status, TaskStatus::Completed) {
+            bail!(
+                "task {task_id} cannot be marked completed through set_task_status; use run completion evidence or a manual override"
+            );
+        }
         self.conn
             .execute(
                 "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2",
@@ -4157,6 +4162,30 @@ mod tests {
 
         assert_eq!(db.get_task_by_id("task-1")?, Some(task.clone()));
         assert_eq!(db.list_due_tasks("2026-04-05T12:00:00Z")?, vec![task]);
+
+        db.set_task_status("task-1", TaskStatus::Paused)?;
+        assert_eq!(
+            db.get_task_by_id("task-1")?.map(|stored| stored.status),
+            Some(TaskStatus::Paused)
+        );
+        let completion_error = db
+            .set_task_status("task-1", TaskStatus::Completed)
+            .expect_err("raw db status update should not bypass completion evidence");
+        assert!(completion_error
+            .to_string()
+            .contains("cannot be marked completed through set_task_status"));
+        assert_eq!(
+            db.get_task_by_id("task-1")?.map(|stored| stored.status),
+            Some(TaskStatus::Paused)
+        );
+
+        db.update_task_after_run("task-1", None, "Completed with evidence")?;
+        let completed = db.get_task_by_id("task-1")?.expect("task should exist");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(
+            completed.last_result.as_deref(),
+            Some("Completed with evidence")
+        );
         Ok(())
     }
 
