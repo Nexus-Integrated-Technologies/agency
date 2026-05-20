@@ -142,6 +142,7 @@ pub enum TaskStatus {
     Active,
     Paused,
     Completed,
+    Failed,
     Custom(String),
 }
 
@@ -151,6 +152,7 @@ impl TaskStatus {
             "" | "active" => Self::Active,
             "paused" => Self::Paused,
             "completed" => Self::Completed,
+            "failed" => Self::Failed,
             other => Self::Custom(other.to_string()),
         }
     }
@@ -160,6 +162,7 @@ impl TaskStatus {
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Completed => "completed",
+            Self::Failed => "failed",
             Self::Custom(value) => value.as_str(),
         }
     }

@@ -230,12 +230,8 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
                 }
                 Err(error) => {
                     errors += 1;
-                    self.app.complete_task_run(
-                        &task.id,
-                        duration_ms,
-                        None,
-                        Some(error.to_string()),
-                    )?;
+                    self.app
+                        .record_failed_task_run(&task.id, duration_ms, error.to_string())?;
                 }
             }
             self.app.queue.finish_group(&task.chat_jid);

@@ -218,6 +218,8 @@ Already active:
 - Scheduled task completion now calls a runtime closure gate: an executed task
   can only transition to completed from successful validated execution
   evidence.
+- Runtime task errors use a failed-run path, so missing/invalid execution
+  evidence no longer reaches completed status through the generic error path.
 
 Remaining work:
 

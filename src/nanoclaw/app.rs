@@ -207,6 +207,25 @@ impl NanoclawApp {
         self.complete_task_run(task_id, duration_ms, result, None)
     }
 
+    pub fn record_failed_task_run(
+        &mut self,
+        task_id: &str,
+        duration_ms: i64,
+        error: String,
+    ) -> Result<Option<ScheduledTask>> {
+        let Some(task) = self.db.get_task_by_id(task_id)? else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let next_run = compute_next_run(&task, &self.config.timezone, now)?;
+        let summary = format!("Error: {error}");
+        let log = build_run_log(task_id, duration_ms, None, Some(error), now);
+        self.db.log_task_run(&log)?;
+        self.db
+            .update_task_after_failed_run(task_id, next_run.as_deref(), &summary)?;
+        self.db.get_task_by_id(task_id)
+    }
+
     pub fn task(&self, task_id: &str) -> Result<Option<ScheduledTask>> {
         self.db.get_task_by_id(task_id)
     }
@@ -732,6 +751,14 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, FoundationEvent::TaskScheduled { .. })));
+        let failed = app
+            .record_failed_task_run(&task.id, 12, "missing execution evidence".to_string())?
+            .expect("task should still exist");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            failed.last_result.as_deref(),
+            Some("Error: missing execution evidence")
+        );
         Ok(())
     }
 

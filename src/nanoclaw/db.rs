@@ -2578,6 +2578,29 @@ impl NanoclawDb {
         Ok(())
     }
 
+    pub fn update_task_after_failed_run(
+        &self,
+        task_id: &str,
+        next_run: Option<&str>,
+        last_result: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                r#"
+                UPDATE scheduled_tasks
+                SET next_run = ?1,
+                    last_run = ?2,
+                    last_result = ?3,
+                    status = CASE WHEN ?1 IS NULL THEN 'failed' ELSE status END
+                WHERE id = ?4
+                "#,
+                params![next_run, now, last_result, task_id],
+            )
+            .with_context(|| format!("failed to update task after failed run {}", task_id))?;
+        Ok(())
+    }
+
     pub fn set_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
         self.conn
             .execute(
