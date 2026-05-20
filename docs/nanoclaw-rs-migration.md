@@ -1,7 +1,10 @@
 # NanoClaw Rust Migration
 
-This repository is being cut down from the existing `agency` workspace into a
-pure-Rust implementation that mirrors NanoClaw's product surface.
+This repository is adopting the existing `agency` harness into a pure-Rust
+NanoClaw-shaped runtime. NanoClaw is the claw-behavior reference model; Agency
+is the Rust implementation substrate. The migration should clean-room useful
+Agency capabilities into the foundation and NanoClaw runtime instead of treating
+all old Agency/holonic material as disposable residue.
 
 ## Target Shape
 
@@ -108,6 +111,9 @@ The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
 
 ## Prune Rules
 
+- Classify Agency subsystems as adoption candidates before pruning them. Useful
+  harness concepts should be distilled into smaller `foundation` or `nanoclaw`
+  contracts.
 - If a subsystem is holonic, FPF-specific, or governance-specific and no longer
   needed for NanoClaw parity, move it into `graveyard/holonic/`.
 - If a subsystem is merely out of scope but not holonic, evaluate it
@@ -119,8 +125,10 @@ The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
 
 - The current collapse audit and ordered backlog live in
   `docs/nanoclaw-rs-collapse-audit.md`.
+- Build an Agency capability adoption ledger before moving large directories.
 - Strip `src/fpf/` and governance-dependent orchestration modules after their
-  remaining call sites are removed or replaced.
+  useful primitives are clean-roomed or their remaining call sites are removed
+  or replaced.
 - Collapse the workspace toward the small, operator-oriented NanoClaw surface:
   orchestrator, queue, DB, runtime, scheduler, channels, and group memory.
 - Extend the subprocess executor into stronger isolation modes, especially

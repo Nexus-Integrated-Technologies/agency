@@ -3,15 +3,27 @@
 Date: 2026-05-20
 Branch baseline: `origin/buddha/openclaw-gateway-runtime-auth-ci` after PR 18
 
-This audit starts the collapse from the legacy `agency` workspace toward the
-Rust NanoClaw runtime by separating three states:
+This audit starts the collapse from the `agency` workspace toward the Rust
+NanoClaw runtime. The intent is not to throw Agency away. Agency is the native
+Rust harness. NanoClaw is the claw-shaped third-party reference model. The
+target is to adopt the useful Agency harness capabilities into a Rust NanoClaw
+runtime through clean-room distillation, not to preserve every old module shape
+or delete valuable ideas just because they are currently outside the compile
+path.
+
+Use four states while collapsing:
 
 - `active`: compiled, tested, and part of the Rust NanoClaw runtime path.
+- `assimilation candidate`: Agency capability that may become a smaller,
+  cleaner foundation or NanoClaw runtime primitive.
 - `parked`: still useful reference material, but not on the runtime compile
   path.
-- `legacy`: old Agency, FPF, voice, memory, or tool-system material that must
-  either move to `graveyard/holonic/`, become a descendant of the foundation
-  model, or leave this runtime package.
+- `graveyard`: material intentionally decoupled from runtime execution because
+  it is governance-only, holonic-only, obsolete, or unsafe to keep as active
+  code.
+
+The practical rule: classify first, clean-room useful capability second, and
+only then park or graveyard what is not worth adopting.
 
 ## Current Runtime Boundary
 
@@ -57,16 +69,16 @@ disabled modules and removed dependencies:
 - removed or intentionally absent deps: `tokio`, `candle_core`, `candle_onnx`,
   `tracing`, `tracing_subscriber`, `pdf_extract`, `futures`, `async_trait`
 
-The repository still contains substantial parked or legacy code:
+The repository still contains substantial parked or candidate code:
 
 - active Rust NanoClaw source: `src/nanoclaw/`, about 33k lines
 - active foundation source: `src/foundation/`, about 3k lines
-- legacy source still on disk under `src/agent`, `src/fpf`, `src/memory`,
+- Agency source still on disk under `src/agent`, `src/fpf`, `src/memory`,
   `src/models`, `src/orchestrator`, `src/runtime`, `src/safety`,
   `src/services`, `src/tools`, and `src/utils`, about 25k lines
-- legacy bins under `src/bin/` other than `nanoclaw.rs`
-- legacy integration tests under `tests/`
-- old desktop shell under `src-tauri/`
+- inactive bins under `src/bin/` other than `nanoclaw.rs`
+- inactive integration tests under `tests/`
+- desktop shell under `src-tauri/`
 - old service scripts such as `start_agency.sh`, `docker-compose.yml`, and
   `docker/Dockerfile.speaker`
 
@@ -93,18 +105,24 @@ Exit criterion:
 - A fresh clone can run all active-target checks without compiling legacy
   Agency bins/tests.
 
-### 2. Classify Legacy Directories
+### 2. Classify Agency Capabilities For Adoption
 
 Status: not done.
 
 Remaining work:
 
-- Move governance-only and FPF-only material into `graveyard/holonic/`.
-- Decide whether each old source directory is:
-  - deleted after replacement,
-  - parked under `graveyard/`,
-  - or re-homed as a descendant module below `foundation` or `nanoclaw`.
-- Start with the largest and least runtime-critical areas:
+- Create a capability ledger for each old source directory before moving or
+  deleting anything.
+- Decide whether each capability should be:
+  - clean-roomed into `src/foundation/` as a domain primitive,
+  - clean-roomed into `src/nanoclaw/` as runtime behavior,
+  - parked as reference material outside the active compile path,
+  - moved to `graveyard/holonic/`,
+  - or deleted after a replacement is proven.
+- Treat holonic and FPF material as candidates for distilled primitives before
+  classifying them as graveyard material. Useful concepts may become typed
+  lineage, gates, assurance, provenance, planning, or evidence contracts.
+- Start with the largest and least active-target-critical areas:
   - `src/fpf/`
   - `src/orchestrator/`
   - `src/agent/`
@@ -113,8 +131,8 @@ Remaining work:
 
 Exit criterion:
 
-- No legacy directory remains at top-level `src/` unless it has a documented
-  descendant role in the NanoClaw architecture.
+- No old Agency directory remains at top-level `src/` unless it has a documented
+  adoption decision and a descendant role in the Rust NanoClaw architecture.
 
 ### 3. Replace Legacy Scripts With NanoClaw Entrypoints
 
@@ -231,11 +249,13 @@ Exit criterion:
 ## Recommended Order
 
 1. Merge the explicit Cargo target graph and collapse audit.
-2. Delete or park legacy bins/tests so `src/bin/` and `tests/` stop advertising
-   broken old targets.
+2. Park inactive bins/tests so `src/bin/` and `tests/` stop advertising broken
+   old targets while preserving useful examples for capability extraction.
 3. Rewrite README and startup docs around the NanoClaw runtime.
-4. Move `src/fpf/` and governance-only files into `graveyard/holonic/`.
-5. Classify the remaining old source directories one by one.
+4. Build an Agency capability adoption ledger, starting with `src/fpf/`,
+   `src/orchestrator/`, `src/agent/`, and `src/tools/`.
+5. Clean-room useful Agency concepts into `foundation` or `nanoclaw`; move only
+   non-adopted holonic/governance material into `graveyard/holonic/`.
 6. Add a unified `nanoclaw runtime` command for local, Slack, webhook, and
    OpenClaw operation.
 7. Add structured execution evidence as the closure gate for every lane.
@@ -247,4 +267,5 @@ Exit criterion:
   or any model directly.
 - Do not make local-private operator routes public for convenience.
 - Do not delete active runtime state or group memory during source cleanup.
-- Do not revive old Agency dependencies just to make legacy tests pass.
+- Do not revive old Agency dependencies just to make old surfaces pass. Re-home
+  useful behavior through smaller Rust NanoClaw contracts instead.
