@@ -32,6 +32,20 @@ pub struct NanoclawDbCounts {
     pub registered_groups: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredExecutionEvidence {
+    pub id: String,
+    pub run_id: String,
+    pub provenance_id: Option<String>,
+    pub group_folder: Option<String>,
+    pub session_id: String,
+    pub adapter_type: String,
+    pub mode: String,
+    pub status: String,
+    pub evidence: Value,
+    pub created_at: String,
+}
+
 pub struct NanoclawDb {
     path: PathBuf,
     conn: Connection,
@@ -296,6 +310,25 @@ impl NanoclawDb {
                   ON execution_provenance(group_folder, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_execution_provenance_status
                   ON execution_provenance(status, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS execution_evidence (
+                  id TEXT PRIMARY KEY,
+                  run_id TEXT NOT NULL,
+                  provenance_id TEXT,
+                  group_folder TEXT,
+                  session_id TEXT NOT NULL,
+                  adapter_type TEXT NOT NULL,
+                  mode TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  evidence_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_execution_evidence_group
+                  ON execution_evidence(group_folder, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_execution_evidence_run
+                  ON execution_evidence(run_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_execution_evidence_status
+                  ON execution_evidence(status, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS omx_sessions (
                   session_id TEXT PRIMARY KEY,
@@ -679,6 +712,92 @@ impl NanoclawDb {
         Ok(())
     }
 
+    pub fn create_execution_evidence(&self, record: &StoredExecutionEvidence) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+                INSERT OR REPLACE INTO execution_evidence (
+                  id,
+                  run_id,
+                  provenance_id,
+                  group_folder,
+                  session_id,
+                  adapter_type,
+                  mode,
+                  status,
+                  evidence_json,
+                  created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                params![
+                    record.id,
+                    record.run_id,
+                    record.provenance_id,
+                    record.group_folder,
+                    record.session_id,
+                    record.adapter_type,
+                    record.mode,
+                    record.status,
+                    record.evidence.to_string(),
+                    record.created_at,
+                ],
+            )
+            .with_context(|| format!("failed to insert execution evidence {}", record.id))?;
+        Ok(())
+    }
+
+    pub fn list_execution_evidence(
+        &self,
+        group_folder: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredExecutionEvidence>> {
+        let limit = limit.max(1) as i64;
+        let (sql, params): (&str, Vec<rusqlite::types::Value>) =
+            if let Some(group_folder) = group_folder {
+                (
+                    r#"
+                    SELECT id, run_id, provenance_id, group_folder, session_id, adapter_type,
+                           mode, status, evidence_json, created_at
+                    FROM execution_evidence
+                    WHERE group_folder = ?1
+                    ORDER BY created_at DESC
+                    LIMIT ?2
+                    "#,
+                    vec![
+                        rusqlite::types::Value::Text(group_folder.to_string()),
+                        rusqlite::types::Value::Integer(limit),
+                    ],
+                )
+            } else {
+                (
+                    r#"
+                    SELECT id, run_id, provenance_id, group_folder, session_id, adapter_type,
+                           mode, status, evidence_json, created_at
+                    FROM execution_evidence
+                    ORDER BY created_at DESC
+                    LIMIT ?1
+                    "#,
+                    vec![rusqlite::types::Value::Integer(limit)],
+                )
+            };
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("failed to prepare execution evidence query")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params),
+                map_execution_evidence_row,
+            )
+            .context("failed to execute execution evidence query")?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.context("failed to decode execution evidence row")?);
+        }
+        Ok(records)
+    }
+
     pub fn update_execution_provenance(
         &self,
         id: &str,
@@ -831,6 +950,13 @@ impl NanoclawDb {
                   secret_handles_used_json,
                   fallback_reason,
                   sync_scope_json,
+                  task_signature_json,
+                  boundary_claims_json,
+                  gate_decision,
+                  gate_evaluation_json,
+                  assurance_json,
+                  symbol_carriers_json,
+                  provenance_edges_json,
                   status,
                   created_at,
                   updated_at,
@@ -2452,6 +2578,29 @@ impl NanoclawDb {
         Ok(())
     }
 
+    pub fn update_task_after_failed_run(
+        &self,
+        task_id: &str,
+        next_run: Option<&str>,
+        last_result: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                r#"
+                UPDATE scheduled_tasks
+                SET next_run = ?1,
+                    last_run = ?2,
+                    last_result = ?3,
+                    status = CASE WHEN ?1 IS NULL THEN 'failed' ELSE status END
+                WHERE id = ?4
+                "#,
+                params![next_run, now, last_result, task_id],
+            )
+            .with_context(|| format!("failed to update task after failed run {}", task_id))?;
+        Ok(())
+    }
+
     pub fn set_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
         self.conn
             .execute(
@@ -3770,6 +3919,23 @@ fn map_execution_provenance_row(
     })
 }
 
+fn map_execution_evidence_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredExecutionEvidence> {
+    Ok(StoredExecutionEvidence {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        provenance_id: row.get(2)?,
+        group_folder: row.get(3)?,
+        session_id: row.get(4)?,
+        adapter_type: row.get(5)?,
+        mode: row.get(6)?,
+        status: row.get(7)?,
+        evidence: parse_json_required(row.get(8)?)?,
+        created_at: row.get(9)?,
+    })
+}
+
 fn map_host_os_control_approval_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<HostOsControlApprovalRequestRecord> {
@@ -3906,7 +4072,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::NanoclawDb;
+    use super::{NanoclawDb, StoredExecutionEvidence};
     use crate::foundation::{
         CapabilityManifest, ExecutionLocation, ExecutionMountKind, ExecutionMountSummaryEntry,
         ExecutionProvenanceRecord, ExecutionRunKind, ExecutionStatus, ExecutionTrustLevel, Group,
@@ -4297,6 +4463,37 @@ mod tests {
         assert_eq!(stored.execution_location, ExecutionLocation::Host);
         assert_eq!(stored.mount_summary.len(), 1);
         assert_eq!(db.list_execution_provenance(Some("main"), 10)?.len(), 1);
+        assert_eq!(db.list_execution_provenance(None, 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stores_execution_evidence_records() -> Result<()> {
+        let dir = tempdir()?;
+        let db = NanoclawDb::open(dir.path().join("messages.db"))?;
+        db.create_execution_evidence(&StoredExecutionEvidence {
+            id: "evidence-1".to_string(),
+            run_id: "exec-1".to_string(),
+            provenance_id: Some("exec-1".to_string()),
+            group_folder: Some("main".to_string()),
+            session_id: "session-1".to_string(),
+            adapter_type: "codex".to_string(),
+            mode: "code".to_string(),
+            status: "succeeded".to_string(),
+            evidence: json!({
+                "schema_version": "2026-05-20",
+                "adapter_type": "codex",
+                "run_id": "exec-1"
+            }),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        })?;
+
+        let all = db.list_execution_evidence(None, 10)?;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].adapter_type, "codex");
+        assert_eq!(all[0].evidence["run_id"], "exec-1");
+        assert_eq!(db.list_execution_evidence(Some("main"), 10)?.len(), 1);
+        assert_eq!(db.list_execution_evidence(Some("other"), 10)?.len(), 0);
         Ok(())
     }
 

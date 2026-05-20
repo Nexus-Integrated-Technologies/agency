@@ -8,7 +8,7 @@
 Please check the following before submitting:
 
 - [ ] I have read and agree to the **CLA** (Comment "I have read and agree to the CLA" if this is your first time).
-- [ ] I have run `make test` locally and all tests passed.
+- [ ] I have run `make verify` locally and all active runtime gates passed.
 - [ ] I have added tests for my new feature/bugfix.
 - [ ] My code follows the project's style and conventions.
 - [ ] I have updated the documentation (if applicable).

@@ -21,8 +21,10 @@ use crate::foundation::{
 use super::app::NanoclawApp;
 use super::config::NanoclawConfig;
 use super::executor::{
-    build_execution_session, ExecutionArtifactRef, ExecutionLaneRouter, ExecutionMetadata,
-    ExecutionRequest, ExecutionResponse, ExecutorBoundary,
+    build_execution_evidence, build_execution_session, BuildExecutionEvidenceInput,
+    ExecutionArtifactRef, ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionLaneRouter,
+    ExecutionMetadata, ExecutionRequest, ExecutionResponse, ExecutionVerificationRef,
+    ExecutorBoundary,
 };
 use super::model_router::WorkerBackend;
 use super::omx::{
@@ -1128,24 +1130,50 @@ fn execute_codespaces_gateway_run(
         ));
     }
 
+    let boundary = ExecutionBoundary {
+        kind: ExecutionBoundaryKind::RemoteWorker,
+        root: Some(target.remote_cwd.clone()),
+        isolated: true,
+    };
+    let log_path_string = log_path.display().to_string();
+    let metadata = ExecutionMetadata {
+        backend: Some("codex".to_string()),
+        provider: Some("github_codespaces".to_string()),
+        status: Some("completed".to_string()),
+        summary: Some(stdout.clone()),
+        ..Default::default()
+    };
+    let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type: "openclaw_gateway",
+        mode: ExecutionEvidenceMode::Gateway,
+        run_id: session.id.as_str(),
+        status: ExecutionEvidenceStatus::Succeeded,
+        session_id: session.id.as_str(),
+        group_folder: Some(session.group_folder.as_str()),
+        workspace_root: Some(target.remote_cwd.as_str()),
+        boundary: &boundary,
+        log_path: Some(log_path_string.as_str()),
+        log_body: Some(log_body.as_str()),
+        metadata: Some(&metadata),
+        provenance_id: None,
+        verification: vec![ExecutionVerificationRef {
+            kind: "command".to_string(),
+            command: Some(describe_process_command(&command)),
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("GitHub Codespaces command completed successfully".to_string()),
+        }],
+        blockers: Vec::new(),
+    });
+
     Ok(ExecutionResponse {
         text: stdout.clone(),
-        boundary: ExecutionBoundary {
-            kind: ExecutionBoundaryKind::RemoteWorker,
-            root: Some(target.remote_cwd.clone()),
-            isolated: true,
-        },
+        boundary,
         session_id: session.id.clone(),
-        log_path: Some(log_path.display().to_string()),
+        log_path: Some(log_path_string),
         log_body: Some(log_body),
         provenance: None,
-        metadata: Some(ExecutionMetadata {
-            backend: Some("codex".to_string()),
-            provider: Some("github_codespaces".to_string()),
-            status: Some("completed".to_string()),
-            summary: Some(stdout.clone()),
-            ..Default::default()
-        }),
+        metadata: Some(metadata),
+        evidence: Some(evidence),
     })
 }
 

@@ -11,7 +11,8 @@ use crate::foundation::{
     Group, MessageRecord, ScheduledTask, TaskContextMode,
 };
 
-use super::app::NanoclawApp;
+use super::app::{validate_task_execution_completion_evidence, NanoclawApp};
+use super::db::StoredExecutionEvidence;
 use super::executor::{
     build_execution_session, ExecutionRequest, ExecutionSession, ExecutorBoundary,
 };
@@ -182,6 +183,7 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
         })?;
         self.record_execution_provenance(&execution)?;
         self.record_execution_log_artifact(&group, None, &session, &execution)?;
+        self.record_execution_evidence_artifact(&group, None, &session, &execution)?;
         let sent = self.deliver_response(
             &group,
             &session,
@@ -228,12 +230,8 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
                 }
                 Err(error) => {
                     errors += 1;
-                    self.app.complete_task_run(
-                        &task.id,
-                        duration_ms,
-                        None,
-                        Some(error.to_string()),
-                    )?;
+                    self.app
+                        .record_failed_task_run(&task.id, duration_ms, error.to_string())?;
                 }
             }
             self.app.queue.finish_group(&task.chat_jid);
@@ -307,8 +305,10 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             boundary_claims,
             gate_evaluation: None,
         })?;
+        validate_task_execution_completion_evidence(&task.id, &execution)?;
         self.record_execution_provenance(&execution)?;
         self.record_execution_log_artifact(&group, Some(&task.id), &session, &execution)?;
+        self.record_execution_evidence_artifact(&group, Some(&task.id), &session, &execution)?;
         let sent = self.deliver_response(
             &group,
             &session,
@@ -316,18 +316,18 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             &execution.text,
             ArtifactKind::TaskResult,
             format!("Scheduled task result for {}", group.name),
-            execution.boundary,
+            execution.boundary.clone(),
         )?;
         let summary = if sent {
-            Some(execution.text)
+            Some(execution.text.clone())
         } else {
             Some("Task completed without outbound text.".to_string())
         };
-        self.app.complete_task_run(
+        self.app.complete_task_run_from_execution(
             &task.id,
             started.elapsed().as_millis() as i64,
             summary,
-            None,
+            &execution,
         )?;
         Ok(sent)
     }
@@ -393,6 +393,61 @@ impl<E: ExecutorBoundary> LocalRuntime<E> {
             title: format!("Execution log for {}", group.name),
             body,
             location: Some(log_path.to_string()),
+            created_at: created_at.clone(),
+        };
+        self.app.record_artifact(artifact.clone());
+        self.app.record_event(FoundationEvent::ArtifactEmitted {
+            artifact,
+            context: Some(ExecutionContext {
+                group_id: group.jid.clone(),
+                chat_id: Some(group.jid.clone()),
+                task_id: task_id.map(str::to_string),
+                boundary: execution.boundary.clone(),
+                workspace_root: Some(session.workspace_root.clone()),
+            }),
+        });
+        Ok(())
+    }
+
+    fn record_execution_evidence_artifact(
+        &mut self,
+        group: &Group,
+        task_id: Option<&str>,
+        session: &ExecutionSession,
+        execution: &super::executor::ExecutionResponse,
+    ) -> Result<()> {
+        let Some(evidence) = execution.evidence.as_ref() else {
+            return Ok(());
+        };
+        let created_at = Utc::now().to_rfc3339();
+        let evidence_value = serde_json::to_value(evidence)?;
+        self.app
+            .db
+            .create_execution_evidence(&StoredExecutionEvidence {
+                id: format!("evidence:{}:{}", evidence.run_id, created_at),
+                run_id: evidence.run_id.clone(),
+                provenance_id: evidence.provenance_id.clone(),
+                group_folder: evidence
+                    .workspace
+                    .group_folder
+                    .clone()
+                    .or_else(|| Some(group.folder.clone())),
+                session_id: evidence.workspace.session_id.clone(),
+                adapter_type: evidence.adapter_type.clone(),
+                mode: evidence.mode.as_str().to_string(),
+                status: evidence.status.as_str().to_string(),
+                evidence: evidence_value.clone(),
+                created_at: created_at.clone(),
+            })?;
+        let body = serde_json::to_string_pretty(&evidence_value)?;
+        let artifact = ArtifactRecord {
+            id: format!("artifact:exec-evidence:{}:{}", session.id, created_at),
+            group_id: group.jid.clone(),
+            task_id: task_id.map(str::to_string),
+            kind: ArtifactKind::Custom("execution_evidence".to_string()),
+            title: format!("Execution evidence for {}", group.name),
+            body,
+            location: None,
             created_at: created_at.clone(),
         };
         self.app.record_artifact(artifact.clone());

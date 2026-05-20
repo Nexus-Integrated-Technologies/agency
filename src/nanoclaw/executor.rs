@@ -13,6 +13,7 @@ use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::foundation::{
@@ -126,7 +127,7 @@ impl ExecutionSession {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("ncl-{}.sock", compact_session_suffix(&self.id)))
+        worker_socket_path(Path::new(&self.session_root), &self.id)
     }
 
     pub fn pid_path(&self) -> PathBuf {
@@ -153,6 +154,22 @@ fn compact_session_suffix(session_id: &str) -> String {
     } else {
         compact[compact.len() - 12..].to_string()
     }
+}
+
+fn worker_socket_path(session_root: &Path, session_id: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(session_root.display().to_string().as_bytes());
+    let digest = hasher.finalize();
+    let root_hash = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::env::temp_dir().join(format!(
+        "ncl-{}-{}.sock",
+        compact_session_suffix(session_id),
+        root_hash
+    ))
 }
 
 pub fn build_execution_session(
@@ -240,6 +257,130 @@ pub struct ExecutionMetadata {
     pub external_run_id: Option<String>,
 }
 
+pub const EXECUTION_EVIDENCE_SCHEMA_VERSION: &str = "2026-05-20";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEvidenceMode {
+    Code,
+    Shell,
+    Gateway,
+    Http,
+    Advisory,
+}
+
+impl ExecutionEvidenceMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Shell => "shell",
+            Self::Gateway => "gateway",
+            Self::Http => "http",
+            Self::Advisory => "advisory",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEvidenceStatus {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl ExecutionEvidenceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionWorkspaceEvidence {
+    pub root: Option<String>,
+    pub exists: bool,
+    pub local: bool,
+    pub group_folder: Option<String>,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionGitFileChange {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionGitCommitRef {
+    pub sha: String,
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionGitEvidence {
+    pub is_repo: bool,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub dirty: bool,
+    pub changed_files: Vec<ExecutionGitFileChange>,
+    pub commits: Vec<ExecutionGitCommitRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionVerificationRef {
+    pub kind: String,
+    pub command: Option<String>,
+    pub status: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionBlockerRef {
+    pub kind: String,
+    pub source: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionEvidence {
+    pub schema_version: String,
+    pub adapter_type: String,
+    pub mode: ExecutionEvidenceMode,
+    pub run_id: String,
+    pub status: ExecutionEvidenceStatus,
+    pub workspace: ExecutionWorkspaceEvidence,
+    pub git: ExecutionGitEvidence,
+    pub boundary: ExecutionBoundary,
+    pub artifacts: Vec<ExecutionArtifactRef>,
+    pub verification: Vec<ExecutionVerificationRef>,
+    pub blockers: Vec<ExecutionBlockerRef>,
+    pub provenance_id: Option<String>,
+    pub external_run_id: Option<String>,
+}
+
+pub struct BuildExecutionEvidenceInput<'a> {
+    pub adapter_type: &'a str,
+    pub mode: ExecutionEvidenceMode,
+    pub run_id: &'a str,
+    pub status: ExecutionEvidenceStatus,
+    pub session_id: &'a str,
+    pub group_folder: Option<&'a str>,
+    pub workspace_root: Option<&'a str>,
+    pub boundary: &'a ExecutionBoundary,
+    pub log_path: Option<&'a str>,
+    pub log_body: Option<&'a str>,
+    pub metadata: Option<&'a ExecutionMetadata>,
+    pub provenance_id: Option<&'a str>,
+    pub verification: Vec<ExecutionVerificationRef>,
+    pub blockers: Vec<ExecutionBlockerRef>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionResponse {
     pub text: String,
@@ -249,6 +390,236 @@ pub struct ExecutionResponse {
     pub log_body: Option<String>,
     pub provenance: Option<ExecutionProvenanceRecord>,
     pub metadata: Option<ExecutionMetadata>,
+    pub evidence: Option<ExecutionEvidence>,
+}
+
+pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> ExecutionEvidence {
+    let artifacts = collect_execution_artifacts(
+        input.adapter_type,
+        input.log_path,
+        input.log_body,
+        input.metadata,
+    );
+    let verification = if input.verification.is_empty() {
+        vec![ExecutionVerificationRef {
+            kind: "adapter_status".to_string(),
+            command: None,
+            status: input.status.as_str().to_string(),
+            summary: input.metadata.and_then(|metadata| metadata.summary.clone()),
+        }]
+    } else {
+        input.verification
+    };
+    let workspace_exists = input
+        .workspace_root
+        .map(|root| Path::new(root).exists())
+        .unwrap_or(false);
+
+    ExecutionEvidence {
+        schema_version: EXECUTION_EVIDENCE_SCHEMA_VERSION.to_string(),
+        adapter_type: input.adapter_type.to_string(),
+        mode: input.mode,
+        run_id: input.run_id.to_string(),
+        status: input.status,
+        workspace: ExecutionWorkspaceEvidence {
+            root: input.workspace_root.map(str::to_string),
+            exists: workspace_exists,
+            local: workspace_exists,
+            group_folder: input.group_folder.map(str::to_string),
+            session_id: input.session_id.to_string(),
+        },
+        git: collect_git_evidence(input.workspace_root),
+        boundary: input.boundary.clone(),
+        artifacts,
+        verification,
+        blockers: input.blockers,
+        provenance_id: input.provenance_id.map(str::to_string),
+        external_run_id: input
+            .metadata
+            .and_then(|metadata| metadata.external_run_id.clone()),
+    }
+}
+
+pub fn validate_execution_response_evidence(response: &ExecutionResponse) -> Result<()> {
+    let Some(evidence) = response.evidence.as_ref() else {
+        bail!(
+            "execution evidence missing for session {}",
+            response.session_id
+        );
+    };
+    validate_execution_evidence(evidence, Some(response.session_id.as_str()))
+}
+
+pub fn validate_execution_evidence(
+    evidence: &ExecutionEvidence,
+    expected_session_id: Option<&str>,
+) -> Result<()> {
+    if evidence.schema_version != EXECUTION_EVIDENCE_SCHEMA_VERSION {
+        bail!(
+            "execution evidence schema mismatch for run {}: expected {}, got {}",
+            evidence.run_id,
+            EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            evidence.schema_version
+        );
+    }
+    if evidence.run_id.trim().is_empty() {
+        bail!("execution evidence missing run_id");
+    }
+    if evidence.adapter_type.trim().is_empty() {
+        bail!(
+            "execution evidence missing adapter_type for run {}",
+            evidence.run_id
+        );
+    }
+    if let Some(expected_session_id) = expected_session_id {
+        if evidence.workspace.session_id != expected_session_id {
+            bail!(
+                "execution evidence session mismatch for run {}: response={}, evidence={}",
+                evidence.run_id,
+                expected_session_id,
+                evidence.workspace.session_id
+            );
+        }
+    }
+    if evidence.verification.is_empty() {
+        bail!(
+            "execution evidence missing verification for run {}",
+            evidence.run_id
+        );
+    }
+    if matches!(evidence.status, ExecutionEvidenceStatus::Succeeded)
+        && is_completion_capable_mode(&evidence.mode)
+        && evidence.artifacts.is_empty()
+    {
+        bail!(
+            "execution evidence missing artifacts for completion-capable run {}",
+            evidence.run_id
+        );
+    }
+    Ok(())
+}
+
+fn is_completion_capable_mode(mode: &ExecutionEvidenceMode) -> bool {
+    matches!(
+        mode,
+        ExecutionEvidenceMode::Code | ExecutionEvidenceMode::Shell | ExecutionEvidenceMode::Gateway
+    )
+}
+
+fn collect_execution_artifacts(
+    adapter_type: &str,
+    log_path: Option<&str>,
+    log_body: Option<&str>,
+    metadata: Option<&ExecutionMetadata>,
+) -> Vec<ExecutionArtifactRef> {
+    let mut artifacts = metadata
+        .map(|metadata| metadata.artifacts.clone())
+        .unwrap_or_default();
+    if let Some(log_path) = log_path {
+        let already_present = artifacts
+            .iter()
+            .any(|artifact| artifact.location.as_deref() == Some(log_path));
+        if !already_present {
+            artifacts.push(ExecutionArtifactRef {
+                kind: "execution_log".to_string(),
+                title: format!("{adapter_type} execution log"),
+                location: Some(log_path.to_string()),
+                body: log_body.map(str::to_string),
+            });
+        }
+    }
+    if log_path.is_none() && log_body.is_some() {
+        artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: format!("{adapter_type} execution log"),
+            location: None,
+            body: log_body.map(str::to_string),
+        });
+    }
+    artifacts
+}
+
+fn collect_git_evidence(workspace_root: Option<&str>) -> ExecutionGitEvidence {
+    let Some(root) = workspace_root else {
+        return ExecutionGitEvidence::default();
+    };
+    let root = Path::new(root);
+    if !root.exists() {
+        return ExecutionGitEvidence::default();
+    }
+    let is_repo = git_output(root, &["rev-parse", "--is-inside-work-tree"])
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    if !is_repo {
+        return ExecutionGitEvidence::default();
+    }
+
+    let branch = git_output(root, &["branch", "--show-current"]);
+    let head_sha = git_output(root, &["rev-parse", "HEAD"]);
+    let changed_files = git_output(root, &["status", "--porcelain=v1"])
+        .map(|output| parse_git_status_porcelain(&output))
+        .unwrap_or_default();
+    let commits = git_output(root, &["log", "-5", "--pretty=format:%H%x1f%s"])
+        .map(|output| parse_git_log_refs(&output))
+        .unwrap_or_default();
+
+    ExecutionGitEvidence {
+        is_repo,
+        branch,
+        head_sha,
+        dirty: !changed_files.is_empty(),
+        changed_files,
+        commits,
+    }
+}
+
+fn git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    (!output.trim().is_empty()).then_some(output)
+}
+
+fn parse_git_status_porcelain(output: &str) -> Vec<ExecutionGitFileChange> {
+    output
+        .lines()
+        .filter_map(|line| {
+            if line.trim().is_empty() {
+                return None;
+            }
+            let status = line.get(0..2).unwrap_or("").trim().to_string();
+            let raw_path = line.get(3..).unwrap_or("").trim();
+            let path = raw_path
+                .rsplit_once(" -> ")
+                .map(|(_, renamed)| renamed)
+                .unwrap_or(raw_path)
+                .trim_matches('"')
+                .to_string();
+            Some(ExecutionGitFileChange { path, status })
+        })
+        .collect()
+}
+
+fn parse_git_log_refs(output: &str) -> Vec<ExecutionGitCommitRef> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (sha, subject) = line.split_once('\u{1f}')?;
+            Some(ExecutionGitCommitRef {
+                sha: sha.to_string(),
+                subject: (!subject.trim().is_empty()).then(|| subject.trim().to_string()),
+            })
+        })
+        .collect()
 }
 
 pub trait ExecutorBoundary {
@@ -470,7 +841,7 @@ impl ExecutionLaneRouter {
 impl ExecutorBoundary for ExecutionLaneRouter {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         let request = self.decorate_request(request);
-        match self.lane_for_request(&request) {
+        let response = match self.lane_for_request(&request) {
             ExecutionLane::Auto | ExecutionLane::Host => self.host.execute(request),
             ExecutionLane::Container => self.container.execute(request),
             ExecutionLane::RemoteWorker => self.remote.execute(request),
@@ -478,7 +849,9 @@ impl ExecutorBoundary for ExecutionLaneRouter {
             ExecutionLane::Custom(value) => {
                 bail!("unsupported execution lane '{}'", value)
             }
-        }
+        }?;
+        validate_execution_response_evidence(&response)?;
+        Ok(response)
     }
 }
 
@@ -747,51 +1120,86 @@ impl ExecutorBoundary for OmxExecutor {
             completed_at: response.status.is_terminal().then_some(now.clone()),
         });
 
+        let text = response.summary.clone();
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Omx,
+            root: Some(response.workspace_root.clone()),
+            isolated: true,
+        };
+        let session_id = response.session_id.clone();
+        let log_path = response.log_path.clone();
+        let log_body = response
+            .log_body
+            .clone()
+            .or_else(|| Some(response.summary.clone()));
+        let external_run_id = response.external_run_id.clone();
+        let artifacts = response
+            .artifacts
+            .into_iter()
+            .map(|artifact| ExecutionArtifactRef {
+                kind: artifact.kind,
+                title: artifact.title,
+                location: artifact.location,
+                body: artifact.body,
+            })
+            .collect();
+        let metadata = ExecutionMetadata {
+            backend: Some("omx".to_string()),
+            provider: None,
+            biller: None,
+            billing_type: None,
+            model: None,
+            usage: None,
+            cost_usd: None,
+            routing_decision: request.routing_decision.clone(),
+            objective: request.objective.clone(),
+            plan: request.plan.clone(),
+            session_state: Some(compact_session_state(&session_state, 6)),
+            gate_evaluation,
+            assurance: Some(assurance),
+            status: Some(response.status.as_str().to_string()),
+            question: response.question.clone(),
+            tmux_session: response.tmux_session.clone(),
+            team_name: response.team_name.clone(),
+            summary: Some(response.summary.clone()),
+            artifacts,
+            external_run_id: external_run_id.clone(),
+        };
+        let blockers = if matches!(response.status, super::omx::OmxSessionStatus::Failed) {
+            vec![ExecutionBlockerRef {
+                kind: "omx_failed".to_string(),
+                source: Some("omx".to_string()),
+                message: response.summary.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "omx",
+            mode: ExecutionEvidenceMode::Gateway,
+            run_id: external_run_id.as_deref().unwrap_or(session_id.as_str()),
+            status: omx_status_to_evidence_status(&response.status),
+            session_id: session_id.as_str(),
+            group_folder: Some(request.group.folder.as_str()),
+            workspace_root: Some(response.workspace_root.as_str()),
+            boundary: &boundary,
+            log_path: log_path.as_deref(),
+            log_body: log_body.as_deref(),
+            metadata: Some(&metadata),
+            provenance_id: Some(provenance.id.as_str()),
+            verification: Vec::new(),
+            blockers,
+        });
+
         Ok(ExecutionResponse {
-            text: response.summary.clone(),
-            boundary: ExecutionBoundary {
-                kind: ExecutionBoundaryKind::Omx,
-                root: Some(response.workspace_root.clone()),
-                isolated: true,
-            },
-            session_id: response.session_id,
-            log_path: response.log_path,
-            log_body: response
-                .log_body
-                .clone()
-                .or_else(|| Some(response.summary.clone())),
+            text,
+            boundary,
+            session_id,
+            log_path,
+            log_body,
             provenance: Some(provenance),
-            metadata: Some(ExecutionMetadata {
-                backend: Some("omx".to_string()),
-                provider: None,
-                biller: None,
-                billing_type: None,
-                model: None,
-                usage: None,
-                cost_usd: None,
-                routing_decision: request.routing_decision.clone(),
-                objective: request.objective.clone(),
-                plan: request.plan.clone(),
-                session_state: Some(compact_session_state(&session_state, 6)),
-                gate_evaluation,
-                assurance: Some(assurance),
-                status: Some(response.status.as_str().to_string()),
-                question: response.question.clone(),
-                tmux_session: response.tmux_session.clone(),
-                team_name: response.team_name.clone(),
-                summary: Some(response.summary.clone()),
-                artifacts: response
-                    .artifacts
-                    .into_iter()
-                    .map(|artifact| ExecutionArtifactRef {
-                        kind: artifact.kind,
-                        title: artifact.title,
-                        location: artifact.location,
-                        body: artifact.body,
-                    })
-                    .collect(),
-                external_run_id: response.external_run_id.clone(),
-            }),
+            metadata: Some(metadata),
+            evidence: Some(evidence),
         })
     }
 }
@@ -822,27 +1230,47 @@ impl ExecutorBoundary for InProcessEchoExecutor {
                 )
             })
             .unwrap_or_else(|| "No inbound messages were provided.".to_string());
+        let text = format!(
+            "{} received {} message(s) for group '{}'.\n{}\nPrompt bytes: {}\nHandled at {}.",
+            self.assistant_name,
+            request.messages.len(),
+            request.group.name,
+            latest_summary,
+            request.prompt.len(),
+            Utc::now().to_rfc3339()
+        );
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::InProcess,
+            root: None,
+            isolated: false,
+        };
+        let session_id = request.session.id.clone();
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "in_process_echo",
+            mode: ExecutionEvidenceMode::Advisory,
+            run_id: session_id.as_str(),
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: session_id.as_str(),
+            group_folder: Some(request.group.folder.as_str()),
+            workspace_root: Some(request.session.workspace_root.as_str()),
+            boundary: &boundary,
+            log_path: None,
+            log_body: None,
+            metadata: None,
+            provenance_id: None,
+            verification: Vec::new(),
+            blockers: Vec::new(),
+        });
 
         Ok(ExecutionResponse {
-            text: format!(
-                "{} received {} message(s) for group '{}'.\n{}\nPrompt bytes: {}\nHandled at {}.",
-                self.assistant_name,
-                request.messages.len(),
-                request.group.name,
-                latest_summary,
-                request.prompt.len(),
-                Utc::now().to_rfc3339()
-            ),
-            boundary: ExecutionBoundary {
-                kind: ExecutionBoundaryKind::InProcess,
-                root: None,
-                isolated: false,
-            },
-            session_id: request.session.id,
+            text,
+            boundary,
+            session_id,
             log_path: None,
             log_body: None,
             provenance: None,
             metadata: None,
+            evidence: Some(evidence),
         })
     }
 }
@@ -880,6 +1308,8 @@ struct WorkerResponse {
     log_body: Option<String>,
     provenance: Option<ExecutionProvenanceRecord>,
     metadata: Option<ExecutionMetadata>,
+    #[serde(default)]
+    evidence: Option<ExecutionEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -974,8 +1404,7 @@ fn run_worker_daemon_with_idle_timeout(session_root: &Path, idle_timeout: Durati
         .file_name()
         .and_then(|value| value.to_str())
         .context("failed to derive session id from session root")?;
-    let socket_path =
-        std::env::temp_dir().join(format!("ncl-{}.sock", compact_session_suffix(session_id)));
+    let socket_path = worker_socket_path(&session_root, session_id);
     let pid_path = state_root.join("worker.pid");
 
     fs::create_dir_all(&ipc_root)
@@ -1286,18 +1715,51 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 gate_evaluation,
                 assurance,
             );
+            let boundary = ExecutionBoundary {
+                kind: ExecutionBoundaryKind::Host,
+                root: Some(request.session.workspace_root.clone()),
+                isolated: true,
+            };
+            let log_path_string = log_path.display().to_string();
+            let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+                adapter_type: result.metadata.backend.as_str(),
+                mode: execution_mode_for_backend(
+                    &result.metadata.backend,
+                    request.script.is_some(),
+                ),
+                run_id: request.invocation_id.as_str(),
+                status: ExecutionEvidenceStatus::Succeeded,
+                session_id: request.session.id.as_str(),
+                group_folder: Some(request.session.group_folder.as_str()),
+                workspace_root: Some(request.session.workspace_root.as_str()),
+                boundary: &boundary,
+                log_path: Some(log_path_string.as_str()),
+                log_body: Some(result.log_body.as_str()),
+                metadata: Some(&execution_metadata),
+                provenance_id: Some(provenance.id.as_str()),
+                verification: request
+                    .script
+                    .as_ref()
+                    .map(|script| {
+                        vec![ExecutionVerificationRef {
+                            kind: "command".to_string(),
+                            command: Some(script.clone()),
+                            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+                            summary: Some("host command completed successfully".to_string()),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                blockers: Vec::new(),
+            });
             Ok(WorkerResponse {
                 text: result.text,
-                boundary: ExecutionBoundary {
-                    kind: ExecutionBoundaryKind::Host,
-                    root: Some(request.session.workspace_root.clone()),
-                    isolated: true,
-                },
+                boundary,
                 session_id: request.session.id.clone(),
-                log_path: Some(log_path.display().to_string()),
+                log_path: Some(log_path_string),
                 log_body: Some(result.log_body),
                 provenance: Some(provenance),
                 metadata: Some(execution_metadata),
+                evidence: Some(evidence),
             })
         }
         Err(error) => {
@@ -1378,6 +1840,7 @@ fn decode_worker_outcome(outcome: WorkerOutcome) -> Result<ExecutionResponse> {
         log_body: response.log_body,
         provenance: response.provenance,
         metadata: response.metadata,
+        evidence: response.evidence,
     })
 }
 
@@ -1469,6 +1932,29 @@ fn build_execution_metadata(
         summary: None,
         artifacts: Vec::new(),
         external_run_id: result.metadata.external_run_id.clone(),
+    }
+}
+
+fn execution_mode_for_backend(backend: &WorkerBackend, has_script: bool) -> ExecutionEvidenceMode {
+    if has_script {
+        return ExecutionEvidenceMode::Shell;
+    }
+    match backend {
+        WorkerBackend::Summary | WorkerBackend::WorkersAI => ExecutionEvidenceMode::Advisory,
+        WorkerBackend::Custom(_) => ExecutionEvidenceMode::Code,
+        WorkerBackend::Codex
+        | WorkerBackend::Claude
+        | WorkerBackend::Zai
+        | WorkerBackend::AzureOpenAI
+        | WorkerBackend::GithubCopilot => ExecutionEvidenceMode::Code,
+    }
+}
+
+fn omx_status_to_evidence_status(status: &super::omx::OmxSessionStatus) -> ExecutionEvidenceStatus {
+    match status {
+        super::omx::OmxSessionStatus::Failed => ExecutionEvidenceStatus::Failed,
+        super::omx::OmxSessionStatus::Stopped => ExecutionEvidenceStatus::Cancelled,
+        _ => ExecutionEvidenceStatus::Succeeded,
     }
 }
 
@@ -3972,29 +4458,37 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::thread;
     use std::time::Duration;
 
     use tempfile::tempdir;
 
     use crate::foundation::CapabilityManifest;
-    use crate::foundation::{ExecutionLane, Group, MessageRecord, RemoteWorkerMode, RequestPlane};
+    use crate::foundation::{
+        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, Group, MessageRecord,
+        RemoteWorkerMode, RequestPlane,
+    };
     use crate::nanoclaw::config::NanoclawConfig;
     use crate::nanoclaw::model_router::WorkerBackend;
 
     use super::{
-        build_azure_openai_chat_target, build_execution_metadata, build_execution_session,
-        build_github_copilot_command, connect_to_worker_socket, default_codex_sandbox_for_request,
+        build_azure_openai_chat_target, build_execution_evidence, build_execution_metadata,
+        build_execution_session, build_github_copilot_command, collect_git_evidence,
+        connect_to_worker_socket, default_codex_sandbox_for_request,
         detect_paperclip_control_plane_blocker, execute_worker_request, extract_azure_openai_text,
         is_codex_usage_limit_error, normalize_azure_openai_fallback_backend, normalize_branch_name,
-        normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, read_json,
-        resolve_container_image, run_worker_daemon_with_idle_timeout, run_worker_from_paths,
-        should_use_container_lane, should_use_remote_lane, wait_for_worker_socket, write_json,
-        BackendExecutionMetadata, BackendExecutionResult, ContainerExecutor,
-        DigitalOceanDevEnvironment, ExecutionLaneRouter, ExecutionRequest, ExecutionSession,
-        ExecutionUsageSummary, ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor,
-        OmxExecutor, RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest,
-        WorkerResponse,
+        normalize_github_repo_ref, parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
+        parse_git_status_porcelain, read_json, resolve_container_image,
+        run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
+        should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
+        write_json, BackendExecutionMetadata, BackendExecutionResult, BuildExecutionEvidenceInput,
+        ContainerExecutor, DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
+        ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
+        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
+        GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor,
+        RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
 
     #[test]
@@ -4039,6 +4533,151 @@ mod tests {
                 "input {input} should normalize to {expected}"
             );
         }
+    }
+
+    #[test]
+    fn parses_git_evidence_helpers() {
+        let changes =
+            parse_git_status_porcelain(" M src/main.rs\nR  old.rs -> new.rs\n?? note.md\n");
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].status, "M");
+        assert_eq!(changes[0].path, "src/main.rs");
+        assert_eq!(changes[1].status, "R");
+        assert_eq!(changes[1].path, "new.rs");
+        assert_eq!(changes[2].status, "??");
+        assert_eq!(changes[2].path, "note.md");
+
+        let commits = parse_git_log_refs("abc123\u{1f}first commit\ndef456\u{1f}second commit\n");
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "abc123");
+        assert_eq!(commits[0].subject.as_deref(), Some("first commit"));
+    }
+
+    #[test]
+    fn collect_git_evidence_preserves_leading_porcelain_status_space() {
+        let temp = tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        fs::write(temp.path().join("README.md"), "initial").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=NanoClaw Test",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        fs::write(temp.path().join("README.md"), "changed").unwrap();
+
+        let evidence = collect_git_evidence(temp.path().to_str());
+        assert!(evidence.is_repo);
+        assert_eq!(evidence.changed_files[0].status, "M");
+        assert_eq!(evidence.changed_files[0].path, "README.md");
+    }
+
+    #[test]
+    fn builds_structured_execution_evidence() {
+        let temp = tempdir().unwrap();
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some(temp.path().display().to_string()),
+            isolated: true,
+        };
+        let metadata = ExecutionMetadata {
+            backend: Some("codex".to_string()),
+            provider: Some("openai".to_string()),
+            summary: Some("completed".to_string()),
+            ..Default::default()
+        };
+
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-1",
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: "session-1",
+            group_folder: Some("main"),
+            workspace_root: temp.path().to_str(),
+            boundary: &boundary,
+            log_path: Some("/tmp/exec.log"),
+            log_body: Some("status=ok"),
+            metadata: Some(&metadata),
+            provenance_id: Some("exec-1"),
+            verification: Vec::new(),
+            blockers: Vec::new(),
+        });
+
+        assert_eq!(evidence.schema_version, EXECUTION_EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(evidence.adapter_type, "codex");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Code);
+        assert_eq!(evidence.workspace.group_folder.as_deref(), Some("main"));
+        assert!(evidence.workspace.exists);
+        assert_eq!(evidence.verification[0].status, "succeeded");
+        assert_eq!(
+            evidence.artifacts[0].location.as_deref(),
+            Some("/tmp/exec.log")
+        );
+    }
+
+    #[test]
+    fn validates_required_execution_evidence_contract() {
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some("/tmp/workspace".to_string()),
+            isolated: true,
+        };
+        let mut response = ExecutionResponse {
+            text: "ok".to_string(),
+            boundary: boundary.clone(),
+            session_id: "session-1".to_string(),
+            log_path: None,
+            log_body: None,
+            provenance: None,
+            metadata: None,
+            evidence: None,
+        };
+        assert!(validate_execution_response_evidence(&response).is_err());
+
+        let mut evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-1",
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: "session-1",
+            group_folder: Some("main"),
+            workspace_root: Some("/tmp/workspace"),
+            boundary: &boundary,
+            log_path: None,
+            log_body: None,
+            metadata: None,
+            provenance_id: None,
+            verification: Vec::new(),
+            blockers: Vec::new(),
+        });
+        response.evidence = Some(evidence.clone());
+        assert!(validate_execution_response_evidence(&response).is_err());
+
+        evidence.artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: "log".to_string(),
+            location: Some("/tmp/exec.log".to_string()),
+            body: None,
+        });
+        response.evidence = Some(evidence);
+        validate_execution_response_evidence(&response).unwrap();
     }
 
     #[test]
@@ -4427,6 +5066,11 @@ mod tests {
         assert_eq!(response.session_id, "session-1");
         assert!(response.text.contains("hello from script"));
         assert!(Path::new(response.log_path.as_deref().unwrap()).exists());
+        let evidence = response.evidence.as_ref().expect("worker emits evidence");
+        assert_eq!(evidence.adapter_type, "summary");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Succeeded);
+        assert_eq!(evidence.provenance_id.as_deref(), Some("exec-1"));
     }
 
     #[test]

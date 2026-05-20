@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+use serde_json::{json, Value};
 
 use crate::foundation::{
     ExecutionLane, Group, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
@@ -48,8 +51,1053 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeServeProfile {
+    Full,
+    Gateway,
+    Webhook,
+    Pm,
+    Slack,
+}
+
+impl RuntimeServeProfile {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "full" => Ok(Self::Full),
+            "gateway" => Ok(Self::Gateway),
+            "webhook" => Ok(Self::Webhook),
+            "pm" => Ok(Self::Pm),
+            "slack" => Ok(Self::Slack),
+            other => anyhow::bail!("unsupported runtime serve profile '{}'", other),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Gateway => "gateway",
+            Self::Webhook => "webhook",
+            Self::Pm => "pm",
+            Self::Slack => "slack",
+        }
+    }
+
+    fn all() -> [Self; 5] {
+        [
+            Self::Full,
+            Self::Gateway,
+            Self::Webhook,
+            Self::Pm,
+            Self::Slack,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeServeArgs {
+    profile: RuntimeServeProfile,
+    lane_override: Option<ExecutionLane>,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeCleanupArgs {
+    apply: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeHealthArgs {
+    limit: usize,
+    strict: bool,
+}
+
+fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut profile = RuntimeServeProfile::Full;
+    let mut lane_override = None::<ExecutionLane>;
+    let mut read_only = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                profile = RuntimeServeProfile::parse(&value)?;
+            }
+            "--lane" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                lane_override = Some(ExecutionLane::parse(&value));
+            }
+            "--read-only" => read_only = true,
+            other => anyhow::bail!("unexpected runtime serve argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeServeArgs {
+        profile,
+        lane_override,
+        read_only,
+    })
+}
+
+fn parse_runtime_control_args<I>(args: &mut I, label: &str) -> Result<RuntimeServeProfile>
+where
+    I: Iterator<Item = String>,
+{
+    let mut profile = RuntimeServeProfile::Full;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                profile = RuntimeServeProfile::parse(&value)?;
+            }
+            other => anyhow::bail!("unexpected runtime {label} argument '{}'", other),
+        }
+    }
+
+    Ok(profile)
+}
+
+fn parse_runtime_cleanup_args<I>(args: &mut I) -> Result<RuntimeCleanupArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut apply = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            other => anyhow::bail!("unexpected runtime cleanup argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeCleanupArgs { apply })
+}
+
+fn parse_runtime_health_args<I>(args: &mut I) -> Result<RuntimeHealthArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = 10;
+    let mut strict = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid runtime health --limit value {value}"))?
+                    .max(1);
+            }
+            "--strict" => strict = true,
+            other => anyhow::bail!("unexpected runtime health argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeHealthArgs { limit, strict })
+}
+
+fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = default_limit;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid {label} --limit value {value}"))?
+                    .max(1);
+            }
+            other => anyhow::bail!("unexpected {label} argument '{}'", other),
+        }
+    }
+    Ok(limit)
+}
+
+fn runtime_control_dir(config: &NanoclawConfig) -> PathBuf {
+    config.data_dir.join("runtime")
+}
+
+fn runtime_pid_path(config: &NanoclawConfig, profile: RuntimeServeProfile) -> PathBuf {
+    runtime_control_dir(config).join(format!("{}.pid", profile.as_str()))
+}
+
+fn runtime_pid_status_json(config: &NanoclawConfig) -> serde_json::Value {
+    let mut profiles = serde_json::Map::new();
+    for profile in RuntimeServeProfile::all() {
+        let profile_state = runtime_pid_profile_state_json(config, profile);
+        profiles.insert(
+            profile.as_str().to_string(),
+            json!({
+                "pidFile": profile_state["pidFile"],
+                "pid": profile_state["pid"],
+                "pidFileExists": profile_state["pidFileExists"],
+            }),
+        );
+    }
+    json!({
+        "controlDir": runtime_control_dir(config).display().to_string(),
+        "profiles": profiles,
+    })
+}
+
+struct RuntimePidFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for RuntimePidFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn write_runtime_pid_file(
+    config: &NanoclawConfig,
+    profile: RuntimeServeProfile,
+) -> Result<RuntimePidFileGuard> {
+    let control_dir = runtime_control_dir(config);
+    fs::create_dir_all(&control_dir)
+        .with_context(|| format!("failed to create {}", control_dir.display()))?;
+    let path = runtime_pid_path(config, profile);
+    fs::write(&path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(RuntimePidFileGuard { path })
+}
+
+fn read_runtime_pid(path: &Path) -> Result<u32> {
+    let value =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid runtime pid file {}", path.display()))
+}
+
+fn signal_runtime_profile(
+    config: &NanoclawConfig,
+    profile: RuntimeServeProfile,
+    signal: &str,
+    remove_pid_file_on_success: bool,
+) -> Result<()> {
+    let path = runtime_pid_path(config, profile);
+    let pid = read_runtime_pid(&path)?;
+    let status = Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to invoke kill for pid {pid}"))?;
+    if !status.success() {
+        anyhow::bail!(
+            "failed to signal runtime profile '{}' pid {} with {}: {}",
+            profile.as_str(),
+            pid,
+            signal,
+            status
+        );
+    }
+    if remove_pid_file_on_success {
+        let _ = fs::remove_file(&path);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "profile": profile.as_str(),
+            "pid": pid,
+            "signal": signal,
+            "pidFile": path.display().to_string(),
+        }))?
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeHealthCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl RuntimeHealthCheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+
+    fn severity(self) -> &'static str {
+        match self {
+            Self::Pass => "info",
+            Self::Warn => "warning",
+            Self::Fail => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeHealthCheck {
+    id: &'static str,
+    status: RuntimeHealthCheckStatus,
+    message: String,
+    evidence: Value,
+}
+
+fn runtime_health_check(
+    id: &'static str,
+    status: RuntimeHealthCheckStatus,
+    message: impl Into<String>,
+    evidence: Value,
+) -> RuntimeHealthCheck {
+    RuntimeHealthCheck {
+        id,
+        status,
+        message: message.into(),
+        evidence,
+    }
+}
+
+fn runtime_health_check_json(check: &RuntimeHealthCheck) -> Value {
+    json!({
+        "id": check.id,
+        "status": check.status.as_str(),
+        "severity": check.status.severity(),
+        "message": check.message,
+        "evidence": check.evidence,
+    })
+}
+
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn runtime_pid_profile_state_json(config: &NanoclawConfig, profile: RuntimeServeProfile) -> Value {
+    let pid_file = runtime_pid_path(config, profile);
+    if !pid_file.exists() {
+        return json!({
+            "profile": profile.as_str(),
+            "pidFile": pid_file.display().to_string(),
+            "pidFileExists": false,
+            "pid": null,
+            "state": "absent",
+            "running": false,
+        });
+    }
+
+    match fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        Some(pid) => {
+            let running = process_is_running(pid);
+            json!({
+                "profile": profile.as_str(),
+                "pidFile": pid_file.display().to_string(),
+                "pidFileExists": true,
+                "pid": pid,
+                "state": if running { "running" } else { "stale" },
+                "running": running,
+            })
+        }
+        None => json!({
+            "profile": profile.as_str(),
+            "pidFile": pid_file.display().to_string(),
+            "pidFileExists": true,
+            "pid": null,
+            "state": "invalid",
+            "running": false,
+        }),
+    }
+}
+
+fn runtime_cleanup_json(config: &NanoclawConfig, args: RuntimeCleanupArgs) -> Value {
+    let mut candidates = Vec::<Value>::new();
+    let mut removed = Vec::<Value>::new();
+    let mut errors = Vec::<Value>::new();
+
+    for profile in RuntimeServeProfile::all() {
+        let state = runtime_pid_profile_state_json(config, profile);
+        let state_name = state
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if !matches!(state_name, "stale" | "invalid") {
+            continue;
+        }
+
+        let pid_file = runtime_pid_path(config, profile);
+        let mut candidate = json!({
+            "profile": profile.as_str(),
+            "state": state_name,
+            "pid": state.get("pid").cloned().unwrap_or(Value::Null),
+            "pidFile": pid_file.display().to_string(),
+            "removed": false,
+        });
+
+        if args.apply {
+            match fs::remove_file(&pid_file) {
+                Ok(()) => {
+                    candidate["removed"] = Value::Bool(true);
+                    removed.push(candidate.clone());
+                }
+                Err(error) => {
+                    errors.push(json!({
+                        "profile": profile.as_str(),
+                        "pidFile": pid_file.display().to_string(),
+                        "error": error.to_string(),
+                    }));
+                }
+            }
+        }
+
+        candidates.push(candidate);
+    }
+
+    json!({
+        "ok": errors.is_empty(),
+        "applied": args.apply,
+        "summary": {
+            "candidates": candidates.len(),
+            "removed": removed.len(),
+            "errors": errors.len(),
+        },
+        "controlDir": runtime_control_dir(config).display().to_string(),
+        "candidates": candidates,
+        "removed": removed,
+        "errors": errors,
+    })
+}
+
+fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
+    let counts = app.db.counts()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_provenance = app.db.list_execution_provenance(None, limit)?;
+    let recent_evidence = app.db.list_execution_evidence(None, limit)?;
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Failed)
+        .count();
+    let active_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Active)
+        .count();
+    let failed_evidence = recent_evidence
+        .iter()
+        .filter(|record| record.status == "failed")
+        .count();
+    let mut checks = Vec::<RuntimeHealthCheck>::new();
+
+    checks.push(runtime_health_check(
+        "data_dir",
+        if app.config.data_dir.is_dir() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if app.config.data_dir.is_dir() {
+            "data directory is present"
+        } else {
+            "data directory is missing"
+        },
+        json!({ "path": app.config.data_dir.display().to_string() }),
+    ));
+
+    checks.push(runtime_health_check(
+        "store_dir",
+        if app.config.store_dir.is_dir() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if app.config.store_dir.is_dir() {
+            "store directory is present"
+        } else {
+            "store directory is missing"
+        },
+        json!({ "path": app.config.store_dir.display().to_string() }),
+    ));
+
+    let profile_states = RuntimeServeProfile::all()
+        .iter()
+        .map(|profile| runtime_pid_profile_state_json(&app.config, *profile))
+        .collect::<Vec<_>>();
+    let stale_or_invalid_profiles = profile_states
+        .iter()
+        .filter(|profile| {
+            matches!(
+                profile.get("state").and_then(Value::as_str),
+                Some("stale" | "invalid")
+            )
+        })
+        .count();
+    checks.push(runtime_health_check(
+        "runtime_pid_files",
+        if stale_or_invalid_profiles == 0 {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if stale_or_invalid_profiles == 0 {
+            "runtime PID files are clean"
+        } else {
+            "one or more runtime PID files are stale or invalid"
+        },
+        json!({
+            "controlDir": runtime_control_dir(&app.config).display().to_string(),
+            "profiles": profile_states,
+            "staleOrInvalid": stale_or_invalid_profiles,
+        }),
+    ));
+
+    let gateway_token_configured = !app.config.openclaw_gateway_token.trim().is_empty();
+    let gateway_check = if app.config.openclaw_gateway_port > 0 && !gateway_token_configured {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Fail,
+            "gateway port is enabled without a gateway token",
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    } else if app.config.openclaw_gateway_port == 0 && gateway_token_configured {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Warn,
+            "gateway token is configured but the gateway port is disabled",
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    } else {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Pass,
+            if gateway_token_configured {
+                "gateway configuration is complete"
+            } else {
+                "gateway is disabled"
+            },
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    };
+    checks.push(gateway_check);
+
+    let webhook_missing_auth = app.config.linear_webhook_port > 0
+        && app.config.linear_webhook_secret.trim().is_empty()
+        && app.config.github_webhook_secret.trim().is_empty()
+        && app.config.observability_webhook_token.trim().is_empty();
+    checks.push(runtime_health_check(
+        "webhook_auth",
+        if webhook_missing_auth {
+            RuntimeHealthCheckStatus::Fail
+        } else {
+            RuntimeHealthCheckStatus::Pass
+        },
+        if app.config.linear_webhook_port == 0 {
+            "webhook server is disabled"
+        } else if webhook_missing_auth {
+            "webhook server is enabled without any configured webhook auth material"
+        } else {
+            "webhook auth material is configured"
+        },
+        json!({
+            "port": app.config.linear_webhook_port,
+            "linearSignatureRequired": !app.config.linear_webhook_secret.trim().is_empty(),
+            "githubSignatureRequired": !app.config.github_webhook_secret.trim().is_empty(),
+            "observabilityTokenConfigured": !app.config.observability_webhook_token.trim().is_empty(),
+        }),
+    ));
+
+    checks.push(runtime_health_check(
+        "scheduled_task_backlog",
+        if due_tasks.is_empty() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if due_tasks.is_empty() {
+            "no scheduled tasks are currently due"
+        } else {
+            "scheduled tasks are due and need a runtime poll"
+        },
+        json!({
+            "total": tasks.len(),
+            "active": active_tasks,
+            "due": due_tasks.len(),
+            "failed": failed_tasks,
+        }),
+    ));
+
+    checks.push(runtime_health_check(
+        "failed_tasks",
+        if failed_tasks == 0 {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if failed_tasks == 0 {
+            "no failed scheduled tasks are recorded"
+        } else {
+            "failed scheduled tasks are recorded"
+        },
+        json!({ "failed": failed_tasks, "total": tasks.len() }),
+    ));
+
+    let evidence_status = if !recent_provenance.is_empty() && recent_evidence.is_empty() {
+        RuntimeHealthCheckStatus::Warn
+    } else if failed_evidence > 0 {
+        RuntimeHealthCheckStatus::Warn
+    } else {
+        RuntimeHealthCheckStatus::Pass
+    };
+    checks.push(runtime_health_check(
+        "execution_evidence",
+        evidence_status,
+        match evidence_status {
+            RuntimeHealthCheckStatus::Pass => "recent execution evidence is consistent",
+            RuntimeHealthCheckStatus::Warn => {
+                "recent execution history needs operator review for missing or failed evidence"
+            }
+            RuntimeHealthCheckStatus::Fail => "recent execution evidence is invalid",
+        },
+        json!({
+            "recentProvenance": recent_provenance.len(),
+            "recentEvidence": recent_evidence.len(),
+            "failedEvidence": failed_evidence,
+        }),
+    ));
+
+    let failing = checks
+        .iter()
+        .filter(|check| check.status == RuntimeHealthCheckStatus::Fail)
+        .count();
+    let warning = checks
+        .iter()
+        .filter(|check| check.status == RuntimeHealthCheckStatus::Warn)
+        .count();
+    let status = if failing > 0 {
+        "unhealthy"
+    } else if warning > 0 {
+        "degraded"
+    } else {
+        "healthy"
+    };
+
+    Ok(json!({
+        "ok": failing == 0,
+        "status": status,
+        "summary": {
+            "checks": checks.len(),
+            "passing": checks.len().saturating_sub(failing + warning),
+            "warnings": warning,
+            "failing": failing,
+        },
+        "runtime": runtime_status_json(&app.config),
+        "counts": {
+            "chats": counts.chats,
+            "messages": counts.messages,
+            "scheduledTasks": counts.scheduled_tasks,
+            "registeredGroups": counts.registered_groups,
+        },
+        "checks": checks.iter().map(runtime_health_check_json).collect::<Vec<_>>(),
+    }))
+}
+
+fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "activeBinary": "nanoclaw",
+        "dataDir": config.data_dir.display().to_string(),
+        "storeDir": config.store_dir.display().to_string(),
+        "control": runtime_pid_status_json(config),
+        "local": {
+            "enabled": true,
+            "mode": "poll",
+            "inboxDir": config.data_dir.join("channels").join("local").join("inbox").display().to_string(),
+            "outboxDir": config.data_dir.join("channels").join("local").join("outbox").display().to_string(),
+        },
+        "slack": {
+            "envFile": config
+                .slack_env_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "pollIntervalMs": config.slack_poll_interval_ms,
+        },
+        "webhook": {
+            "enabled": config.linear_webhook_port > 0,
+            "port": config.linear_webhook_port,
+            "linearSignatureRequired": !config.linear_webhook_secret.trim().is_empty(),
+            "githubSignatureRequired": !config.github_webhook_secret.trim().is_empty(),
+            "observabilityTokenConfigured": !config.observability_webhook_token.trim().is_empty(),
+        },
+        "pmAutomation": {
+            "enabled": !config.linear_chat_jid.trim().is_empty(),
+            "linearChatJidConfigured": !config.linear_chat_jid.trim().is_empty(),
+            "teamKeysConfigured": !config.linear_pm_team_keys.is_empty(),
+        },
+        "openclawGateway": describe_openclaw_gateway_readiness(config),
+        "execution": {
+            "defaultLane": config.execution_lane.as_str(),
+            "gatewayLane": config.openclaw_gateway_execution_lane.as_str(),
+        },
+        "serveProfiles": ["full", "gateway", "webhook", "pm", "slack"],
+    })
+}
+
+fn print_runtime_status(config: &NanoclawConfig) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_status_json(config))?
+    );
+    Ok(())
+}
+
+fn runtime_inspect_json(app: &NanoclawApp, limit: usize) -> Result<serde_json::Value> {
+    let counts = app.db.counts()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_tasks = tasks.iter().take(limit).cloned().collect::<Vec<_>>();
+    let recent_provenance = app.db.list_execution_provenance(None, limit)?;
+    let recent_evidence = app.db.list_execution_evidence(None, limit)?;
+    let mut task_status_counts = BTreeMap::<String, usize>::new();
+    for task in &tasks {
+        *task_status_counts
+            .entry(task.status.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "runtime": runtime_status_json(&app.config),
+        "counts": {
+            "chats": counts.chats,
+            "messages": counts.messages,
+            "scheduledTasks": counts.scheduled_tasks,
+            "registeredGroups": counts.registered_groups,
+        },
+        "tasks": {
+            "total": tasks.len(),
+            "due": due_tasks.len(),
+            "byStatus": task_status_counts,
+            "recent": recent_tasks,
+        },
+        "recentExecutionProvenance": recent_provenance,
+        "recentExecutionEvidence": recent_evidence,
+    }))
+}
+
+fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_inspect_json(&app, limit)?)?
+    );
+    Ok(())
+}
+
+fn print_runtime_health(config: NanoclawConfig, args: RuntimeHealthArgs) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    let health = runtime_health_json(&app, args.limit)?;
+    println!("{}", serde_json::to_string_pretty(&health)?);
+    if args.strict && health.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("runtime health strict check failed");
+    }
+    Ok(())
+}
+
+fn print_runtime_cleanup(config: NanoclawConfig, args: RuntimeCleanupArgs) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_cleanup_json(&config, args))?
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parses_default_runtime_serve_profile() {
+        let mut args = Vec::<String>::new().into_iter();
+        let parsed = parse_runtime_serve_args(&mut args).unwrap();
+
+        assert_eq!(parsed.profile, RuntimeServeProfile::Full);
+        assert_eq!(parsed.lane_override, None);
+        assert!(!parsed.read_only);
+    }
+
+    #[test]
+    fn parses_runtime_serve_profile_lane_and_read_only() {
+        let mut args = vec![
+            "--profile".to_string(),
+            "gateway".to_string(),
+            "--lane".to_string(),
+            "omx".to_string(),
+            "--read-only".to_string(),
+        ]
+        .into_iter();
+        let parsed = parse_runtime_serve_args(&mut args).unwrap();
+
+        assert_eq!(parsed.profile, RuntimeServeProfile::Gateway);
+        assert_eq!(parsed.lane_override, Some(ExecutionLane::Omx));
+        assert!(parsed.read_only);
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_serve_profile() {
+        let mut args = vec!["--profile".to_string(), "legacy".to_string()].into_iter();
+        let error = parse_runtime_serve_args(&mut args).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported runtime serve profile"));
+    }
+
+    #[test]
+    fn parses_runtime_control_profile() {
+        let mut args = vec!["--profile".to_string(), "gateway".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_control_args(&mut args, "stop").unwrap(),
+            RuntimeServeProfile::Gateway
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_control_arg() {
+        let mut args = vec!["--force".to_string()].into_iter();
+        let error = parse_runtime_control_args(&mut args, "reload").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unexpected runtime reload argument"));
+    }
+
+    #[test]
+    fn parses_runtime_inspect_limit() {
+        let mut args = vec!["--limit".to_string(), "5".to_string()].into_iter();
+        assert_eq!(
+            parse_limit_args(&mut args, 10, "runtime inspect").unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn parses_runtime_cleanup_apply() {
+        let mut args = vec!["--apply".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_cleanup_args(&mut args).unwrap(),
+            RuntimeCleanupArgs { apply: true }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_health_strict_limit() {
+        let mut args = vec![
+            "--limit".to_string(),
+            "3".to_string(),
+            "--strict".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_health_args(&mut args).unwrap(),
+            RuntimeHealthArgs {
+                limit: 3,
+                strict: true
+            }
+        );
+    }
+
+    #[test]
+    fn detects_stale_runtime_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        fs::write(
+            runtime_pid_path(&config, RuntimeServeProfile::Full),
+            "999999999\n",
+        )?;
+
+        let state = runtime_pid_profile_state_json(&config, RuntimeServeProfile::Full);
+
+        assert_eq!(state["state"], "stale");
+        assert_eq!(state["pid"], 999999999);
+        assert_eq!(state["running"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_invalid_runtime_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        fs::write(
+            runtime_pid_path(&config, RuntimeServeProfile::Pm),
+            "not-a-pid\n",
+        )?;
+
+        let state = runtime_pid_profile_state_json(&config, RuntimeServeProfile::Pm);
+
+        assert_eq!(state["state"], "invalid");
+        assert_eq!(state["pid"], Value::Null);
+        assert_eq!(state["running"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_dry_run_keeps_invalid_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Slack);
+        fs::write(&pid_path, "not-a-pid\n")?;
+
+        let report = runtime_cleanup_json(&config, RuntimeCleanupArgs { apply: false });
+
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], false);
+        assert_eq!(report["summary"]["candidates"], 1);
+        assert!(pid_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_apply_removes_invalid_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Webhook);
+        fs::write(&pid_path, "not-a-pid\n")?;
+
+        let report = runtime_cleanup_json(&config, RuntimeCleanupArgs { apply: true });
+
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], true);
+        assert_eq!(report["summary"]["removed"], 1);
+        assert!(!pid_path.exists());
+        Ok(())
+    }
+}
+
+fn print_runtime_poll_summary(summary: super::runtime::RuntimePumpSummary) {
+    println!("inbound_messages: {}", summary.inbound_messages);
+    println!("processed_groups: {}", summary.processed_groups);
+    println!("scheduled_tasks_run: {}", summary.scheduled_tasks_run);
+    println!("scheduled_task_errors: {}", summary.scheduled_task_errors);
+    println!("swarm_tasks_run: {}", summary.swarm_tasks_run);
+    println!("swarm_task_errors: {}", summary.swarm_task_errors);
+    println!("outbound_messages: {}", summary.outbound_messages);
+}
+
+fn run_runtime_poll(config: NanoclawConfig, lane_override: Option<ExecutionLane>) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    let executor = ExecutionLaneRouter::from_config(&app.config, lane_override)?;
+    let mut runtime = LocalRuntime::new(app, executor)?;
+    let summary = runtime.poll_once()?;
+    print_runtime_poll_summary(summary);
+    Ok(())
+}
+
+fn park_runtime(profile: RuntimeServeProfile) -> ! {
+    eprintln!("nanoclaw runtime profile '{}' is running", profile.as_str());
+    loop {
+        std::thread::park();
+    }
+}
+
+fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
+    let _pid_guard = write_runtime_pid_file(&config, serve_args.profile)?;
+    match serve_args.profile {
+        RuntimeServeProfile::Full => {
+            let app = NanoclawApp::open(config.clone())?;
+            if !serve_args.read_only {
+                start_webhook_server(app.config.clone())?;
+                start_pm_automation_loop(app.config.clone())?;
+                start_openclaw_gateway_server(app.config.clone())?;
+            }
+            let executor = ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override)?;
+            let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let mut runtime = SlackRuntime::new(app, channel, executor);
+            runtime.run_forever()?;
+        }
+        RuntimeServeProfile::Gateway => {
+            if config.openclaw_gateway_port == 0 {
+                anyhow::bail!(
+                    "runtime gateway profile is disabled: set NANOCLAW_OPENCLAW_GATEWAY_PORT"
+                );
+            }
+            if config.openclaw_gateway_token.trim().is_empty() {
+                anyhow::bail!(
+                    "runtime gateway profile is disabled: set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"
+                );
+            }
+            let _app = NanoclawApp::open(config.clone())?;
+            start_openclaw_gateway_server(config)?;
+            park_runtime(RuntimeServeProfile::Gateway);
+        }
+        RuntimeServeProfile::Webhook => {
+            if config.linear_webhook_port == 0 {
+                anyhow::bail!("runtime webhook profile is disabled: set LINEAR_WEBHOOK_PORT");
+            }
+            start_webhook_server(config)?;
+            park_runtime(RuntimeServeProfile::Webhook);
+        }
+        RuntimeServeProfile::Pm => {
+            if config.linear_chat_jid.trim().is_empty() {
+                anyhow::bail!("runtime pm profile is disabled: set LINEAR_CHAT_JID");
+            }
+            start_pm_automation_loop(config)?;
+            park_runtime(RuntimeServeProfile::Pm);
+        }
+        RuntimeServeProfile::Slack => {
+            let app = NanoclawApp::open(config)?;
+            let executor = ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override)?;
+            let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let mut runtime = SlackRuntime::new(app, channel, executor);
+            runtime.run_forever()?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_lane_override<I>(args: &mut I) -> Result<Option<ExecutionLane>>
@@ -358,6 +1406,10 @@ fn notify_host_os_record(app: &mut NanoclawApp, chat_jid: Option<&str>, body: &s
 pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
     let mut args = args.into_iter();
     let command = args.next().unwrap_or_else(|| "bootstrap".to_string());
+    if matches!(command.as_str(), "--help" | "-h" | "help") {
+        print_usage();
+        return Ok(());
+    }
     if command == "exec-worker" {
         let Some(request_path) = args.next() else {
             print_usage();
@@ -540,6 +1592,44 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     .as_deref()
                     .unwrap_or("-")
             );
+        }
+        "runtime" => {
+            let Some(runtime_command) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            match runtime_command.as_str() {
+                "status" => print_runtime_status(&config)?,
+                "inspect" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime inspect")?;
+                    print_runtime_inspect(config, limit)?;
+                }
+                "health" => {
+                    let health_args = parse_runtime_health_args(&mut args)?;
+                    print_runtime_health(config, health_args)?;
+                }
+                "cleanup" => {
+                    let cleanup_args = parse_runtime_cleanup_args(&mut args)?;
+                    print_runtime_cleanup(config, cleanup_args)?;
+                }
+                "poll" => {
+                    let lane_override = parse_lane_override(&mut args)?;
+                    run_runtime_poll(config, lane_override)?;
+                }
+                "serve" => {
+                    let serve_args = parse_runtime_serve_args(&mut args)?;
+                    run_runtime_serve(config, serve_args)?;
+                }
+                "stop" => {
+                    let profile = parse_runtime_control_args(&mut args, "stop")?;
+                    signal_runtime_profile(&config, profile, "-TERM", true)?;
+                }
+                "reload" => {
+                    let profile = parse_runtime_control_args(&mut args, "reload")?;
+                    signal_runtime_profile(&config, profile, "-HUP", false)?;
+                }
+                other => anyhow::bail!("unsupported runtime command '{}'", other),
+            }
         }
         "group-runtime" => {
             let Some(group_command) = args.next() else {

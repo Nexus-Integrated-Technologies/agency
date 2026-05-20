@@ -1,7 +1,10 @@
 # NanoClaw Rust Migration
 
-This repository is being cut down from the existing `agency` workspace into a
-pure-Rust implementation that mirrors NanoClaw's product surface.
+This repository is adopting the existing `agency` harness into a pure-Rust
+NanoClaw-shaped runtime. NanoClaw is the claw-behavior reference model; Agency
+is the Rust implementation substrate. The migration should clean-room useful
+Agency capabilities into the foundation and NanoClaw runtime instead of treating
+all old Agency/holonic material as disposable residue.
 
 ## Target Shape
 
@@ -21,8 +24,9 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
 
 - A standalone `nanoclaw` Rust bootstrap binary that does not depend on the
   current `agency` runtime.
-- The default runtime entrypoints (`cargo run`, `src/main.rs`) now route to the
-  NanoClaw CLI surface instead of the legacy Agency runtime.
+- The default runtime entrypoint is the explicit `nanoclaw` binary in
+  `src/bin/nanoclaw.rs`; old root-level Rust entrypoints are parked under
+  `graveyard/agency-harness/src-root/`.
 - A canonical domain base now lives in `src/foundation/`, with `nanoclaw` as
   the first runtime descendant rather than a separate ontology.
 - The DigitalOcean VM dev environment is now modeled as a first-class
@@ -108,6 +112,9 @@ The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
 
 ## Prune Rules
 
+- Classify Agency subsystems as adoption candidates before pruning them. Useful
+  harness concepts should be distilled into smaller `foundation` or `nanoclaw`
+  contracts.
 - If a subsystem is holonic, FPF-specific, or governance-specific and no longer
   needed for NanoClaw parity, move it into `graveyard/holonic/`.
 - If a subsystem is merely out of scope but not holonic, evaluate it
@@ -117,8 +124,18 @@ The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
 
 ## Near-Term Next Cuts
 
+- The current collapse audit and ordered backlog live in
+  `docs/nanoclaw-rs-collapse-audit.md`.
+- The Agency capability adoption ledger lives in
+  `docs/agency-capability-adoption-ledger.md`.
+- Inactive old Agency bins and tests are parked under
+  `graveyard/agency-harness/` as clean-room reference material.
+- Old Agency service launch scripts and the old speaker compose stack are also
+  parked under `graveyard/agency-harness/`; the root `start_agency.sh` is a
+  compatibility guard only.
 - Strip `src/fpf/` and governance-dependent orchestration modules after their
-  remaining call sites are removed or replaced.
+  useful primitives are clean-roomed or their remaining call sites are removed
+  or replaced.
 - Collapse the workspace toward the small, operator-oriented NanoClaw surface:
   orchestrator, queue, DB, runtime, scheduler, channels, and group memory.
 - Extend the subprocess executor into stronger isolation modes, especially
