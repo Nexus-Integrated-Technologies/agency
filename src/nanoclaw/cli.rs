@@ -654,6 +654,308 @@ fn runtime_startup_failure_summary(events: &Value) -> (usize, BTreeMap<String, u
     (failed, by_profile, latest_failed)
 }
 
+fn runtime_missing_config_recovery_suggestion(
+    profile: &str,
+    channel_id: &str,
+    missing_config: &str,
+) -> Value {
+    let restart_profile = match profile {
+        "full" | "gateway" | "webhook" | "pm" | "slack" => profile,
+        _ => match channel_id {
+            "openclaw_gateway" => "gateway",
+            "github_webhook" => "webhook",
+            "observability_webhook" => "webhook",
+            "slack_socket" => "slack",
+            "pm_automation" => "pm",
+            _ => profile,
+        },
+    };
+
+    match missing_config {
+        "NANOCLAW_OPENCLAW_GATEWAY_TOKEN" => json!({
+            "key": "openclaw_gateway_token",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Set NANOCLAW_OPENCLAW_GATEWAY_TOKEN in the runtime secret source, then restart the gateway-capable runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_secret",
+                    "target": "NANOCLAW_OPENCLAW_GATEWAY_TOKEN",
+                    "description": "Generate or retrieve a high-entropy gateway token and set it in the launch/service environment; do not commit it to the repo."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the token is present."
+                }
+            ],
+        }),
+        "NANOCLAW_OPENCLAW_GATEWAY_PORT" => json!({
+            "key": "openclaw_gateway_port",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Set NANOCLAW_OPENCLAW_GATEWAY_PORT to a nonzero control-plane port, then restart the gateway-capable runtime profile.",
+            "requiresSecret": false,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_config",
+                    "target": "NANOCLAW_OPENCLAW_GATEWAY_PORT",
+                    "description": "Choose the gateway bind port used by the local control plane."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the port is configured."
+                }
+            ],
+        }),
+        "NANOCLAW_SLACK_ENV_FILE or project .env" => json!({
+            "key": "slack_env_file",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Provide a Slack env file via NANOCLAW_SLACK_ENV_FILE or project .env before starting the Slack/full runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_config",
+                    "target": "NANOCLAW_SLACK_ENV_FILE",
+                    "description": "Point NanoClaw at a local env file that contains Slack Socket Mode credentials."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the env file is readable."
+                }
+            ],
+        }),
+        "SLACK_BOT_TOKEN" | "SLACK_APP_TOKEN" => json!({
+            "key": format!("slack_{}", missing_config.trim_start_matches("SLACK_").to_ascii_lowercase()),
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": format!("Add {missing_config} to the configured Slack env file, then restart the Slack/full runtime profile."),
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_secret",
+                    "target": missing_config,
+                    "description": "Set the missing Slack credential in the configured env file; do not commit it to the repo."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the Slack credential is present."
+                }
+            ],
+        }),
+        "GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN" => json!({
+            "key": "webhook_auth_secret",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Set GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN before starting the webhook/full runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_secret",
+                    "target": "GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN",
+                    "description": "Configure at least one webhook authentication mechanism for operator-facing webhook ingress."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after webhook auth material is present."
+                }
+            ],
+        }),
+        "LINEAR_WEBHOOK_SECRET" => json!({
+            "key": "legacy_linear_webhook_secret",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "If legacy Linear webhook support is intentionally enabled, set LINEAR_WEBHOOK_SECRET; otherwise leave the discontinued Linear lane disabled.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "confirm_legacy_lane",
+                    "target": "NANOCLAW_LINEAR_LEGACY_ENABLED",
+                    "description": "Confirm that the discontinued Linear lane is intentionally being used."
+                },
+                {
+                    "kind": "set_secret",
+                    "target": "LINEAR_WEBHOOK_SECRET",
+                    "description": "Set the legacy Linear webhook signing secret only when that legacy lane is required."
+                }
+            ],
+        }),
+        "NANOCLAW_LINEAR_LEGACY_ENABLED=true" => json!({
+            "key": "legacy_linear_disabled",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Avoid the discontinued pm profile unless legacy Linear automation is intentionally re-enabled.",
+            "requiresSecret": false,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "select_supported_profile",
+                    "target": "runtime serve --profile",
+                    "description": "Use full, gateway, webhook, or slack unless this instance explicitly needs legacy Linear PM automation."
+                },
+                {
+                    "kind": "set_config",
+                    "target": "NANOCLAW_LINEAR_LEGACY_ENABLED=true",
+                    "description": "Only set this when the operator deliberately accepts the legacy Linear lane."
+                }
+            ],
+        }),
+        "LINEAR_CHAT_JID" | "LINEAR_API_KEY or LINEAR_WRITE_API_KEY" => json!({
+            "key": "legacy_linear_pm_config",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": format!("Configure {missing_config} only if the discontinued Linear PM lane is intentionally re-enabled."),
+            "requiresSecret": missing_config.contains("API_KEY"),
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "confirm_legacy_lane",
+                    "target": "pm_automation",
+                    "description": "Confirm the instance is intentionally using the discontinued legacy Linear PM automation lane."
+                },
+                {
+                    "kind": "set_config",
+                    "target": missing_config,
+                    "description": "Set the missing legacy Linear PM configuration only after confirming the lane is required."
+                }
+            ],
+        }),
+        other if other.starts_with("readable Slack env file:") => json!({
+            "key": "slack_env_file_readable",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Fix the configured Slack env file path or permissions before starting the Slack/full runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "fix_file_access",
+                    "target": "NANOCLAW_SLACK_ENV_FILE",
+                    "description": "Ensure the configured Slack env file exists and is readable by the runtime process."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the file is readable."
+                }
+            ],
+        }),
+        _ => json!({
+            "key": "runtime_channel_missing_config",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": format!("Configure {missing_config} for runtime channel {channel_id}, then rerun runtime health."),
+            "requiresSecret": missing_config.contains("TOKEN")
+                || missing_config.contains("SECRET")
+                || missing_config.contains("KEY"),
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_config",
+                    "target": missing_config,
+                    "description": "Set the missing runtime channel configuration from the operator-controlled environment."
+                },
+                {
+                    "kind": "verify",
+                    "command": "cargo run --quiet --bin nanoclaw -- runtime health --limit 5",
+                    "description": "Rerun runtime health after the configuration is present."
+                }
+            ],
+        }),
+    }
+}
+
+fn runtime_startup_recovery_suggestions(events: &Value) -> Vec<Value> {
+    let mut suggestions = BTreeMap::<String, (usize, Value)>::new();
+
+    if let Some(recent_events) = events.get("recent").and_then(Value::as_array) {
+        for event in recent_events {
+            if event.get("status").and_then(Value::as_str) != Some("failed") {
+                continue;
+            }
+            let event_id = event
+                .get("eventId")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let profile = event
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let failures = event
+                .get("evidence")
+                .and_then(|evidence| evidence.get("failures"))
+                .and_then(Value::as_array);
+            let Some(failures) = failures else {
+                continue;
+            };
+
+            for failure in failures {
+                let channel_id = failure
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let missing_configs = failure
+                    .get("missingConfig")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str);
+                for missing_config in missing_configs {
+                    let key = format!("{profile}:{channel_id}:{missing_config}");
+                    let entry = suggestions.entry(key).or_insert_with(|| {
+                        (
+                            0,
+                            runtime_missing_config_recovery_suggestion(
+                                profile,
+                                channel_id,
+                                missing_config,
+                            ),
+                        )
+                    });
+                    entry.0 += 1;
+                    if let Some(object) = entry.1.as_object_mut() {
+                        object.insert("occurrences".to_string(), json!(entry.0));
+                        object.insert("latestEventId".to_string(), json!(event_id));
+                    }
+                }
+            }
+        }
+    }
+
+    suggestions
+        .into_values()
+        .map(|(_, suggestion)| suggestion)
+        .collect()
+}
+
 fn runtime_cleanup_json(config: &NanoclawConfig, args: RuntimeCleanupArgs) -> Value {
     let mut candidates = Vec::<Value>::new();
     let mut removed = Vec::<Value>::new();
@@ -803,6 +1105,7 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
     let startup_events = runtime_startup_events_json(&app.config, limit);
     let (failed_startup_events, failed_startup_profiles, latest_failed_startup) =
         runtime_startup_failure_summary(&startup_events);
+    let recovery_suggestions = runtime_startup_recovery_suggestions(&startup_events);
     let startup_event_status = if failed_startup_events >= 3 {
         RuntimeHealthCheckStatus::Fail
     } else if failed_startup_events > 0 {
@@ -830,6 +1133,7 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
             "latestFailed": latest_failed_startup,
             "startupEvents": startup_events,
             "repeatFailureThreshold": 3,
+            "recoverySuggestions": recovery_suggestions,
         }),
     ));
 
@@ -1774,6 +2078,17 @@ fn runtime_health_alert_text(health: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("no message");
             lines.push(format!("- {id}: {check_status} - {message}"));
+            if let Some(suggestions) = check
+                .get("evidence")
+                .and_then(|evidence| evidence.get("recoverySuggestions"))
+                .and_then(Value::as_array)
+            {
+                for suggestion in suggestions.iter().take(3) {
+                    if let Some(summary) = suggestion.get("summary").and_then(Value::as_str) {
+                        lines.push(format!("  recovery: {summary}"));
+                    }
+                }
+            }
         }
     }
 
@@ -2530,6 +2845,10 @@ mod tests {
             "synthetic gateway preflight failure",
             json!({
                 "reason": "unit_test",
+                "failures": [{
+                    "id": "openclaw_gateway",
+                    "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                }],
             }),
         )?;
 
@@ -2546,6 +2865,14 @@ mod tests {
         assert_eq!(check["status"], "warn");
         assert_eq!(check["evidence"]["failedRecent"], 1);
         assert_eq!(check["evidence"]["failedProfiles"]["gateway"], 1);
+        assert_eq!(
+            check["evidence"]["recoverySuggestions"][0]["missingConfig"],
+            "NANOCLAW_OPENCLAW_GATEWAY_TOKEN"
+        );
+        assert!(check["evidence"]["recoverySuggestions"][0]["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
         Ok(())
     }
 
@@ -2573,6 +2900,10 @@ mod tests {
                 json!({
                     "reason": "unit_test",
                     "index": index,
+                    "failures": [{
+                        "id": "openclaw_gateway",
+                        "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                    }],
                 }),
             )?;
         }
@@ -2599,6 +2930,9 @@ mod tests {
         assert!(outbox[0]
             .text
             .contains("repeated runtime startup or preflight failures"));
+        assert!(outbox[0]
+            .text
+            .contains("Set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
         Ok(())
     }
 
