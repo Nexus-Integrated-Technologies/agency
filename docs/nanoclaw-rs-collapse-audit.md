@@ -410,18 +410,24 @@ Already active:
 - The state-action apply registry is intentionally non-destructive in this
   slice: it does not delete caches, mutate source references, or migrate legacy
   stores into active session sidecars without a separate runtime contract.
+- `nanoclaw runtime source-disposition --limit <n>` now fingerprints and
+  classifies the remaining legacy Agency source directories against their
+  active Rust NanoClaw descendant roles. This keeps `src/fpf`,
+  `src/orchestrator`, `src/agent`, `src/memory`, `src/tools`, and related
+  source material in a deterministic report-only adoption ledger before any
+  source move or deletion is considered.
 
 Remaining work:
 
 - Add explicit migration handlers only after a specific legacy store has an
   active runtime contract and replay/rollback path.
-- Decide which legacy memory source references should be clean-roomed further,
-  moved to graveyard, or deleted after capability adoption is complete.
+- Add guarded source-disposition actions only after a specific parked source
+  path has a clean-room adoption contract or graveyard decision.
 
 Exit criterion:
 
-- Operators can tell which state belongs to the active Rust runtime and which
-  state is parked legacy residue.
+- Operators can tell which state and source material belongs to the active Rust
+  runtime and which material is parked legacy residue.
 
 ### 7. Rewrite Public Repo Documentation
 
