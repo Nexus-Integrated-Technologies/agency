@@ -630,6 +630,30 @@ fn runtime_startup_events_json(config: &NanoclawConfig, limit: usize) -> Value {
     }
 }
 
+fn runtime_startup_failure_summary(events: &Value) -> (usize, BTreeMap<String, usize>, Value) {
+    let mut failed = 0usize;
+    let mut by_profile = BTreeMap::<String, usize>::new();
+    let mut latest_failed = Value::Null;
+
+    if let Some(recent_events) = events.get("recent").and_then(Value::as_array) {
+        for event in recent_events {
+            if event.get("status").and_then(Value::as_str) != Some("failed") {
+                continue;
+            }
+            failed += 1;
+            let profile = event
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            *by_profile.entry(profile).or_default() += 1;
+            latest_failed = event.clone();
+        }
+    }
+
+    (failed, by_profile, latest_failed)
+}
+
 fn runtime_cleanup_json(config: &NanoclawConfig, args: RuntimeCleanupArgs) -> Value {
     let mut candidates = Vec::<Value>::new();
     let mut removed = Vec::<Value>::new();
@@ -773,6 +797,39 @@ fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
             "controlDir": runtime_control_dir(&app.config).display().to_string(),
             "profiles": profile_states,
             "staleOrInvalid": stale_or_invalid_profiles,
+        }),
+    ));
+
+    let startup_events = runtime_startup_events_json(&app.config, limit);
+    let (failed_startup_events, failed_startup_profiles, latest_failed_startup) =
+        runtime_startup_failure_summary(&startup_events);
+    let startup_event_status = if failed_startup_events >= 3 {
+        RuntimeHealthCheckStatus::Fail
+    } else if failed_startup_events > 0 {
+        RuntimeHealthCheckStatus::Warn
+    } else {
+        RuntimeHealthCheckStatus::Pass
+    };
+    checks.push(runtime_health_check(
+        "runtime_startup_events",
+        startup_event_status,
+        match startup_event_status {
+            RuntimeHealthCheckStatus::Pass => {
+                "no recent runtime startup or preflight failures are recorded"
+            }
+            RuntimeHealthCheckStatus::Warn => {
+                "recent runtime startup or preflight failure needs operator review"
+            }
+            RuntimeHealthCheckStatus::Fail => {
+                "repeated runtime startup or preflight failures need operator action"
+            }
+        },
+        json!({
+            "failedRecent": failed_startup_events,
+            "failedProfiles": failed_startup_profiles,
+            "latestFailed": latest_failed_startup,
+            "startupEvents": startup_events,
+            "repeatFailureThreshold": 3,
         }),
     ));
 
@@ -2448,6 +2505,100 @@ mod tests {
             .text
             .contains("NanoClaw runtime health: unhealthy"));
         assert!(outbox[0].text.contains("webhook_auth"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_warns_on_recent_startup_failure() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "preflight",
+            "failed",
+            "synthetic gateway preflight failure",
+            json!({
+                "reason": "unit_test",
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let health = runtime_health_json(&app, 5)?;
+        let check = health["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "runtime_startup_events")
+            .expect("runtime startup event health check should exist");
+
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(check["status"], "warn");
+        assert_eq!(check["evidence"]["failedRecent"], 1);
+        assert_eq!(check["evidence"]["failedProfiles"]["gateway"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_fails_on_repeated_startup_failures_and_notifies() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        for index in 0..3 {
+            record_runtime_startup_event(
+                &config,
+                &serve_args,
+                "preflight",
+                "failed",
+                format!("synthetic gateway preflight failure {index}"),
+                json!({
+                    "reason": "unit_test",
+                    "index": index,
+                }),
+            )?;
+        }
+
+        let app = NanoclawApp::open(config.clone())?;
+        let health = runtime_health_json(&app, 5)?;
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 5,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+        let channel = LocalChannel::new(&config.data_dir)?;
+        let outbox = channel.read_outbox()?;
+
+        assert_eq!(health["status"], "unhealthy");
+        assert_eq!(notification["sent"], true);
+        assert_eq!(outbox.len(), 1);
+        assert!(outbox[0].text.contains("runtime_startup_events"));
+        assert!(outbox[0]
+            .text
+            .contains("repeated runtime startup or preflight failures"));
         Ok(())
     }
 
