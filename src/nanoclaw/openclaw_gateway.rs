@@ -771,10 +771,12 @@ fn execute_gateway_run(
     let identity = derive_group_identity(run_id, params);
     let group = app.ensure_group_for_chat(&identity.chat_jid, Some(&identity.group_name))?;
     let session_id = format!("gateway-{}", slug(run_id));
-    let backend_override = gateway_backend_override(params);
-    let effective_backend = backend_override
-        .clone()
-        .or_else(default_gateway_worker_backend_from_env);
+    let backend_override = select_gateway_worker_backend(
+        forced_gateway_worker_backend_from_env(),
+        gateway_backend_override(params),
+        default_gateway_worker_backend_from_env(),
+    );
+    let effective_backend = backend_override.clone();
     if !matches!(effective_backend, Some(WorkerBackend::GithubCopilot)) {
         if let Some(target) = resolve_codespaces_gateway_target(params)? {
             let session = build_execution_session(
@@ -1579,6 +1581,14 @@ fn gateway_backend_override(params: &GatewayAgentParams) -> Option<WorkerBackend
         .map(WorkerBackend::parse)
 }
 
+fn forced_gateway_worker_backend_from_env() -> Option<WorkerBackend> {
+    std::env::var("NANOCLAW_FORCE_WORKER_BACKEND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| WorkerBackend::parse(&value))
+}
+
 fn default_gateway_worker_backend_from_env() -> Option<WorkerBackend> {
     std::env::var("NANOCLAW_WORKER_BACKEND")
         .or_else(|_| std::env::var("NANOCLAW_MODEL_BACKEND"))
@@ -1586,6 +1596,14 @@ fn default_gateway_worker_backend_from_env() -> Option<WorkerBackend> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(|value| WorkerBackend::parse(&value))
+}
+
+fn select_gateway_worker_backend(
+    forced: Option<WorkerBackend>,
+    hinted: Option<WorkerBackend>,
+    default: Option<WorkerBackend>,
+) -> Option<WorkerBackend> {
+    forced.or(hinted).or(default)
 }
 
 fn gateway_runtime_env(params: &GatewayAgentParams) -> BTreeMap<String, String> {
@@ -3023,6 +3041,17 @@ mod tests {
             Some("zai")
         );
         assert!(!env.contains_key("NANOCLAW_ZAI_MODEL"));
+    }
+
+    #[test]
+    fn forced_gateway_backend_wins_over_payload_hint() {
+        let selected = select_gateway_worker_backend(
+            Some(WorkerBackend::AzureOpenAI),
+            Some(WorkerBackend::Zai),
+            Some(WorkerBackend::Codex),
+        );
+
+        assert_eq!(selected, Some(WorkerBackend::AzureOpenAI));
     }
 
     #[test]
