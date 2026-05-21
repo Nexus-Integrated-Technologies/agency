@@ -12,7 +12,7 @@ remain inspectable.
 - Primary gateway backend: `azure-openai`
 - Azure deployment: `nanoclaw-gpt-4-1-mini`
 - Azure fallback backend: `codex`
-- Codex usage-limit fallback: `zai`, configurable with
+- Codex usage-limit fallback: `azure-openai`, configurable with
   `NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND`
 - Workers AI: not a default execution fallback
 - ZAI: available as an explicit backend or fallback when configured, but not a
@@ -43,8 +43,9 @@ Container defaults still set the normal production posture:
 
 ```text
 NANOCLAW_WORKER_BACKEND=azure-openai
+NANOCLAW_FORCE_WORKER_BACKEND=azure-openai
 NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND=codex
-NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND=zai
+NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND=azure-openai
 ```
 
 Per-run gateway hints can override provider routing without changing the
@@ -57,7 +58,7 @@ container:
       "workerBackend": "azure-openai",
       "model": "nanoclaw-gpt-4-1-mini",
       "azureFallbackBackend": "codex",
-      "codexUsageFallbackBackend": "zai"
+      "codexUsageFallbackBackend": "azure-openai"
     }
   }
 }
