@@ -786,7 +786,7 @@ fn execute_gateway_run(
                 &PathBuf::from(&target.remote_cwd),
             );
             let mut runtime_env = paperclip_runtime_env(params.paperclip.as_ref());
-            runtime_env.extend(gateway_runtime_env(params));
+            runtime_env.extend(gateway_runtime_env(params, backend_override.as_ref()));
             let runtime_env = codespaces_runtime_env(runtime_env);
             let prompt = render_codespaces_gateway_prompt(&render_gateway_remote_prompt(
                 prompt,
@@ -817,7 +817,7 @@ fn execute_gateway_run(
     );
     let executor = ExecutionLaneRouter::from_config(&state.config, Some(lane.clone()))?;
     let mut runtime_env = paperclip_runtime_env(params.paperclip.as_ref());
-    runtime_env.extend(gateway_runtime_env(params));
+    runtime_env.extend(gateway_runtime_env(params, backend_override.as_ref()));
 
     let request = ExecutionRequest {
         group: group.clone(),
@@ -1606,24 +1606,34 @@ fn select_gateway_worker_backend(
     forced.or(hinted).or(default)
 }
 
-fn gateway_runtime_env(params: &GatewayAgentParams) -> BTreeMap<String, String> {
+fn gateway_runtime_env(
+    params: &GatewayAgentParams,
+    effective_backend: Option<&WorkerBackend>,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     let gateway = params
         .paperclip
         .as_ref()
         .and_then(|paperclip| paperclip.gateway.as_ref());
-    let backend_hint = gateway
+    let payload_backend_hint = gateway
         .and_then(|gateway| gateway.worker_backend.as_deref())
         .map(WorkerBackend::parse);
+    let effective_backend = effective_backend.cloned();
+    let suppress_generic_model = matches!(
+        (effective_backend.as_ref(), payload_backend_hint.as_ref()),
+        (Some(effective), Some(payload)) if effective != payload
+    );
+    let backend_hint = effective_backend.or(payload_backend_hint);
 
     if let Some(gateway) = gateway {
         if let Some(model) = gateway
             .zai_model
             .as_deref()
             .or_else(|| {
-                (!matches!(backend_hint.as_ref(), Some(WorkerBackend::AzureOpenAI)))
-                    .then_some(gateway.model.as_deref())
-                    .flatten()
+                (!suppress_generic_model
+                    && !matches!(backend_hint.as_ref(), Some(WorkerBackend::AzureOpenAI)))
+                .then_some(gateway.model.as_deref())
+                .flatten()
             })
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1646,9 +1656,10 @@ fn gateway_runtime_env(params: &GatewayAgentParams) -> BTreeMap<String, String> 
             .as_deref()
             .or(gateway.azure_model.as_deref())
             .or_else(|| {
-                matches!(backend_hint.as_ref(), Some(WorkerBackend::AzureOpenAI))
-                    .then_some(gateway.model.as_deref())
-                    .flatten()
+                (!suppress_generic_model
+                    && matches!(backend_hint.as_ref(), Some(WorkerBackend::AzureOpenAI)))
+                .then_some(gateway.model.as_deref())
+                .flatten()
             })
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -2984,7 +2995,7 @@ mod tests {
         };
 
         assert_eq!(gateway_backend_override(&params), Some(WorkerBackend::Zai));
-        let env = gateway_runtime_env(&params);
+        let env = gateway_runtime_env(&params, None);
         assert_eq!(
             env.get("NANOCLAW_ZAI_MODEL").map(String::as_str),
             Some("glm-4.7")
@@ -3014,7 +3025,7 @@ mod tests {
             gateway_backend_override(&params),
             Some(WorkerBackend::AzureOpenAI)
         );
-        let env = gateway_runtime_env(&params);
+        let env = gateway_runtime_env(&params, None);
         assert_eq!(
             env.get("NANOCLAW_AZURE_OPENAI_DEPLOYMENT")
                 .map(String::as_str),
@@ -3055,6 +3066,51 @@ mod tests {
     }
 
     #[test]
+    fn forced_gateway_backend_suppresses_mismatched_generic_model_env() {
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                gateway: Some(GatewayHints {
+                    worker_backend: Some("zai".to_string()),
+                    model: Some("glm-4.7".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = gateway_runtime_env(&params, Some(&WorkerBackend::AzureOpenAI));
+
+        assert!(!env.contains_key("NANOCLAW_ZAI_MODEL"));
+        assert!(!env.contains_key("NANOCLAW_AZURE_OPENAI_DEPLOYMENT"));
+    }
+
+    #[test]
+    fn forced_gateway_backend_keeps_explicit_azure_deployment_env() {
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                gateway: Some(GatewayHints {
+                    worker_backend: Some("zai".to_string()),
+                    model: Some("glm-4.7".to_string()),
+                    azure_deployment: Some("nanoclaw-gpt-4-1-mini".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = gateway_runtime_env(&params, Some(&WorkerBackend::AzureOpenAI));
+
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_OPENAI_DEPLOYMENT")
+                .map(String::as_str),
+            Some("nanoclaw-gpt-4-1-mini")
+        );
+        assert!(!env.contains_key("NANOCLAW_ZAI_MODEL"));
+    }
+
+    #[test]
     fn gateway_hints_deserialize_provider_fallback_aliases() {
         let params: GatewayAgentParams = serde_json::from_value(serde_json::json!({
             "paperclip": {
@@ -3071,7 +3127,7 @@ mod tests {
             gateway_backend_override(&params),
             Some(WorkerBackend::AzureOpenAI)
         );
-        let env = gateway_runtime_env(&params);
+        let env = gateway_runtime_env(&params, None);
         assert_eq!(
             env.get("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND")
                 .map(String::as_str),
@@ -3112,7 +3168,7 @@ mod tests {
             gateway_backend_override(&params),
             Some(WorkerBackend::GithubCopilot)
         );
-        let env = gateway_runtime_env(&params);
+        let env = gateway_runtime_env(&params, None);
         assert_eq!(
             env.get("NANOCLAW_GITHUB_COPILOT_REPO").map(String::as_str),
             Some("https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare")
