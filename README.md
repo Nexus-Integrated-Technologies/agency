@@ -112,6 +112,18 @@ writes a receipt under `data/runtime/state-actions/`. It does not delete source
 references, purge caches destructively, or migrate legacy state without a
 separate runtime contract.
 
+Classify remaining legacy Agency source material against its active Rust
+NanoClaw descendant surface:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime source-disposition --limit 10
+```
+
+This report is deterministic and report-only. It fingerprints parked source
+directories such as `src/fpf`, `src/orchestrator`, `src/agent`, `src/memory`,
+and `src/tools`, then records whether each path should be distilled further,
+left parked, or held for a future runtime contract.
+
 Get a deterministic health report over runtime directories, PID files,
 startup/preflight failures, runtime-channel ownership, gateway/webhook auth
 posture, task backlog, recent execution evidence, and known recovery

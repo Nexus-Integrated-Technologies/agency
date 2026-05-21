@@ -116,6 +116,10 @@ or clean-roomed into the active runtime.
    converts legacy memory/vector/history residue into confirmed, receipt-backed
    archive actions while refusing source-reference mutation, destructive cache
    purge, or legacy-store migration without a narrower runtime contract.
+   Source material now has a deterministic report-only pass too:
+   `runtime source-disposition --limit <n>` fingerprints remaining legacy
+   source directories and maps each one to its active Rust NanoClaw descendant
+   role, recommended clean-room action, and non-mutation policy.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring

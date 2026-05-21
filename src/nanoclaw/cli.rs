@@ -52,6 +52,7 @@ use super::session_storage::{
 };
 use super::slack::SlackChannel;
 use super::slack_runtime::SlackRuntime;
+use super::source_disposition::source_disposition_report;
 use super::swarm::{
     cancel_swarm_objective_run, create_swarm_objective_run, get_swarm_run_details,
     list_swarm_run_details, pump_swarm_once, CreateSwarmObjectiveRunInput,
@@ -65,7 +66,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|state-action|inspect|health|repair|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|state-action|source-disposition|inspect|health|repair|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -2311,6 +2312,14 @@ fn print_runtime_state_action(config: NanoclawConfig, args: RuntimeStateActionAr
     println!(
         "{}",
         serde_json::to_string_pretty(&runtime_state_action_json(&config, args)?)?
+    );
+    Ok(())
+}
+
+fn print_runtime_source_disposition(config: NanoclawConfig, limit: usize) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&source_disposition_report(&config, limit)?)?
     );
     Ok(())
 }
@@ -5050,6 +5059,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                 "state-action" => {
                     let action_args = parse_runtime_state_action_args(&mut args)?;
                     print_runtime_state_action(config, action_args)?;
+                }
+                "source-disposition" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime source-disposition")?;
+                    print_runtime_source_disposition(config, limit)?;
                 }
                 "inspect" => {
                     let limit = parse_limit_args(&mut args, 10, "runtime inspect")?;

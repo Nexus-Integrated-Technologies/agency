@@ -34,6 +34,7 @@ pub mod session_storage;
 pub mod slack;
 pub mod slack_runtime;
 pub mod slack_threading;
+pub mod source_disposition;
 pub mod swarm;
 pub mod tool_registry;
 pub mod types;
