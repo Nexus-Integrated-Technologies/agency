@@ -108,6 +108,18 @@ cargo run --quiet --bin nanoclaw -- runtime health --strict
 cargo run --quiet --bin nanoclaw -- runtime health --notify-local ops
 ```
 
+Convert health recovery evidence into a guarded repair plan, or attempt only
+safe deterministic repairs:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime repair --plan --limit 5
+cargo run --quiet --bin nanoclaw -- runtime repair --apply --limit 5
+```
+
+`runtime repair --apply` will not write secrets, choose ports, enable legacy
+lanes, or restart long-running profiles automatically. Those remain explicit
+operator actions.
+
 Report stale or invalid runtime PID files, then remove them only when explicitly
 applied:
 

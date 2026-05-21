@@ -65,7 +65,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|repair|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -130,6 +130,27 @@ struct RuntimeHealthArgs {
     strict: bool,
     notify_local: Option<String>,
     notify_always: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRepairMode {
+    Plan,
+    Apply,
+}
+
+impl RuntimeRepairMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeRepairArgs {
+    mode: RuntimeRepairMode,
+    limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +320,45 @@ where
         strict,
         notify_local,
         notify_always,
+    })
+}
+
+fn parse_runtime_repair_args<I>(args: &mut I) -> Result<RuntimeRepairArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = 10;
+    let mut mode = None::<RuntimeRepairMode>;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--plan" => {
+                if mode.replace(RuntimeRepairMode::Plan).is_some() {
+                    anyhow::bail!("runtime repair accepts only one of --plan or --apply");
+                }
+            }
+            "--apply" => {
+                if mode.replace(RuntimeRepairMode::Apply).is_some() {
+                    anyhow::bail!("runtime repair accepts only one of --plan or --apply");
+                }
+            }
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid runtime repair --limit value {value}"))?
+                    .max(1);
+            }
+            other => anyhow::bail!("unexpected runtime repair argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeRepairArgs {
+        mode: mode.unwrap_or(RuntimeRepairMode::Plan),
+        limit,
     })
 }
 
@@ -2133,6 +2193,345 @@ fn maybe_send_runtime_health_notification(
     }))
 }
 
+fn runtime_repair_action_has_auto_apply_handler(kind: &str) -> bool {
+    let _ = kind;
+    false
+}
+
+fn runtime_repair_item_classification(suggestion: &Value) -> (&'static str, String) {
+    let requires_secret = suggestion
+        .get("requiresSecret")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let safe_to_automate = suggestion
+        .get("safeToAutomate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let action_kinds = suggestion
+        .get("operatorActions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| action.get("kind").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    if requires_secret {
+        return (
+            "operator_required",
+            "repair requires secret material controlled by the operator".to_string(),
+        );
+    }
+    if !safe_to_automate {
+        return (
+            "operator_required",
+            "repair is intentionally gated for operator decision".to_string(),
+        );
+    }
+    if action_kinds.is_empty() {
+        return (
+            "blocked",
+            "repair suggestion does not include deterministic actions".to_string(),
+        );
+    }
+    if action_kinds
+        .iter()
+        .all(|kind| runtime_repair_action_has_auto_apply_handler(kind))
+    {
+        return (
+            "auto_applyable",
+            "all repair actions have deterministic auto-apply handlers".to_string(),
+        );
+    }
+
+    (
+        "operator_required",
+        "one or more repair actions do not have a safe auto-apply handler".to_string(),
+    )
+}
+
+fn runtime_repair_item_from_suggestion(check_id: &str, suggestion: &Value) -> Value {
+    let key = suggestion
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or("runtime_recovery_suggestion");
+    let missing_config = suggestion
+        .get("missingConfig")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let summary = suggestion
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("runtime recovery suggestion needs operator review");
+    let (classification, reason) = runtime_repair_item_classification(suggestion);
+
+    json!({
+        "id": format!("{check_id}:{key}:{missing_config}"),
+        "sourceCheckId": check_id,
+        "kind": "runtime_recovery_suggestion",
+        "classification": classification,
+        "summary": summary,
+        "reason": reason,
+        "safeToAutomate": suggestion.get("safeToAutomate").cloned().unwrap_or(json!(false)),
+        "requiresSecret": suggestion.get("requiresSecret").cloned().unwrap_or(json!(true)),
+        "profile": suggestion.get("profile").cloned().unwrap_or(Value::Null),
+        "channelId": suggestion.get("channelId").cloned().unwrap_or(Value::Null),
+        "missingConfig": missing_config,
+        "occurrences": suggestion.get("occurrences").cloned().unwrap_or(json!(1)),
+        "latestEventId": suggestion.get("latestEventId").cloned().unwrap_or(Value::Null),
+        "operatorActions": suggestion.get("operatorActions").cloned().unwrap_or(json!([])),
+        "sourceSuggestion": suggestion.clone(),
+    })
+}
+
+fn runtime_startup_event_has_missing_config_failure(event: &Value) -> bool {
+    event
+        .get("evidence")
+        .and_then(|evidence| evidence.get("failures"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|failure| {
+            failure
+                .get("missingConfig")
+                .and_then(Value::as_array)
+                .map(|missing| {
+                    missing
+                        .iter()
+                        .any(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
+                })
+                .unwrap_or(false)
+        })
+}
+
+fn runtime_repair_diagnostic_item_from_startup_event(event: &Value) -> Value {
+    let event_id = event
+        .get("eventId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let profile = event
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let message = event
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("runtime startup failure has no deterministic repair mapping");
+
+    json!({
+        "id": format!("runtime_startup_events:diagnostic:{event_id}"),
+        "sourceCheckId": "runtime_startup_events",
+        "kind": "runtime_startup_failure_diagnostic",
+        "classification": "blocked",
+        "summary": format!("Inspect startup failure for profile {profile}: {message}"),
+        "reason": "no deterministic remediation is registered for this failure shape",
+        "safeToAutomate": false,
+        "requiresSecret": false,
+        "profile": profile,
+        "channelId": Value::Null,
+        "missingConfig": Value::Null,
+        "occurrences": 1,
+        "latestEventId": event_id,
+        "operatorActions": [{
+            "kind": "inspect_event",
+            "target": event_id,
+            "description": "Inspect the startup event evidence and add a remediation mapping only after the failure shape is understood."
+        }],
+        "sourceEvent": event.clone(),
+    })
+}
+
+fn runtime_repair_items_from_health(health: &Value) -> Vec<Value> {
+    let mut items = Vec::<Value>::new();
+    let mut seen = BTreeSet::<String>::new();
+
+    if let Some(checks) = health.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let check_id = check.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            if let Some(suggestions) = check
+                .get("evidence")
+                .and_then(|evidence| evidence.get("recoverySuggestions"))
+                .and_then(Value::as_array)
+            {
+                for suggestion in suggestions {
+                    let item = runtime_repair_item_from_suggestion(check_id, suggestion);
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if seen.insert(item_id) {
+                        items.push(item);
+                    }
+                }
+            }
+
+            if check_id != "runtime_startup_events" {
+                continue;
+            }
+            if let Some(events) = check
+                .get("evidence")
+                .and_then(|evidence| evidence.get("startupEvents"))
+                .and_then(|startup_events| startup_events.get("recent"))
+                .and_then(Value::as_array)
+            {
+                for event in events {
+                    if event.get("status").and_then(Value::as_str) != Some("failed") {
+                        continue;
+                    }
+                    if runtime_startup_event_has_missing_config_failure(event) {
+                        continue;
+                    }
+                    let item = runtime_repair_diagnostic_item_from_startup_event(event);
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if seen.insert(item_id) {
+                        items.push(item);
+                    }
+                }
+            }
+        }
+    }
+
+    items
+}
+
+fn runtime_repair_summary(items: &[Value]) -> Value {
+    let auto_applyable = items
+        .iter()
+        .filter(|item| item.get("classification").and_then(Value::as_str) == Some("auto_applyable"))
+        .count();
+    let operator_required = items
+        .iter()
+        .filter(|item| {
+            item.get("classification").and_then(Value::as_str) == Some("operator_required")
+        })
+        .count();
+    let blocked = items
+        .iter()
+        .filter(|item| item.get("classification").and_then(Value::as_str) == Some("blocked"))
+        .count();
+
+    json!({
+        "total": items.len(),
+        "autoApplyable": auto_applyable,
+        "operatorRequired": operator_required,
+        "blocked": blocked,
+    })
+}
+
+fn runtime_repair_apply_outcome(item: &Value) -> Value {
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let classification = item
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or("blocked");
+
+    match classification {
+        "auto_applyable" => json!({
+            "itemId": item_id,
+            "applied": false,
+            "status": "blocked",
+            "reason": "no deterministic auto-apply handler is registered for this repair item",
+        }),
+        "operator_required" => json!({
+            "itemId": item_id,
+            "applied": false,
+            "status": "skipped",
+            "reason": "operator action required; runtime repair will not write secrets, choose ports, enable legacy lanes, or restart long-running profiles automatically",
+        }),
+        _ => json!({
+            "itemId": item_id,
+            "applied": false,
+            "status": "blocked",
+            "reason": item.get("reason").cloned().unwrap_or(json!("repair item is blocked")),
+        }),
+    }
+}
+
+fn runtime_repair_json(app: &NanoclawApp, args: RuntimeRepairArgs) -> Result<Value> {
+    let health = runtime_health_json(app, args.limit)?;
+    let items = runtime_repair_items_from_health(&health);
+    let summary = runtime_repair_summary(&items);
+    let mut result = json!({
+        "schemaVersion": "2026-05-21",
+        "mode": args.mode.as_str(),
+        "ok": true,
+        "status": "nothing_to_repair",
+        "health": {
+            "status": health.get("status").cloned().unwrap_or(Value::Null),
+            "ok": health.get("ok").cloned().unwrap_or(Value::Null),
+            "summary": health.get("summary").cloned().unwrap_or(Value::Null),
+        },
+        "summary": summary,
+        "items": items,
+        "applyResults": [],
+    });
+
+    let total = result["summary"]["total"].as_u64().unwrap_or(0);
+    let auto_applyable = result["summary"]["autoApplyable"].as_u64().unwrap_or(0);
+    let operator_required = result["summary"]["operatorRequired"].as_u64().unwrap_or(0);
+    let blocked = result["summary"]["blocked"].as_u64().unwrap_or(0);
+
+    let status = match args.mode {
+        RuntimeRepairMode::Plan if total == 0 => "nothing_to_repair",
+        RuntimeRepairMode::Plan if blocked > 0 => "blocked",
+        RuntimeRepairMode::Plan if operator_required > 0 => "operator_action_required",
+        RuntimeRepairMode::Plan if auto_applyable > 0 => "ready_to_apply",
+        RuntimeRepairMode::Plan => "planned",
+        RuntimeRepairMode::Apply => {
+            let apply_results = result["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(runtime_repair_apply_outcome)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let applied_count = apply_results
+                .iter()
+                .filter(|outcome| outcome.get("applied").and_then(Value::as_bool) == Some(true))
+                .count();
+            let skipped_count = apply_results.len().saturating_sub(applied_count);
+            if let Value::Object(fields) = &mut result {
+                fields.insert("applyResults".to_string(), json!(apply_results));
+                fields.insert(
+                    "applySummary".to_string(),
+                    json!({
+                        "applied": applied_count,
+                        "skippedOrBlocked": skipped_count,
+                    }),
+                );
+            }
+            if applied_count > 0 {
+                "applied"
+            } else if skipped_count > 0 {
+                "nothing_applied"
+            } else {
+                "nothing_to_apply"
+            }
+        }
+    };
+
+    if let Value::Object(fields) = &mut result {
+        fields.insert("status".to_string(), json!(status));
+    }
+
+    Ok(result)
+}
+
+fn print_runtime_repair(config: NanoclawConfig, args: RuntimeRepairArgs) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_repair_json(&app, args)?)?
+    );
+    Ok(())
+}
+
 fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
     let app = NanoclawApp::open(config)?;
     println!(
@@ -2298,6 +2697,23 @@ mod tests {
                 strict: false,
                 notify_local: Some("ops".to_string()),
                 notify_always: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_repair_apply_limit() {
+        let mut args = vec![
+            "--apply".to_string(),
+            "--limit".to_string(),
+            "3".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_repair_args(&mut args).unwrap(),
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Apply,
+                limit: 3,
             }
         );
     }
@@ -2933,6 +3349,208 @@ mod tests {
         assert!(outbox[0]
             .text
             .contains("Set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_plan_dedupes_secret_recovery_as_operator_required() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        for index in 0..3 {
+            record_runtime_startup_event(
+                &config,
+                &serve_args,
+                "preflight",
+                "failed",
+                format!("synthetic gateway preflight failure {index}"),
+                json!({
+                    "reason": "unit_test",
+                    "failures": [{
+                        "id": "openclaw_gateway",
+                        "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                    }],
+                }),
+            )?;
+        }
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Plan,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "operator_action_required");
+        assert_eq!(repair["summary"]["total"], 1);
+        assert_eq!(repair["summary"]["operatorRequired"], 1);
+        assert_eq!(repair["items"][0]["classification"], "operator_required");
+        assert_eq!(
+            repair["items"][0]["missingConfig"],
+            "NANOCLAW_OPENCLAW_GATEWAY_TOKEN"
+        );
+        assert_eq!(repair["items"][0]["occurrences"], 3);
+        assert_eq!(repair["items"][0]["requiresSecret"], true);
+        assert_eq!(repair["items"][0]["safeToAutomate"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_apply_refuses_secret_bearing_recovery() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "preflight",
+            "failed",
+            "synthetic gateway preflight failure",
+            json!({
+                "reason": "unit_test",
+                "failures": [{
+                    "id": "openclaw_gateway",
+                    "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                }],
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Apply,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "nothing_applied");
+        assert_eq!(repair["applySummary"]["applied"], 0);
+        assert_eq!(repair["applySummary"]["skippedOrBlocked"], 1);
+        assert_eq!(repair["applyResults"][0]["applied"], false);
+        assert!(repair["applyResults"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("will not write secrets"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_plan_includes_non_secret_missing_config() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "preflight",
+            "failed",
+            "synthetic gateway preflight failure",
+            json!({
+                "reason": "unit_test",
+                "failures": [{
+                    "id": "openclaw_gateway",
+                    "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_PORT"],
+                }],
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Plan,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "operator_action_required");
+        assert_eq!(repair["summary"]["total"], 1);
+        assert_eq!(repair["items"][0]["classification"], "operator_required");
+        assert_eq!(
+            repair["items"][0]["missingConfig"],
+            "NANOCLAW_OPENCLAW_GATEWAY_PORT"
+        );
+        assert_eq!(repair["items"][0]["requiresSecret"], false);
+        assert_eq!(repair["items"][0]["safeToAutomate"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_plan_reports_unknown_startup_failure_as_blocked_diagnostic() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "startup",
+            "failed",
+            "synthetic unknown startup failure",
+            json!({
+                "reason": "unit_test_unknown_shape",
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Plan,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "blocked");
+        assert_eq!(repair["summary"]["total"], 1);
+        assert_eq!(repair["summary"]["blocked"], 1);
+        assert_eq!(
+            repair["items"][0]["kind"],
+            "runtime_startup_failure_diagnostic"
+        );
+        assert_eq!(repair["items"][0]["classification"], "blocked");
+        assert!(repair["items"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no deterministic remediation"));
         Ok(())
     }
 
@@ -3798,6 +4416,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                 "health" => {
                     let health_args = parse_runtime_health_args(&mut args)?;
                     print_runtime_health(config, health_args)?;
+                }
+                "repair" => {
+                    let repair_args = parse_runtime_repair_args(&mut args)?;
+                    print_runtime_repair(config, repair_args)?;
                 }
                 "cleanup" => {
                     let cleanup_args = parse_runtime_cleanup_args(&mut args)?;
