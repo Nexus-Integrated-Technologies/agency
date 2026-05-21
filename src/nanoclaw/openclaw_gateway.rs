@@ -883,6 +883,19 @@ fn resolve_gateway_workspace_root(
             ));
         }
         if !path.is_dir() {
+            if should_provision_paperclip_workspace(params, label, &path) {
+                std::fs::create_dir_all(&path).with_context(|| {
+                    format!(
+                        "failed to provision Paperclip {label} directory: {}",
+                        path.display()
+                    )
+                })?;
+                eprintln!(
+                    "openclaw gateway provisioned Paperclip {label} directory: {}",
+                    path.display()
+                );
+                return Ok(path);
+            }
             return Err(anyhow::anyhow!(
                 "Paperclip {label} path is not a directory: {}",
                 path.display()
@@ -892,6 +905,37 @@ fn resolve_gateway_workspace_root(
     }
 
     Ok(config.groups_dir.join(group_folder))
+}
+
+fn should_provision_paperclip_workspace(
+    params: &GatewayAgentParams,
+    label: &str,
+    path: &Path,
+) -> bool {
+    if label != "workspace.cwd" {
+        return false;
+    }
+    let Some(workspace) = params
+        .paperclip
+        .as_ref()
+        .and_then(|paperclip| paperclip.workspace.as_ref())
+    else {
+        return false;
+    };
+
+    let is_agent_home_source = non_empty(workspace.source.as_deref())
+        .map(|source| source == "agent_home")
+        .unwrap_or(false);
+    let is_declared_agent_home = non_empty(workspace.agent_home.as_deref())
+        .map(|agent_home| Path::new(agent_home) == path)
+        .unwrap_or(false);
+    if !is_agent_home_source && !is_declared_agent_home {
+        return false;
+    }
+
+    non_empty(workspace.repo_url.as_deref()).is_none()
+        && non_empty(workspace.worktree_path.as_deref()).is_none()
+        && non_empty(workspace.workspace_id.as_deref()).is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3112,6 +3156,62 @@ mod tests {
             .expect("workspace should resolve");
 
         assert_eq!(resolved, workspace.path());
+    }
+
+    #[test]
+    fn gateway_provisions_missing_agent_home_workspace_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let fallback = temp.path().join("groups");
+        let workspace = temp.path().join("instances/default/workspaces/agent-1");
+        let mut config = NanoclawConfig::from_env();
+        config.groups_dir = fallback;
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                workspace: Some(GatewayPaperclipWorkspace {
+                    cwd: Some(workspace.display().to_string()),
+                    source: Some("agent_home".to_string()),
+                    agent_home: Some(workspace.display().to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_gateway_workspace_root(&config, &params, "paperclip_issue_1")
+            .expect("agent home fallback should be provisioned");
+
+        assert_eq!(resolved, workspace);
+        assert!(resolved.is_dir());
+    }
+
+    #[test]
+    fn gateway_does_not_provision_missing_repo_workspace_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let fallback = temp.path().join("groups");
+        let workspace = temp.path().join("projects/repo");
+        let mut config = NanoclawConfig::from_env();
+        config.groups_dir = fallback;
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                workspace: Some(GatewayPaperclipWorkspace {
+                    cwd: Some(workspace.display().to_string()),
+                    source: Some("project_primary".to_string()),
+                    repo_url: Some(
+                        "https://github.com/Nexus-Integrated-Technologies/example".to_string(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = resolve_gateway_workspace_root(&config, &params, "paperclip_issue_1")
+            .expect_err("missing repo workspace should stay a provisioning failure");
+
+        assert!(error.to_string().contains("path is not a directory"));
+        assert!(!workspace.exists());
     }
 
     #[test]
