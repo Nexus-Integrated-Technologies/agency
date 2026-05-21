@@ -84,7 +84,7 @@ or clean-roomed into the active runtime.
    integration and is disabled by default. Remaining work is to extend the same
    contract to future external adapter plugins as they are registered.
 2. Runtime supervisor:
-   `nanoclaw runtime status|state|inspect|health|cleanup|poll|serve|stop|reload`
+   `nanoclaw runtime status|state|inspect|health|repair|cleanup|poll|serve|stop|reload`
    now owns the basic lifecycle surface with NanoClaw PID files, deterministic
    state inventory, health checks, local health notifications, and explicit
    stale-PID cleanup. `runtime state` and `runtime cleanup --state-residue`
@@ -107,7 +107,11 @@ or clean-roomed into the active runtime.
    and failing on repeated startup failures so local operator notifications can
    carry the same evidence. Known missing-config failures now produce
    deterministic recovery suggestions in health evidence and local alert text,
-   while secret-bearing fixes remain explicit operator actions.
+   while secret-bearing fixes remain explicit operator actions. `runtime repair`
+   now normalizes those suggestions into guarded repair items, classifying each
+   as `auto_applyable`, `operator_required`, or `blocked`; apply mode refuses
+   secret/config-choice/legacy-lane mutations unless a deterministic handler is
+   registered.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring

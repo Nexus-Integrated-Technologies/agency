@@ -184,6 +184,10 @@ Already active:
   heartbeat reporting. Startup/preflight failures are included in health, with
   repeated failures promoted from warning to failing status and known
   missing-config failures mapped to deterministic recovery suggestions.
+- `runtime repair --plan|--apply` for converting health recovery evidence into
+  guarded repair items. Apply mode refuses secret writes, operator config
+  choices, legacy-lane enablement, and long-running profile restarts unless a
+  deterministic auto-apply handler is registered.
 - `runtime cleanup` for report-only stale/invalid PID-file cleanup, with
   mutation gated behind `--apply`
 - a typed `runtimeChannels` registry that declares local, scheduler, Slack,
@@ -216,6 +220,10 @@ Current unified entrypoint:
   warns on degraded channel posture, and local notifications write to the
   NanoClaw local outbox only when attention is needed unless
   `--notify-always` is set.
+- `nanoclaw runtime repair --plan|--apply --limit <n>` converts health
+  recovery suggestions into deterministic repair items classified as
+  `auto_applyable`, `operator_required`, or `blocked`; unknown startup failures
+  become blocked diagnostic items instead of guessed fixes.
 - `nanoclaw runtime cleanup [--apply]` reports stale or invalid runtime PID
   files and removes only those files when explicitly applied.
 - `nanoclaw runtime poll` runs one local control-plane pump.
