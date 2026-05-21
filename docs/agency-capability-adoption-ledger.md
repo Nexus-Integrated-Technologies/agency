@@ -105,7 +105,9 @@ or clean-roomed into the active runtime.
    and surface in `runtime state` as durable operational evidence. `runtime
    health` now evaluates those events too, warning on any recent startup failure
    and failing on repeated startup failures so local operator notifications can
-   carry the same evidence.
+   carry the same evidence. Known missing-config failures now produce
+   deterministic recovery suggestions in health evidence and local alert text,
+   while secret-bearing fixes remain explicit operator actions.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring

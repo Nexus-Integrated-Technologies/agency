@@ -99,7 +99,8 @@ cargo run --quiet --bin nanoclaw -- runtime cleanup --state-residue
 
 Get a deterministic health report over runtime directories, PID files,
 startup/preflight failures, runtime-channel ownership, gateway/webhook auth
-posture, task backlog, and recent execution evidence:
+posture, task backlog, recent execution evidence, and known recovery
+suggestions for missing runtime config:
 
 ```bash
 cargo run --quiet --bin nanoclaw -- runtime health --limit 5
@@ -138,7 +139,9 @@ Startup uses the same `runtimeChannels` registry reported by status and health.
 Misconfigured profile channels fail before PID-file creation with
 `runtime_channel_misconfigured` and the missing config/auth fields. Those
 preflight failures, startup attempts, running transitions, and startup failures
-are recorded in `runtime state` under `runtime.startupEvents`.
+are recorded in `runtime state` under `runtime.startupEvents`. `runtime health`
+derives deterministic recovery suggestions from the same ledger, keeping
+secret-bearing fixes operator-gated instead of auto-applying them.
 
 Stop or signal a running profile through the NanoClaw entrypoint:
 
