@@ -120,6 +120,9 @@ or clean-roomed into the active runtime.
    `runtime source-disposition --limit <n>` fingerprints remaining legacy
    source directories and maps each one to its active Rust NanoClaw descendant
    role, recommended clean-room action, and non-mutation policy.
+   `scripts/check-legacy-source-gates.sh` now enforces the active/parked source
+   boundary in `make verify` and CI so legacy modules and old targets cannot
+   quietly leak back into the compiled Rust NanoClaw surface.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring

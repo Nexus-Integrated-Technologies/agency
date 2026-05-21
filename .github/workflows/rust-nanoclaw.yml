@@ -8,6 +8,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "Makefile"
+      - "scripts/check-legacy-source-gates.sh"
       - "build.rs"
       - "src/**"
       - "docs/nanoclaw-rs-*.md"
@@ -22,6 +23,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "Makefile"
+      - "scripts/check-legacy-source-gates.sh"
       - "build.rs"
       - "src/**"
       - "docs/nanoclaw-rs-*.md"
@@ -82,8 +84,14 @@ jobs:
       - name: Runtime state
         run: cargo run --quiet --bin nanoclaw -- runtime state --limit 5
 
+      - name: Source disposition
+        run: cargo run --quiet --bin nanoclaw -- runtime source-disposition --limit 5
+
       - name: Runtime inspect
         run: cargo run --quiet --bin nanoclaw -- runtime inspect --limit 5
+
+      - name: Legacy source gates
+        run: ./scripts/check-legacy-source-gates.sh
 
       - name: Diff hygiene
         run: git diff --check

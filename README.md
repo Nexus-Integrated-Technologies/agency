@@ -16,6 +16,9 @@ distilled into clear Rust NanoClaw contracts.
 - `src/bin/nanoclaw.rs` is the only active binary target.
 - `Cargo.toml` disables Cargo auto-discovery for legacy bins, tests, examples,
   and benches.
+- `make verify` runs `scripts/check-legacy-source-gates.sh`, which fails if old
+  Agency modules, tests, or parked root binaries leak back into the active Cargo
+  surface.
 - `graveyard/agency-harness/` preserves old Agency binaries and integration
   tests as reference material outside the active compile path.
 

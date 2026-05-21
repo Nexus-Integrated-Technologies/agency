@@ -446,13 +446,14 @@ Already active:
 - `.github/copilot-instructions.md` now points contributors and AI agents at
   NanoClaw runtime status/state/inspect/health/cleanup commands instead of old
   gateway/local entrypoint examples.
+- `scripts/check-legacy-source-gates.sh` is now part of `make verify` and the
+  Rust NanoClaw GitHub Actions gate. It fails if Cargo auto-discovery is
+  re-enabled, legacy Agency modules are exported from `src/lib.rs`, old
+  `src/main.rs`/`src/server.rs`/`src/desktop.rs` or root `tests/` reappear, or
+  required parked source paths are missing.
 
 Remaining work:
 
-- Keep the old Agency README body parked as
-  `graveyard/agency-harness/LEGACY_README.md`.
-- Keep the old `src/bin/README.md` parked with the legacy bins under
-  `graveyard/agency-harness/src-bin/`.
 - Continue scanning for docs that still describe old FPF/SOTA microservice
   posture as active runtime behavior.
 
