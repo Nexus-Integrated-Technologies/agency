@@ -65,7 +65,7 @@ use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|inspect|health|repair|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|state-action|inspect|health|repair|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
 }
 
@@ -151,6 +151,28 @@ impl RuntimeRepairMode {
 struct RuntimeRepairArgs {
     mode: RuntimeRepairMode,
     limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeStateActionMode {
+    Plan,
+    Apply,
+}
+
+impl RuntimeStateActionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeStateActionArgs {
+    mode: RuntimeStateActionMode,
+    limit: usize,
+    confirm: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +381,58 @@ where
     Ok(RuntimeRepairArgs {
         mode: mode.unwrap_or(RuntimeRepairMode::Plan),
         limit,
+    })
+}
+
+fn parse_runtime_state_action_args<I>(args: &mut I) -> Result<RuntimeStateActionArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = 10;
+    let mut mode = None::<RuntimeStateActionMode>;
+    let mut confirm = None::<String>;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--plan" => {
+                if mode.replace(RuntimeStateActionMode::Plan).is_some() {
+                    anyhow::bail!("runtime state-action accepts only one of --plan or --apply");
+                }
+            }
+            "--apply" => {
+                if mode.replace(RuntimeStateActionMode::Apply).is_some() {
+                    anyhow::bail!("runtime state-action accepts only one of --plan or --apply");
+                }
+            }
+            "--confirm" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    anyhow::bail!("runtime state-action --confirm requires a non-empty action id");
+                }
+                confirm = Some(value);
+            }
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid runtime state-action --limit value {value}"))?
+                    .max(1);
+            }
+            other => anyhow::bail!("unexpected runtime state-action argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeStateActionArgs {
+        mode: mode.unwrap_or(RuntimeStateActionMode::Plan),
+        limit,
+        confirm,
     })
 }
 
@@ -1838,6 +1912,409 @@ fn runtime_state_residue_json(config: &NanoclawConfig) -> Value {
     })
 }
 
+fn runtime_state_action_receipts_dir(config: &NanoclawConfig) -> PathBuf {
+    runtime_control_dir(config).join("state-actions")
+}
+
+fn runtime_state_action_archive_dir(config: &NanoclawConfig) -> PathBuf {
+    runtime_control_dir(config).join("state-archive")
+}
+
+fn runtime_state_action_id(key: &str, apply_action: &str) -> String {
+    format!("state-residue:{key}:{apply_action}")
+}
+
+fn runtime_state_action_safe_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn runtime_state_action_apply_shape(
+    classification: &str,
+    exists: bool,
+    active_runtime_path: bool,
+) -> (&'static str, &'static str, bool, &'static str) {
+    if !exists {
+        return (
+            "noop",
+            "not_present",
+            false,
+            "legacy residue path is not present; leave in place",
+        );
+    }
+    if active_runtime_path {
+        return (
+            "preserve_active_runtime",
+            "blocked",
+            false,
+            "active runtime paths cannot be mutated by state-action",
+        );
+    }
+
+    match classification {
+        "legacy_vector_cache"
+        | "legacy_vector_store"
+        | "legacy_embedding_db"
+        | "legacy_history_jsonl" => (
+            "archive_legacy_state",
+            "ready_to_apply",
+            true,
+            "non-destructively move legacy residue into the runtime state archive and write a receipt",
+        ),
+        "legacy_source_reference" => (
+            "preserve_reference",
+            "operator_required",
+            false,
+            "source references are parked for clean-room adoption decisions and cannot be moved by runtime state-action",
+        ),
+        _ => (
+            "manual_review",
+            "operator_required",
+            false,
+            "classification has no registered deterministic state action",
+        ),
+    }
+}
+
+fn runtime_state_action_plan_item(candidate: &Value, operator_action: Option<&Value>) -> Value {
+    let key = candidate
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let classification = candidate
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let active_runtime_path = candidate
+        .get("activeRuntimePath")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let state = candidate.get("state").cloned().unwrap_or(Value::Null);
+    let path = state.get("path").and_then(Value::as_str).unwrap_or("");
+    let exists = state
+        .get("exists")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let recommendation = candidate
+        .get("recommendation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let original_action = operator_action
+        .and_then(|action| action.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or("review_candidate");
+    let original_destructive = operator_action
+        .and_then(|action| action.get("destructive"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (apply_action, status, mutates_filesystem, reason) =
+        runtime_state_action_apply_shape(classification, exists, active_runtime_path);
+    let action_id = runtime_state_action_id(key, apply_action);
+
+    json!({
+        "schemaVersion": "2026-05-21",
+        "actionId": action_id,
+        "key": key,
+        "classification": classification,
+        "status": status,
+        "applyAction": apply_action,
+        "sourcePath": path,
+        "exists": exists,
+        "activeRuntimePath": active_runtime_path,
+        "approvalRequired": true,
+        "requiresConfirm": true,
+        "mutatesFilesystem": mutates_filesystem,
+        "destructive": false,
+        "originalOperatorAction": original_action,
+        "originalOperatorActionDestructive": original_destructive,
+        "safeDefault": "leave_in_place",
+        "recommendation": recommendation,
+        "reason": reason,
+        "receiptPolicy": if mutates_filesystem { "required_on_apply" } else { "not_applicable" },
+    })
+}
+
+fn runtime_state_action_plan_items(config: &NanoclawConfig) -> Vec<Value> {
+    let residue = runtime_state_residue_json(config);
+    let operator_actions = residue
+        .get("operatorActions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let operator_actions_by_key = operator_actions
+        .iter()
+        .filter_map(|action| {
+            action
+                .get("key")
+                .and_then(Value::as_str)
+                .map(|key| (key.to_string(), action.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    residue
+        .get("legacyCandidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|candidate| {
+            let key = candidate
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            runtime_state_action_plan_item(candidate, operator_actions_by_key.get(key))
+        })
+        .collect()
+}
+
+fn runtime_state_action_summary(items: &[Value]) -> Value {
+    let total = items.len();
+    let ready_to_apply = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("ready_to_apply"))
+        .count();
+    let operator_required = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("operator_required"))
+        .count();
+    let blocked = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("blocked"))
+        .count();
+    let not_present = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("not_present"))
+        .count();
+
+    json!({
+        "total": total,
+        "readyToApply": ready_to_apply,
+        "operatorRequired": operator_required,
+        "blocked": blocked,
+        "notPresent": not_present,
+    })
+}
+
+fn runtime_state_action_receipt_path(config: &NanoclawConfig, action_id: &str) -> PathBuf {
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let suffix = Uuid::new_v4();
+    runtime_state_action_receipts_dir(config).join(format!(
+        "{}-{}-{}.json",
+        stamp,
+        runtime_state_action_safe_segment(action_id),
+        suffix
+    ))
+}
+
+fn runtime_state_action_archive_target(
+    config: &NanoclawConfig,
+    item: &Value,
+    source_path: &Path,
+) -> PathBuf {
+    let key = item.get("key").and_then(Value::as_str).unwrap_or("unknown");
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let suffix = Uuid::new_v4();
+    let basename = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("residue");
+    runtime_state_action_archive_dir(config)
+        .join(format!(
+            "{}-{}-{}",
+            stamp,
+            runtime_state_action_safe_segment(key),
+            suffix
+        ))
+        .join(runtime_state_action_safe_segment(basename))
+}
+
+fn apply_runtime_state_action(config: &NanoclawConfig, item: &Value) -> Result<Value> {
+    let action_id = item
+        .get("actionId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let apply_action = item
+        .get("applyAction")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let source_path = item.get("sourcePath").and_then(Value::as_str).unwrap_or("");
+
+    if apply_action != "archive_legacy_state" || status != "ready_to_apply" {
+        return Ok(json!({
+            "actionId": action_id,
+            "applied": false,
+            "status": "skipped",
+            "reason": "state action is not registered as a ready non-destructive apply handler",
+            "receipt": null,
+        }));
+    }
+
+    let source_path = PathBuf::from(source_path);
+    if !source_path.exists() {
+        return Ok(json!({
+            "actionId": action_id,
+            "applied": false,
+            "status": "not_present",
+            "reason": "source path no longer exists",
+            "receipt": null,
+        }));
+    }
+
+    let archive_target = runtime_state_action_archive_target(config, item, &source_path);
+    if let Some(parent) = archive_target.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create runtime state archive directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::rename(&source_path, &archive_target).with_context(|| {
+        format!(
+            "failed to archive legacy runtime residue from {} to {}",
+            source_path.display(),
+            archive_target.display()
+        )
+    })?;
+
+    let receipt_path = runtime_state_action_receipt_path(config, action_id);
+    if let Some(parent) = receipt_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create runtime state action receipt directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let receipt = json!({
+        "schemaVersion": "2026-05-21",
+        "actionId": action_id,
+        "status": "applied",
+        "applyAction": apply_action,
+        "appliedAt": Utc::now().to_rfc3339(),
+        "sourcePath": source_path.display().to_string(),
+        "archivePath": archive_target.display().to_string(),
+        "rollback": {
+            "kind": "move_archive_back",
+            "description": "Stop the runtime, then move archivePath back to sourcePath if this archive action needs to be reverted.",
+            "sourcePath": source_path.display().to_string(),
+            "archivePath": archive_target.display().to_string(),
+        },
+        "item": item,
+    });
+    fs::write(&receipt_path, serde_json::to_string_pretty(&receipt)?).with_context(|| {
+        format!(
+            "failed to write runtime state action receipt {}",
+            receipt_path.display()
+        )
+    })?;
+
+    Ok(json!({
+        "actionId": action_id,
+        "applied": true,
+        "status": "applied",
+        "receipt": path_state_json(&receipt_path),
+        "archivePath": archive_target.display().to_string(),
+        "rollback": receipt["rollback"],
+    }))
+}
+
+fn runtime_state_action_json(
+    config: &NanoclawConfig,
+    args: RuntimeStateActionArgs,
+) -> Result<Value> {
+    let all_items = runtime_state_action_plan_items(config);
+    let shown_items = all_items
+        .iter()
+        .take(args.limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let summary = runtime_state_action_summary(&all_items);
+
+    match args.mode {
+        RuntimeStateActionMode::Plan => {
+            let status = if summary["readyToApply"].as_u64().unwrap_or(0) > 0 {
+                "ready_to_apply"
+            } else if summary["operatorRequired"].as_u64().unwrap_or(0) > 0 {
+                "operator_action_required"
+            } else if summary["blocked"].as_u64().unwrap_or(0) > 0 {
+                "blocked"
+            } else {
+                "no_state_actions"
+            };
+
+            Ok(json!({
+                "schemaVersion": "2026-05-21",
+                "mode": args.mode.as_str(),
+                "status": status,
+                "policy": {
+                    "mutationDefault": "off",
+                    "applyRequiresConfirm": true,
+                    "destructiveDeleteHandlers": false,
+                    "sourceReferenceMutation": false,
+                    "receiptRequired": true,
+                },
+                "summary": summary,
+                "shown": shown_items.len(),
+                "items": shown_items,
+            }))
+        }
+        RuntimeStateActionMode::Apply => {
+            let Some(confirm) = args.confirm.as_deref() else {
+                anyhow::bail!(
+                    "runtime state-action --apply requires --confirm <action-id> from a prior --plan"
+                );
+            };
+            let Some(item) = all_items
+                .iter()
+                .find(|item| item.get("actionId").and_then(Value::as_str) == Some(confirm))
+            else {
+                anyhow::bail!("unknown runtime state-action confirmation id '{confirm}'");
+            };
+            let apply_result = apply_runtime_state_action(config, item)?;
+            Ok(json!({
+                "schemaVersion": "2026-05-21",
+                "mode": args.mode.as_str(),
+                "status": if apply_result["applied"].as_bool() == Some(true) { "applied" } else { "nothing_applied" },
+                "policy": {
+                    "mutationDefault": "off",
+                    "applyRequiresConfirm": true,
+                    "destructiveDeleteHandlers": false,
+                    "sourceReferenceMutation": false,
+                    "receiptRequired": true,
+                },
+                "confirmedActionId": confirm,
+                "result": apply_result,
+            }))
+        }
+    }
+}
+
+fn print_runtime_state_action(config: NanoclawConfig, args: RuntimeStateActionArgs) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_state_action_json(&config, args)?)?
+    );
+    Ok(())
+}
+
 fn sqlite_table_count_json(path: &Path, table: &str) -> Value {
     if !path.exists() {
         return json!({
@@ -2719,6 +3196,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_runtime_state_action_apply_confirm() {
+        let mut args = vec![
+            "--apply".to_string(),
+            "--confirm".to_string(),
+            "state-residue:agency_history_jsonl:archive_legacy_state".to_string(),
+            "--limit".to_string(),
+            "2".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_state_action_args(&mut args).unwrap(),
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 2,
+                confirm: Some(
+                    "state-residue:agency_history_jsonl:archive_legacy_state".to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn task_complete_requires_manual_override() {
         let mut args = vec!["task-1".to_string(), "done".to_string()].into_iter();
         let error = parse_task_complete_args(&mut args).unwrap_err();
@@ -3161,6 +3660,145 @@ mod tests {
         assert_eq!(source_action["destructive"], false);
         assert!(temp.path().join(".fastembed_cache").exists());
         assert!(config.data_dir.join("agency_history.jsonl").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_plan_exposes_archivable_legacy_history() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(&config.data_dir)?;
+        fs::write(config.data_dir.join("agency_history.jsonl"), "{}\n")?;
+
+        let report = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Plan,
+                limit: 10,
+                confirm: None,
+            },
+        )?;
+
+        assert_eq!(report["status"], "ready_to_apply");
+        let items = report["items"].as_array().unwrap();
+        let history_action = items
+            .iter()
+            .find(|item| item["key"] == "agency_history_jsonl")
+            .expect("history action should exist");
+        assert_eq!(
+            history_action["actionId"],
+            "state-residue:agency_history_jsonl:archive_legacy_state"
+        );
+        assert_eq!(history_action["status"], "ready_to_apply");
+        assert_eq!(history_action["applyAction"], "archive_legacy_state");
+        assert_eq!(history_action["destructive"], false);
+        assert_eq!(history_action["requiresConfirm"], true);
+        assert_eq!(
+            history_action["originalOperatorAction"],
+            "migration_candidate"
+        );
+        assert!(config.data_dir.join("agency_history.jsonl").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_apply_requires_confirm() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+
+        let error = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 10,
+                confirm: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--confirm <action-id>"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_apply_archives_legacy_history_with_receipt() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(&config.data_dir)?;
+        let history_path = config.data_dir.join("agency_history.jsonl");
+        fs::write(&history_path, "{\"event\":\"legacy\"}\n")?;
+
+        let report = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 10,
+                confirm: Some(
+                    "state-residue:agency_history_jsonl:archive_legacy_state".to_string(),
+                ),
+            },
+        )?;
+
+        assert_eq!(report["status"], "applied");
+        assert_eq!(report["result"]["applied"], true);
+        assert!(!history_path.exists());
+        let archive_path = PathBuf::from(report["result"]["archivePath"].as_str().unwrap());
+        assert!(archive_path.exists());
+        assert_eq!(
+            fs::read_to_string(&archive_path)?,
+            "{\"event\":\"legacy\"}\n"
+        );
+        let receipt_path = PathBuf::from(
+            report["result"]["receipt"]["path"]
+                .as_str()
+                .expect("receipt path"),
+        );
+        assert!(receipt_path.exists());
+        let receipt = fs::read_to_string(receipt_path)?;
+        assert!(receipt.contains("state-residue:agency_history_jsonl:archive_legacy_state"));
+        assert!(receipt.contains("move_archive_back"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_apply_refuses_source_reference_mutation() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(config.project_root.join("src").join("memory"))?;
+
+        let report = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 10,
+                confirm: Some("state-residue:src_memory:preserve_reference".to_string()),
+            },
+        )?;
+
+        assert_eq!(report["status"], "nothing_applied");
+        assert_eq!(report["result"]["applied"], false);
+        assert!(report["result"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not registered"));
+        assert!(config.project_root.join("src").join("memory").exists());
         Ok(())
     }
 
@@ -4408,6 +5046,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                 "state" => {
                     let limit = parse_limit_args(&mut args, 10, "runtime state")?;
                     print_runtime_state(config, limit)?;
+                }
+                "state-action" => {
+                    let action_args = parse_runtime_state_action_args(&mut args)?;
+                    print_runtime_state_action(config, action_args)?;
                 }
                 "inspect" => {
                     let limit = parse_limit_args(&mut args, 10, "runtime inspect")?;

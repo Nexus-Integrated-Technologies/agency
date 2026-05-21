@@ -97,6 +97,21 @@ without deleting state:
 cargo run --quiet --bin nanoclaw -- runtime cleanup --state-residue
 ```
 
+Plan or apply guarded state-residue actions:
+
+```bash
+cargo run --quiet --bin nanoclaw -- runtime state-action --plan --limit 10
+cargo run --quiet --bin nanoclaw -- runtime state-action --apply \
+  --confirm state-residue:agency_history_jsonl:archive_legacy_state
+```
+
+`runtime state-action --apply` mutates exactly one confirmed action id from a
+prior plan. The current apply registry is non-destructive: it can archive
+legacy memory/vector/history residue into `data/runtime/state-archive/` and
+writes a receipt under `data/runtime/state-actions/`. It does not delete source
+references, purge caches destructively, or migrate legacy state without a
+separate runtime contract.
+
 Get a deterministic health report over runtime directories, PID files,
 startup/preflight failures, runtime-channel ownership, gateway/webhook auth
 posture, task backlog, recent execution evidence, and known recovery

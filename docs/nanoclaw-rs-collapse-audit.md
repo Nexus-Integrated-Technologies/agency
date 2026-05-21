@@ -401,11 +401,20 @@ Already active:
   candidate, classifying the safe default as leave-in-place and separating
   migration candidates, purge candidates, and source references without
   mutating any state.
+- `nanoclaw runtime state-action --plan|--apply` now turns that residue
+  inventory into guarded apply actions. Apply requires a concrete
+  `--confirm <action-id>` from a prior plan, mutates exactly one target, archives
+  eligible legacy memory/vector/history residue under
+  `data/runtime/state-archive/`, and writes a rollback receipt under
+  `data/runtime/state-actions/`.
+- The state-action apply registry is intentionally non-destructive in this
+  slice: it does not delete caches, mutate source references, or migrate legacy
+  stores into active session sidecars without a separate runtime contract.
 
 Remaining work:
 
-- Add separate operator-approved apply commands only after a specific migration
-  or purge action has a runtime contract and rollback path.
+- Add explicit migration handlers only after a specific legacy store has an
+  active runtime contract and replay/rollback path.
 - Decide which legacy memory source references should be clean-roomed further,
   moved to graveyard, or deleted after capability adoption is complete.
 

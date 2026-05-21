@@ -112,6 +112,10 @@ or clean-roomed into the active runtime.
    as `auto_applyable`, `operator_required`, or `blocked`; apply mode refuses
    secret/config-choice/legacy-lane mutations unless a deterministic handler is
    registered.
+   State residue has the same posture: `runtime state-action --plan|--apply`
+   converts legacy memory/vector/history residue into confirmed, receipt-backed
+   archive actions while refusing source-reference mutation, destructive cache
+   purge, or legacy-store migration without a narrower runtime contract.
 3. Tool contract: the first native foundation contract now exists as
    `ToolAdapterContract` in `src/foundation/tool_contract.rs`. Useful old
    Agency tools can only re-enter as typed runtime adapters after declaring
