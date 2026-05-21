@@ -177,11 +177,12 @@ Already active:
 - `runtime stop` and `runtime reload` operator controls for profiled runtime
   processes
 - `runtime health` for deterministic checks over directories, PID file state,
-  gateway/webhook auth posture, scheduled-task backlog, and recent execution
-  evidence
+  startup/preflight failures, gateway/webhook auth posture, scheduled-task
+  backlog, and recent execution evidence
 - `runtime health --notify-local <chat>` for local operator alerts when health
   is degraded or unhealthy, with `--notify-always` available for explicit
-  heartbeat reporting
+  heartbeat reporting. Startup/preflight failures are included in health, with
+  repeated failures promoted from warning to failing status.
 - `runtime cleanup` for report-only stale/invalid PID-file cleanup, with
   mutation gated behind `--apply`
 - a typed `runtimeChannels` registry that declares local, scheduler, Slack,
@@ -224,7 +225,8 @@ Current unified entrypoint:
   `runtime_channel_misconfigured` and the exact missing config/auth fields.
   Preflight failures, startup attempts, running transitions, and startup
   failures append to `data/runtime/startup-events.jsonl` and are reported by
-  `runtime state` under `runtime.startupEvents`.
+  `runtime state` under `runtime.startupEvents`; `runtime health` reads the
+  same ledger so local operator notifications include startup failure evidence.
 - `nanoclaw runtime stop --profile <profile>` terminates a profiled runtime
   from its NanoClaw PID file.
 - `nanoclaw runtime reload --profile <profile>` sends a reload signal to the

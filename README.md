@@ -98,8 +98,8 @@ cargo run --quiet --bin nanoclaw -- runtime cleanup --state-residue
 ```
 
 Get a deterministic health report over runtime directories, PID files,
-runtime-channel ownership, gateway/webhook auth posture, task backlog, and
-recent execution evidence:
+startup/preflight failures, runtime-channel ownership, gateway/webhook auth
+posture, task backlog, and recent execution evidence:
 
 ```bash
 cargo run --quiet --bin nanoclaw -- runtime health --limit 5
