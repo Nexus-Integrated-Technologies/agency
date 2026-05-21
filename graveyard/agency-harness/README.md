@@ -20,10 +20,11 @@ equivalent primitive in `src/foundation/` or `src/nanoclaw/` with focused tests.
 Agency microservice suite and should not be treated as current operator
 documentation.
 
-The original `start_agency.sh`, Matrix Conduit launcher, speaker Dockerfile,
-and old compose stack are parked under `scripts/` and `docker/`. The root
-`start_agency.sh` is now only a guard that points operators to the active
-NanoClaw commands.
+The original `start_agency.sh`, Matrix Conduit launcher, ONNX bundling helper,
+speaker Dockerfile, and old compose stack are parked under `scripts/` and
+`docker/`. The root `start_agency.sh` and `scripts/bundle_onnx.sh` paths are now
+guards that point operators away from inactive Agency targets and toward active
+NanoClaw contracts.
 
 `src-root/` contains old root-level Rust files that are outside the explicit
 Cargo target graph. They are kept only as adoption reference material.

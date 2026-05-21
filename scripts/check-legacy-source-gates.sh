@@ -57,6 +57,7 @@ for forbidden in ("src/main.rs", "src/server.rs", "src/desktop.rs", "tests"):
 
 required_parked_paths = (
     "graveyard/agency-harness/LEGACY_README.md",
+    "graveyard/agency-harness/scripts/bundle_onnx.sh",
     "graveyard/agency-harness/src-bin/README.md",
     "graveyard/agency-harness/src-root/main.rs",
     "graveyard/agency-harness/src-root/server.rs",
@@ -66,6 +67,10 @@ required_parked_paths = (
 missing = [path for path in required_parked_paths if not (root / path).exists()]
 if missing:
     raise SystemExit(f"missing parked legacy source paths: {missing!r}")
+
+active_bundle_helper = (root / "scripts/bundle_onnx.sh").read_text(encoding="utf-8")
+if "cargo run --bin proof_of_life" in active_bundle_helper:
+    raise SystemExit("scripts/bundle_onnx.sh must remain a guard, not a legacy proof_of_life launcher")
 
 print("legacy source gates ok")
 PY

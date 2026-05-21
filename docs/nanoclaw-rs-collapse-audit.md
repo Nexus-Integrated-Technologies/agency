@@ -451,6 +451,11 @@ Already active:
   re-enabled, legacy Agency modules are exported from `src/lib.rs`, old
   `src/main.rs`/`src/server.rs`/`src/desktop.rs` or root `tests/` reappear, or
   required parked source paths are missing.
+- The legacy ONNX bundling helper is parked under
+  `graveyard/agency-harness/scripts/bundle_onnx.sh`. The root
+  `scripts/bundle_onnx.sh` path is now a guard that refuses the old
+  `proof_of_life` bootstrap path and points future model-lane work back through
+  typed runtime provider contracts.
 
 Remaining work:
 

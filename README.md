@@ -21,6 +21,9 @@ distilled into clear Rust NanoClaw contracts.
   surface.
 - `graveyard/agency-harness/` preserves old Agency binaries and integration
   tests as reference material outside the active compile path.
+- Legacy root helpers such as `start_agency.sh` and `scripts/bundle_onnx.sh`
+  are compatibility guards only; they do not launch old Agency services or
+  inactive binaries.
 
 The old distributed Agency microservice suite is not the current operator
 entrypoint. It remains source material for adoption decisions, not proof of the
