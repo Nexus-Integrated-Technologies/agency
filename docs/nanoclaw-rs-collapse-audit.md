@@ -88,20 +88,19 @@ The repository still contains substantial parked or candidate code:
 
 ### 1. Lock The Build Boundary
 
-Status: started.
+Status: active and guarded.
 
-Remaining work:
+Already active:
 
-- Keep `cargo check --all-targets` passing with only the explicit NanoClaw
-  binary and library targets.
-- Keep old root-level Rust files parked under
-  `graveyard/agency-harness/src-root/` unless a smaller replacement is
-  clean-roomed into the active runtime.
-- Keep CI aligned with the same active-target gates in
-  `.github/workflows/rust-nanoclaw.yml`:
-  - `cargo check --all-targets`
-  - `cargo test --all-targets`
-  - `cargo run --quiet --bin nanoclaw -- show-config`
+- `Cargo.toml` disables Cargo auto-discovery for bins, tests, examples, and
+  benches.
+- `src/bin/nanoclaw.rs` is the only active binary target.
+- Old root-level Rust files remain parked under
+  `graveyard/agency-harness/src-root/`.
+- `.github/workflows/rust-nanoclaw.yml` and `make verify` run the active target
+  gates.
+- `scripts/check-legacy-source-gates.sh` fails if legacy modules, root
+  binaries, root tests, or missing parked source paths violate this boundary.
 
 Exit criterion:
 
@@ -110,27 +109,24 @@ Exit criterion:
 
 ### 2. Classify Agency Capabilities For Adoption
 
-Status: started in `docs/agency-capability-adoption-ledger.md`.
+Status: active and reportable.
+
+Already active:
+
+- `docs/agency-capability-adoption-ledger.md` records a decision and descendant
+  role for each legacy source area.
+- `nanoclaw runtime source-disposition --limit <n>` fingerprints the same
+  source areas and reports their active Rust NanoClaw descendant roles without
+  moving or deleting source.
+- `make verify` and CI run the source-disposition report so drift is visible.
 
 Remaining work:
 
 - Keep the capability ledger updated before moving or deleting old source
   directories.
-- Decide whether each capability should be:
-  - clean-roomed into `src/foundation/` as a domain primitive,
-  - clean-roomed into `src/nanoclaw/` as runtime behavior,
-  - parked as reference material outside the active compile path,
-  - moved to `graveyard/holonic/`,
-  - or deleted after a replacement is proven.
 - Treat holonic and FPF material as candidates for distilled primitives before
   classifying them as graveyard material. Useful concepts may become typed
   lineage, gates, assurance, provenance, planning, or evidence contracts.
-- Start with the largest and least active-target-critical areas:
-  - `src/fpf/`
-  - `src/orchestrator/`
-  - `src/agent/`
-  - `src/tools/`
-  - `tests/` that target those modules
 
 Exit criterion:
 
@@ -139,17 +135,19 @@ Exit criterion:
 
 ### 3. Replace Legacy Scripts With NanoClaw Entrypoints
 
-Status: started.
+Status: active and guarded.
 
-Remaining work:
+Already active:
 
 - Keep the root `start_agency.sh` as a guard only; it must not launch old
   `memory_server`, `speaker_server`, `listener_server`, or `nexus_server`
   binaries.
 - Keep the original service launchers and old speaker compose stack parked under
   `graveyard/agency-harness/`.
-- Replace old service/docker docs with NanoClaw-specific commands where those
-  docs still describe the legacy suite as active.
+- Park the original ONNX helper under
+  `graveyard/agency-harness/scripts/bundle_onnx.sh`.
+- Keep `scripts/bundle_onnx.sh` as a guard only; it must not send operators to
+  the inactive `proof_of_life` bootstrap path.
 - Keep `docker/start-openclaw-gateway.sh` because it is already part of the
   NanoClaw OpenClaw gateway runtime.
 - Keep `Dockerfile.openclaw-gateway` but continue reducing its build context as
@@ -431,7 +429,7 @@ Exit criterion:
 
 ### 7. Rewrite Public Repo Documentation
 
-Status: mostly done.
+Status: active and guarded.
 
 Already active:
 
@@ -459,30 +457,46 @@ Already active:
 
 Remaining work:
 
-- Continue scanning for docs that still describe old FPF/SOTA microservice
-  posture as active runtime behavior.
+- Continue scanning for newly added docs that describe old FPF/SOTA
+  microservice posture as active runtime behavior.
 
 Exit criterion:
 
 - A reader can clone the repo and understand that this is the Rust NanoClaw
   runtime, not the old Agency microservice suite.
 
-## Recommended Order
+## Completed Collapse Milestones
 
-1. Merge the explicit Cargo target graph and collapse audit.
-2. Park inactive bins/tests so `src/bin/` and `tests/` stop advertising broken
-   old targets while preserving useful examples for capability extraction.
-3. Rewrite README and startup docs around the NanoClaw runtime; keep legacy
-   startup artifacts parked or guarded.
-4. Refine the Agency capability adoption ledger, starting with `src/fpf/`,
-   `src/orchestrator/`, `src/agent/`, and `src/tools/`.
-5. Clean-room useful Agency concepts into `foundation` or `nanoclaw`; move only
-   non-adopted holonic/governance material into `graveyard/holonic/`.
-6. Expand the unified `nanoclaw runtime` command from status/inspect/poll/serve
-   into stop/reload operations and richer health-loop reporting.
-7. Persist structured execution evidence and make it the closure gate for every
-   lane.
-8. Add state-inspection and safe cleanup commands.
+1. Explicit Cargo target graph and collapse audit are merged.
+2. Inactive bins, tests, root Rust files, service scripts, Docker artifacts, and
+   legacy ONNX helper paths are parked or guarded.
+3. README, contributor, and operator docs describe the Rust NanoClaw runtime
+   instead of the old Agency microservice suite.
+4. The Agency capability adoption ledger and runtime source-disposition report
+   classify parked source material before any movement or deletion.
+5. Useful Agency concepts now re-enter through active Rust contracts:
+   foundation primitives, runtime channels, provider/gateway lanes, execution
+   evidence, command safety, output safety, tool adapter contracts, session
+   sidecars, state residue reporting, guarded repair, and guarded state actions.
+6. The unified `nanoclaw runtime` command owns status, state, source
+   disposition, inspect, health, repair, cleanup, poll, serve, stop, reload, and
+   state-action flows.
+7. Structured execution evidence is the closure gate for active lanes.
+8. `make verify` and GitHub Actions now enforce active target, completion,
+   source-disposition, and legacy-source gates.
+
+## Remaining Collapse Work
+
+1. Add new migration handlers only when a specific legacy state store has an
+   active runtime contract and replay/rollback path.
+2. Add source-disposition apply actions only when a specific parked source path
+   has a clean-room adoption contract or graveyard decision.
+3. Extend command safety to any future active shell-capable adapter before it is
+   allowed to satisfy completion evidence.
+4. Keep provider use for Azure, ZAI, Codex, OpenClaw, and future providers
+   inside the adapter/gateway/runtime contracts.
+5. Continue reducing Docker/build context only as parked source directories are
+   actually moved out of the active path.
 
 ## Non-Goals During Collapse
 
