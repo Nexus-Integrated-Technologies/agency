@@ -266,6 +266,51 @@ it into those hints.
 }
 ```
 
+Runtime enforcement now derives a route for each gateway run when Paperclip did
+not send a more specific gateway hint. Explicit per-run gateway hints still win,
+except zero-call contextless wakes still resolve to the summary backend to avoid
+accidental paid inference:
+
+- `heartbeat_timer`, `interval_elapsed`, and contextless `retry_failed_run`
+  resolve to the zero-call summary backend even if a paid backend is configured
+  as the default.
+- CTO repo/code work resolves to the coder slot, currently `codex` by default,
+  with `NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND=azure-openai` so quota/usage-limit
+  fallback stays inside the gateway contract.
+- CFO/cost work resolves to the tiny Azure slot.
+- Standard non-code planning resolves to the planner Azure slot.
+- Heavy reasoning resolves to the reasoner Azure slot.
+- Visual work resolves to the vision Azure slot.
+- Safety/classification work resolves to the safety Azure slot.
+
+Slot-specific deployments are optional and override the generic Azure
+deployment only when configured:
+
+```text
+NANOCLAW_MODEL_ROUTE_TINY_DEPLOYMENT=service01-foundry-tiny
+NANOCLAW_MODEL_ROUTE_PLANNER_DEPLOYMENT=service01-foundry-planner
+NANOCLAW_MODEL_ROUTE_REASONER_DEPLOYMENT=service01-foundry-reasoner
+NANOCLAW_MODEL_ROUTE_CODER_BACKEND=codex
+NANOCLAW_MODEL_ROUTE_CODER_DEPLOYMENT=service01-foundry-coder
+NANOCLAW_MODEL_ROUTE_REVIEWER_DEPLOYMENT=service01-foundry-reviewer
+NANOCLAW_MODEL_ROUTE_VISION_DEPLOYMENT=service01-foundry-vision
+NANOCLAW_MODEL_ROUTE_SAFETY_DEPLOYMENT=service01-foundry-safety
+```
+
+If the slot deployment is unset, the gateway keeps the existing generic Azure
+deployment/model env. That prevents a failed rollout while Foundry deployments
+are being created.
+
+Each routed run receives operator-visible env metadata:
+
+```text
+NANOCLAW_MODEL_ROUTE_SLOT
+NANOCLAW_MODEL_ROUTE_ROLE
+NANOCLAW_MODEL_ROUTE_TASK_KIND
+NANOCLAW_MODEL_ROUTE_SCALE_CLASS
+NANOCLAW_MODEL_ROUTE_REASON
+```
+
 ### Budget Defaults
 
 - Company daily paid-inference cap: `$5` until the model mix is proven.

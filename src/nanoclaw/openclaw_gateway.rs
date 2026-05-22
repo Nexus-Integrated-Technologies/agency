@@ -15,7 +15,8 @@ use tungstenite::{accept, Message, WebSocket};
 use uuid::Uuid;
 
 use crate::foundation::{
-    ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, MessageRecord, RequestPlane,
+    ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, HarnessRouter, MessageRecord,
+    RequestPlane, RoutingDecision, RoutingInput, ScaleClass, TaskKind,
 };
 
 use super::app::NanoclawApp;
@@ -771,9 +772,11 @@ fn execute_gateway_run(
     let identity = derive_group_identity(run_id, params);
     let group = app.ensure_group_for_chat(&identity.chat_jid, Some(&identity.group_name))?;
     let session_id = format!("gateway-{}", slug(run_id));
+    let model_route = derive_gateway_model_route(params, prompt);
     let backend_override = select_gateway_worker_backend(
         forced_gateway_worker_backend_from_env(),
         gateway_backend_override(params),
+        Some(model_route.backend.clone()),
         default_gateway_worker_backend_from_env(),
     );
     let effective_backend = backend_override.clone();
@@ -786,7 +789,11 @@ fn execute_gateway_run(
                 &PathBuf::from(&target.remote_cwd),
             );
             let mut runtime_env = paperclip_runtime_env(params.paperclip.as_ref());
-            runtime_env.extend(gateway_runtime_env(params, backend_override.as_ref()));
+            runtime_env.extend(gateway_runtime_env(
+                params,
+                backend_override.as_ref(),
+                Some(&model_route),
+            ));
             let runtime_env = codespaces_runtime_env(runtime_env);
             let prompt = render_codespaces_gateway_prompt(&render_gateway_remote_prompt(
                 prompt,
@@ -817,7 +824,11 @@ fn execute_gateway_run(
     );
     let executor = ExecutionLaneRouter::from_config(&state.config, Some(lane.clone()))?;
     let mut runtime_env = paperclip_runtime_env(params.paperclip.as_ref());
-    runtime_env.extend(gateway_runtime_env(params, backend_override.as_ref()));
+    runtime_env.extend(gateway_runtime_env(
+        params,
+        backend_override.as_ref(),
+        Some(&model_route),
+    ));
 
     let request = ExecutionRequest {
         group: group.clone(),
@@ -848,7 +859,7 @@ fn execute_gateway_run(
         session,
         backend_override,
         task_signature: None,
-        routing_decision: None,
+        routing_decision: model_route.routing_decision.clone(),
         objective: None,
         plan: None,
         boundary_claims: Vec::new(),
@@ -1665,14 +1676,337 @@ fn default_gateway_worker_backend_from_env() -> Option<WorkerBackend> {
 fn select_gateway_worker_backend(
     forced: Option<WorkerBackend>,
     hinted: Option<WorkerBackend>,
+    routed: Option<WorkerBackend>,
     default: Option<WorkerBackend>,
 ) -> Option<WorkerBackend> {
-    forced.or(hinted).or(default)
+    if matches!(routed.as_ref(), Some(WorkerBackend::Summary)) {
+        return routed;
+    }
+    hinted.or(routed).or(forced).or(default)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayModelSlot {
+    Zero,
+    Tiny,
+    Planner,
+    Reasoner,
+    Coder,
+    Reviewer,
+    Vision,
+    Safety,
+}
+
+impl GatewayModelSlot {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Zero => "zero",
+            Self::Tiny => "tiny",
+            Self::Planner => "planner",
+            Self::Reasoner => "reasoner",
+            Self::Coder => "coder",
+            Self::Reviewer => "reviewer",
+            Self::Vision => "vision",
+            Self::Safety => "safety",
+        }
+    }
+
+    fn env_label(self) -> &'static str {
+        match self {
+            Self::Zero => "ZERO",
+            Self::Tiny => "TINY",
+            Self::Planner => "PLANNER",
+            Self::Reasoner => "REASONER",
+            Self::Coder => "CODER",
+            Self::Reviewer => "REVIEWER",
+            Self::Vision => "VISION",
+            Self::Safety => "SAFETY",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GatewayModelRoute {
+    slot: GatewayModelSlot,
+    backend: WorkerBackend,
+    deployment: Option<String>,
+    role: String,
+    task_kind: String,
+    scale_class: String,
+    reason: String,
+    routing_decision: Option<RoutingDecision>,
+}
+
+fn derive_gateway_model_route(params: &GatewayAgentParams, prompt: &str) -> GatewayModelRoute {
+    let role = gateway_role(params);
+    let route_prompt = gateway_route_prompt(params, prompt);
+    let routing_decision = HarnessRouter::route(&RoutingInput {
+        prompt: route_prompt.clone(),
+        request_plane: RequestPlane::Web,
+        has_repo: gateway_has_repo_context(params),
+        preferred_lane: None,
+    });
+    let task_kind = routing_decision.task_kind.as_str().to_string();
+    let scale_class = scale_class_label(routing_decision.scale.class).to_string();
+
+    let slot = if is_contextless_zero_call(params) {
+        GatewayModelSlot::Zero
+    } else {
+        choose_gateway_model_slot(params, &role, &routing_decision, &route_prompt)
+    };
+    let backend = backend_for_gateway_model_slot(slot);
+    let deployment = deployment_for_gateway_model_slot(slot);
+    let reason = format!(
+        "role={} task_kind={} scale={} slot={}",
+        role,
+        task_kind,
+        scale_class,
+        slot.as_str()
+    );
+
+    GatewayModelRoute {
+        slot,
+        backend,
+        deployment,
+        role,
+        task_kind,
+        scale_class,
+        reason,
+        routing_decision: Some(routing_decision),
+    }
+}
+
+fn gateway_route_prompt(params: &GatewayAgentParams, prompt: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(message) = non_empty(params.message.as_deref()) {
+        parts.push(message.to_string());
+    }
+    if let Some(prompt) = non_empty(Some(prompt)) {
+        parts.push(prompt.to_string());
+    }
+    if let Some(paperclip) = params.paperclip.as_ref() {
+        if let Some(agent_name) = non_empty(paperclip.agent_name.as_deref()) {
+            parts.push(format!("agent: {agent_name}"));
+        }
+        if let Some(wake_reason) = paperclip
+            .wake
+            .as_ref()
+            .and_then(|wake| non_empty(wake.reason.as_deref()))
+        {
+            parts.push(format!("wake reason: {wake_reason}"));
+        }
+        if let Some(issue) = paperclip.wake.as_ref().and_then(|wake| wake.issue.as_ref()) {
+            if let Some(identifier) = non_empty(issue.identifier.as_deref()) {
+                parts.push(format!("issue: {identifier}"));
+            }
+            if let Some(title) = non_empty(issue.title.as_deref()) {
+                parts.push(format!("issue title: {title}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "Paperclip gateway run".to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn choose_gateway_model_slot(
+    params: &GatewayAgentParams,
+    role: &str,
+    routing_decision: &RoutingDecision,
+    prompt: &str,
+) -> GatewayModelSlot {
+    let lower_prompt = prompt.to_ascii_lowercase();
+    if contains_any_text(
+        &lower_prompt,
+        &[
+            "screenshot",
+            "visual",
+            "image",
+            "ui diff",
+            "browser screenshot",
+        ],
+    ) {
+        return GatewayModelSlot::Vision;
+    }
+    if contains_any_text(
+        &lower_prompt,
+        &["safety", "guardrail", "classification", "policy check"],
+    ) {
+        return GatewayModelSlot::Safety;
+    }
+    if contains_any_text(
+        &lower_prompt,
+        &["security", "secret", "vulnerability", "compliance", "auth"],
+    ) {
+        return if routing_decision.scale.class >= ScaleClass::Standard {
+            GatewayModelSlot::Reasoner
+        } else {
+            GatewayModelSlot::Reviewer
+        };
+    }
+    if matches!(
+        routing_decision.task_kind,
+        TaskKind::Coding | TaskKind::HostControl
+    ) {
+        return GatewayModelSlot::Coder;
+    }
+    if role == "CFO" || contains_any_text(&lower_prompt, &["cost", "budget", "billing", "spend"]) {
+        return if routing_decision.scale.class >= ScaleClass::Heavy {
+            GatewayModelSlot::Reasoner
+        } else {
+            GatewayModelSlot::Tiny
+        };
+    }
+    if matches!(role, "CMO" | "QA" | "VERIFIER") {
+        return if routing_decision.scale.class >= ScaleClass::Heavy {
+            GatewayModelSlot::Planner
+        } else {
+            GatewayModelSlot::Tiny
+        };
+    }
+    if role == "SECURITY" {
+        return GatewayModelSlot::Reviewer;
+    }
+    if role == "CTO" && gateway_has_repo_context(params) {
+        return if routing_decision.scale.class >= ScaleClass::Standard {
+            GatewayModelSlot::Coder
+        } else {
+            GatewayModelSlot::Planner
+        };
+    }
+
+    match routing_decision.scale.class {
+        ScaleClass::Logic | ScaleClass::Tiny => GatewayModelSlot::Tiny,
+        ScaleClass::Standard => GatewayModelSlot::Planner,
+        ScaleClass::Heavy => GatewayModelSlot::Reasoner,
+    }
+}
+
+fn backend_for_gateway_model_slot(slot: GatewayModelSlot) -> WorkerBackend {
+    if matches!(slot, GatewayModelSlot::Zero) {
+        return WorkerBackend::Summary;
+    }
+    if let Some(backend) = non_empty_env(&format!(
+        "NANOCLAW_MODEL_ROUTE_{}_BACKEND",
+        slot.env_label()
+    )) {
+        return WorkerBackend::parse(&backend);
+    }
+    if matches!(slot, GatewayModelSlot::Coder) {
+        return WorkerBackend::Codex;
+    }
+    WorkerBackend::AzureOpenAI
+}
+
+fn deployment_for_gateway_model_slot(slot: GatewayModelSlot) -> Option<String> {
+    if matches!(slot, GatewayModelSlot::Zero) {
+        return None;
+    }
+    let label = slot.env_label();
+    for key in [
+        format!("NANOCLAW_MODEL_ROUTE_{label}_DEPLOYMENT"),
+        format!("NANOCLAW_MODEL_ROUTE_{label}_MODEL"),
+    ] {
+        if let Some(value) = non_empty_env(&key) {
+            return Some(value);
+        }
+    }
+    first_non_empty_env(&[
+        "NANOCLAW_AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_OPENAI_DEPLOYMENT",
+        "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT",
+        "AZURE_AI_FOUNDRY_DEPLOYMENT",
+        "NANOCLAW_AZURE_FOUNDRY_DEPLOYMENT",
+        "AZURE_FOUNDRY_DEPLOYMENT",
+        "NANOCLAW_AZURE_OPENAI_MODEL",
+        "AZURE_OPENAI_MODEL",
+        "NANOCLAW_AZURE_AI_FOUNDRY_MODEL",
+        "AZURE_AI_FOUNDRY_MODEL",
+        "NANOCLAW_AZURE_FOUNDRY_MODEL",
+        "AZURE_FOUNDRY_MODEL",
+    ])
+}
+
+fn gateway_role(params: &GatewayAgentParams) -> String {
+    params
+        .paperclip
+        .as_ref()
+        .and_then(|paperclip| non_empty(paperclip.agent_name.as_deref()))
+        .unwrap_or("default")
+        .trim()
+        .to_ascii_uppercase()
+}
+
+fn gateway_has_repo_context(params: &GatewayAgentParams) -> bool {
+    gateway_github_copilot_repo(params).is_some()
+        || params
+            .paperclip
+            .as_ref()
+            .and_then(|paperclip| paperclip.workspace.as_ref())
+            .and_then(|workspace| {
+                non_empty(workspace.worktree_path.as_deref())
+                    .or_else(|| non_empty(workspace.repo_ref.as_deref()))
+                    .or_else(|| non_empty(workspace.branch_name.as_deref()))
+            })
+            .is_some()
+}
+
+fn is_contextless_zero_call(params: &GatewayAgentParams) -> bool {
+    let Some(paperclip) = params.paperclip.as_ref() else {
+        return false;
+    };
+    let has_issue_or_task = non_empty(paperclip.issue_id.as_deref()).is_some()
+        || non_empty(paperclip.task_id.as_deref()).is_some()
+        || paperclip
+            .wake
+            .as_ref()
+            .and_then(|wake| wake.issue.as_ref())
+            .is_some();
+    if has_issue_or_task || gateway_has_repo_context(params) {
+        return false;
+    }
+    let wake_reason = paperclip
+        .wake
+        .as_ref()
+        .and_then(|wake| non_empty(wake.reason.as_deref()))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        wake_reason.as_str(),
+        "heartbeat_timer" | "interval_elapsed" | "retry_failed_run"
+    )
+}
+
+fn scale_class_label(scale: ScaleClass) -> &'static str {
+    match scale {
+        ScaleClass::Logic => "logic",
+        ScaleClass::Tiny => "tiny",
+        ScaleClass::Standard => "standard",
+        ScaleClass::Heavy => "heavy",
+    }
+}
+
+fn contains_any_text(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| non_empty_env(key))
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn gateway_runtime_env(
     params: &GatewayAgentParams,
     effective_backend: Option<&WorkerBackend>,
+    model_route: Option<&GatewayModelRoute>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     let gateway = params
@@ -1792,6 +2126,40 @@ fn gateway_runtime_env(
                 "NANOCLAW_GITHUB_COPILOT_FOLLOW".to_string(),
                 follow.to_string(),
             );
+        }
+    }
+
+    if let Some(route) = model_route {
+        env.insert(
+            "NANOCLAW_MODEL_ROUTE_SLOT".to_string(),
+            route.slot.as_str().to_string(),
+        );
+        env.insert("NANOCLAW_MODEL_ROUTE_ROLE".to_string(), route.role.clone());
+        env.insert(
+            "NANOCLAW_MODEL_ROUTE_TASK_KIND".to_string(),
+            route.task_kind.clone(),
+        );
+        env.insert(
+            "NANOCLAW_MODEL_ROUTE_SCALE_CLASS".to_string(),
+            route.scale_class.clone(),
+        );
+        env.insert(
+            "NANOCLAW_MODEL_ROUTE_REASON".to_string(),
+            route.reason.clone(),
+        );
+        if let Some(deployment) = route.deployment.as_deref() {
+            env.entry("NANOCLAW_AZURE_OPENAI_DEPLOYMENT".to_string())
+                .or_insert_with(|| deployment.to_string());
+            env.entry("NANOCLAW_AZURE_AI_FOUNDRY_MODEL".to_string())
+                .or_insert_with(|| deployment.to_string());
+        }
+        if matches!(route.backend, WorkerBackend::AzureOpenAI) {
+            env.entry("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND".to_string())
+                .or_insert_with(|| "codex".to_string());
+        }
+        if matches!(route.backend, WorkerBackend::Codex) {
+            env.entry("NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND".to_string())
+                .or_insert_with(|| "azure-openai".to_string());
         }
     }
 
@@ -3059,7 +3427,7 @@ mod tests {
         };
 
         assert_eq!(gateway_backend_override(&params), Some(WorkerBackend::Zai));
-        let env = gateway_runtime_env(&params, None);
+        let env = gateway_runtime_env(&params, None, None);
         assert_eq!(
             env.get("NANOCLAW_ZAI_MODEL").map(String::as_str),
             Some("glm-4.7")
@@ -3089,7 +3457,7 @@ mod tests {
             gateway_backend_override(&params),
             Some(WorkerBackend::AzureOpenAI)
         );
-        let env = gateway_runtime_env(&params, None);
+        let env = gateway_runtime_env(&params, None, None);
         assert_eq!(
             env.get("NANOCLAW_AZURE_OPENAI_DEPLOYMENT")
                 .map(String::as_str),
@@ -3119,14 +3487,124 @@ mod tests {
     }
 
     #[test]
-    fn forced_gateway_backend_wins_over_payload_hint() {
+    fn gateway_policy_route_wins_over_forced_default_backend() {
+        let selected = select_gateway_worker_backend(
+            Some(WorkerBackend::AzureOpenAI),
+            None,
+            Some(WorkerBackend::Codex),
+            Some(WorkerBackend::Zai),
+        );
+
+        assert_eq!(selected, Some(WorkerBackend::Codex));
+    }
+
+    #[test]
+    fn explicit_gateway_hint_wins_over_policy_route() {
         let selected = select_gateway_worker_backend(
             Some(WorkerBackend::AzureOpenAI),
             Some(WorkerBackend::Zai),
             Some(WorkerBackend::Codex),
+            Some(WorkerBackend::AzureOpenAI),
         );
 
-        assert_eq!(selected, Some(WorkerBackend::AzureOpenAI));
+        assert_eq!(selected, Some(WorkerBackend::Zai));
+    }
+
+    #[test]
+    fn zero_call_route_overrides_all_paid_backends() {
+        let selected = select_gateway_worker_backend(
+            Some(WorkerBackend::AzureOpenAI),
+            Some(WorkerBackend::Codex),
+            Some(WorkerBackend::Summary),
+            Some(WorkerBackend::Zai),
+        );
+
+        assert_eq!(selected, Some(WorkerBackend::Summary));
+    }
+
+    #[test]
+    fn contextless_heartbeat_routes_to_zero_call_summary() {
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                agent_name: Some("CTO".to_string()),
+                wake: Some(GatewayPaperclipWake {
+                    reason: Some("heartbeat_timer".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let route = derive_gateway_model_route(&params, "Routine heartbeat.");
+
+        assert_eq!(route.slot, GatewayModelSlot::Zero);
+        assert_eq!(route.backend, WorkerBackend::Summary);
+        let env = gateway_runtime_env(&params, Some(&route.backend), Some(&route));
+        assert_eq!(
+            env.get("NANOCLAW_MODEL_ROUTE_SLOT").map(String::as_str),
+            Some("zero")
+        );
+        assert!(!env.contains_key("NANOCLAW_AZURE_OPENAI_DEPLOYMENT"));
+    }
+
+    #[test]
+    fn cto_repo_coding_routes_to_codex_with_azure_fallback() {
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                agent_name: Some("CTO".to_string()),
+                issue_id: Some("NEX-1".to_string()),
+                workspace: Some(GatewayPaperclipWorkspace {
+                    repo_url: Some(
+                        "https://github.com/Nexus-Integrated-Technologies/agency".to_string(),
+                    ),
+                    repo_ref: Some("main".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let route = derive_gateway_model_route(&params, "Fix the Rust gateway bug and run tests.");
+
+        assert_eq!(route.slot, GatewayModelSlot::Coder);
+        assert_eq!(route.backend, WorkerBackend::Codex);
+        assert_eq!(route.role, "CTO");
+        assert_eq!(route.task_kind, "coding");
+        let env = gateway_runtime_env(&params, Some(&route.backend), Some(&route));
+        assert_eq!(
+            env.get("NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND")
+                .map(String::as_str),
+            Some("azure-openai")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_MODEL_ROUTE_SLOT").map(String::as_str),
+            Some("coder")
+        );
+    }
+
+    #[test]
+    fn cfo_cost_work_routes_to_tiny_azure_slot() {
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                agent_name: Some("CFO".to_string()),
+                issue_id: Some("NEX-COST".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let route = derive_gateway_model_route(&params, "Summarize Azure spend and budget status.");
+
+        assert_eq!(route.slot, GatewayModelSlot::Tiny);
+        assert_eq!(route.backend, WorkerBackend::AzureOpenAI);
+        let env = gateway_runtime_env(&params, Some(&route.backend), Some(&route));
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND")
+                .map(String::as_str),
+            Some("codex")
+        );
     }
 
     #[test]
@@ -3143,7 +3621,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = gateway_runtime_env(&params, Some(&WorkerBackend::AzureOpenAI));
+        let env = gateway_runtime_env(&params, Some(&WorkerBackend::AzureOpenAI), None);
 
         assert!(!env.contains_key("NANOCLAW_ZAI_MODEL"));
         assert!(!env.contains_key("NANOCLAW_AZURE_OPENAI_DEPLOYMENT"));
@@ -3164,7 +3642,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = gateway_runtime_env(&params, Some(&WorkerBackend::AzureOpenAI));
+        let env = gateway_runtime_env(&params, Some(&WorkerBackend::AzureOpenAI), None);
 
         assert_eq!(
             env.get("NANOCLAW_AZURE_OPENAI_DEPLOYMENT")
@@ -3191,7 +3669,7 @@ mod tests {
             gateway_backend_override(&params),
             Some(WorkerBackend::AzureOpenAI)
         );
-        let env = gateway_runtime_env(&params, None);
+        let env = gateway_runtime_env(&params, None, None);
         assert_eq!(
             env.get("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND")
                 .map(String::as_str),
@@ -3232,7 +3710,7 @@ mod tests {
             gateway_backend_override(&params),
             Some(WorkerBackend::GithubCopilot)
         );
-        let env = gateway_runtime_env(&params, None);
+        let env = gateway_runtime_env(&params, None, None);
         assert_eq!(
             env.get("NANOCLAW_GITHUB_COPILOT_REPO").map(String::as_str),
             Some("https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare")
