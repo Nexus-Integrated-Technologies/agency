@@ -7,17 +7,6 @@ on:
         description: Optional image tag. Defaults to ci-gateway-<sha>-<run_attempt>.
         required: false
         type: string
-  push:
-    branches:
-      - master
-    paths:
-      - .github/workflows/cloudflare-gateway-container.yml
-      - .dockerignore
-      - Dockerfile.openclaw-gateway
-      - Cargo.lock
-      - Cargo.toml
-      - docker/start-openclaw-gateway.sh
-      - src/**
 
 permissions:
   contents: read
