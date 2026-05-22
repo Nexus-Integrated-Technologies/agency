@@ -3448,6 +3448,14 @@ fn build_azure_openai_chat_target(
         });
     }
 
+    if path.contains("/api/projects/") && !path.contains("/openai/") {
+        parsed.set_path(&format!("{path}/openai/v1/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
     if let Some(index) = path.find("/openai/v1") {
         let prefix = &path[..index + "/openai/v1".len()];
         parsed.set_path(&format!("{prefix}/chat/completions"));
@@ -5834,6 +5842,22 @@ mod tests {
         assert_eq!(
             target.url,
             "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_azure_foundry_project_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.services.ai.azure.com/api/projects/proj-default",
+            "DeepSeek-V3.1",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/api/projects/proj-default/openai/v1/chat/completions"
         );
         assert!(target.include_model);
     }

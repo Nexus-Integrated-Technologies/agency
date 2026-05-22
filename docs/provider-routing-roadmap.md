@@ -59,6 +59,10 @@ NANOCLAW_AZURE_OPENAI_ENDPOINT=https://<resource>.services.ai.azure.com
 NANOCLAW_AZURE_OPENAI_DEPLOYMENT=<deployment-name>
 NANOCLAW_AZURE_OPENAI_API_VERSION=2024-10-21
 
+# Foundry project endpoint copied from the Foundry portal
+NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project-name>
+NANOCLAW_AZURE_AI_FOUNDRY_MODEL=<deployment-name>
+
 # Direct Foundry Models route
 NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/models
 NANOCLAW_AZURE_AI_FOUNDRY_MODEL=<deployment-or-model-name>
