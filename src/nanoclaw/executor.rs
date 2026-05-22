@@ -1242,11 +1242,12 @@ impl ExecutorBoundary for OmxExecutor {
                 &created_at,
             ))
         });
+        let omx_prompt = render_omx_execution_prompt(&request);
         let response = self.client.invoke(
             &request.group.folder,
             Some(&request.group.jid),
             None,
-            &request.prompt,
+            &omx_prompt,
             workspace_root.as_path(),
             request.omx.as_ref(),
             request.env.clone(),
@@ -1392,6 +1393,31 @@ impl ExecutorBoundary for OmxExecutor {
             evidence: Some(evidence),
         })
     }
+}
+
+fn render_omx_execution_prompt(request: &ExecutionRequest) -> String {
+    let mut sections = Vec::new();
+    sections.push(
+        "OpenClaw/OMX execution contract:\n\
+- Paperclip API credentials, when provided, are available through PAPERCLIP_API_KEY and PAPERCLIP_API_URL.\n\
+- The runner also materializes PAPERCLIP_CLAIMED_API_KEY_FILE for tools that expect ~/.openclaw/workspace/paperclip-claimed-api-key.json.\n\
+- Never print, echo, commit, or include credential values in artifacts.\n\
+- When writing markdown, JSON, or other multiline text through shell, use single-quoted heredocs like <<'EOF' so backticks and $VARIABLES are not expanded by the shell.\n\
+- If a required credential is still missing, report that blocker explicitly and do not claim the Paperclip API workflow completed."
+            .to_string(),
+    );
+
+    if let Some(context) = request
+        .paperclip_overlay_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(format!("Paperclip managed context:\n{context}"));
+    }
+
+    sections.push(format!("Paperclip request:\n{}", request.prompt.trim()));
+    sections.join("\n\n")
 }
 
 #[derive(Debug, Clone)]
@@ -6025,10 +6051,11 @@ mod tests {
         normalize_azure_openai_fallback_backend, normalize_azure_openai_rate_model_name,
         normalize_branch_name, normalize_github_repo_ref, parse_azure_openai_cost_rate_card,
         parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
-        parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
-        run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
-        should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
-        write_json, AzureOpenAICostConfig, AzureOpenAICostRateOverrides, BackendExecutionMetadata,
+        parse_git_status_porcelain, read_json, render_omx_execution_prompt,
+        resolve_container_image, run_worker_command, run_worker_daemon_with_idle_timeout,
+        run_worker_from_paths, should_use_container_lane, should_use_remote_lane,
+        validate_execution_response_evidence, wait_for_worker_socket, write_json,
+        AzureOpenAICostConfig, AzureOpenAICostRateOverrides, BackendExecutionMetadata,
         BackendExecutionResult, BuildExecutionEvidenceInput, ContainerExecutor,
         DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
         ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
@@ -6675,6 +6702,48 @@ mod tests {
             normalize_branch_name("0123456789abcdef0123456789abcdef01234567"),
             None
         );
+    }
+
+    #[test]
+    fn omx_prompt_includes_runtime_credential_and_safe_heredoc_contract() {
+        let root = tempdir().unwrap();
+        let request = ExecutionRequest {
+            group: Group {
+                jid: "paperclip".to_string(),
+                name: "Paperclip".to_string(),
+                folder: "paperclip".to_string(),
+                trigger: "@paperclip".to_string(),
+                added_at: "2026-05-22T00:00:00Z".to_string(),
+                requires_trigger: false,
+                is_main: false,
+            },
+            prompt: "Resolve NEX-707.".to_string(),
+            paperclip_overlay_context: Some(
+                "Paperclip issue packet:\n- issue: NEX-707 COO: Ops Run Hygiene".to_string(),
+            ),
+            messages: Vec::new(),
+            task_id: None,
+            script: None,
+            omx: None,
+            assistant_name: "NanoClaw".to_string(),
+            request_plane: RequestPlane::Web,
+            env: BTreeMap::new(),
+            session: build_execution_session(root.path(), "paperclip", "session-1", root.path()),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let prompt = render_omx_execution_prompt(&request);
+
+        assert!(prompt.contains("PAPERCLIP_CLAIMED_API_KEY_FILE"));
+        assert!(prompt.contains("single-quoted heredocs like <<'EOF'"));
+        assert!(prompt.contains("Paperclip issue packet"));
+        assert!(prompt.contains("Resolve NEX-707."));
     }
 
     #[test]

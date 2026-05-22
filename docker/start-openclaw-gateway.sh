@@ -63,6 +63,38 @@ elif [ -n "$CODEX_AUTH_JSON_B64" ]; then
   chmod 600 "$CODEX_HOME/auth.json"
 fi
 
+if [ -n "${PAPERCLIP_API_KEY:-${NANOCLAW_PAPERCLIP_API_KEY:-}}" ]; then
+  PAPERCLIP_API_KEY="${PAPERCLIP_API_KEY:-${NANOCLAW_PAPERCLIP_API_KEY:-}}" \
+  node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const apiKey = String(process.env.PAPERCLIP_API_KEY || "").trim();
+if (!apiKey) process.exit(0);
+const home = String(process.env.NANOCLAW_HOME || process.env.HOME || "/nanoclaw").trim() || "/nanoclaw";
+const dir = path.join(home, ".openclaw", "workspace");
+fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+const payload = {
+  apiKey,
+  token: apiKey,
+  source: "container_env",
+  apiUrl: process.env.PAPERCLIP_API_URL || null,
+  agentId: process.env.PAPERCLIP_AGENT_ID || null,
+  companyId: process.env.PAPERCLIP_COMPANY_ID || null,
+  writtenAt: new Date().toISOString(),
+};
+const body = `${JSON.stringify(payload)}\n`;
+const defaultPath = path.join(dir, "paperclip-claimed-api-key.json");
+fs.writeFileSync(defaultPath, body, { mode: 0o600 });
+fs.chmodSync(defaultPath, 0o600);
+if (payload.agentId) {
+  const safeAgentId = payload.agentId.replace(/[^A-Za-z0-9_.-]/g, "_");
+  const agentPath = path.join(dir, `paperclip-claimed-api-key-${safeAgentId}.json`);
+  fs.writeFileSync(agentPath, body, { mode: 0o600 });
+  fs.chmodSync(agentPath, 0o600);
+}
+'
+fi
+
 if { [ "${NANOCLAW_WORKER_BACKEND:-}" = "codex" ] || [ "${NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND:-}" = "codex" ]; } && [ ! -s "$CODEX_HOME/auth.json" ]; then
   echo "warning: Codex is selected as primary or backup but CODEX_HOME/auth.json is missing" >&2
 fi

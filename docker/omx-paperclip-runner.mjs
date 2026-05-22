@@ -400,7 +400,9 @@ function buildRunScript(state, runEnv = {}) {
     "#!/usr/bin/env bash",
     "set +e",
     'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"',
+    'export HOME="${HOME:-/nanoclaw}"',
     ...buildRunEnvExports(runEnv),
+    ...buildPaperclipCredentialBootstrap(),
     `cd ${shellQuote(state.cwd)}`,
     `${omxCommand} >> ${logPath} 2>&1`,
     "status=$?",
@@ -415,6 +417,45 @@ function buildRunScript(state, runEnv = {}) {
     "exit \"$status\"",
   ];
   return `${lines.join("\n")}\n`;
+}
+
+function buildPaperclipCredentialBootstrap() {
+  const script = [
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    'const apiKey = String(process.env.PAPERCLIP_API_KEY || "").trim();',
+    "if (!apiKey) { process.exit(0); }",
+    'const home = String(process.env.HOME || "/nanoclaw").trim() || "/nanoclaw";',
+    'const workspaceDir = path.join(home, ".openclaw", "workspace");',
+    "fs.mkdirSync(workspaceDir, { recursive: true, mode: 0o700 });",
+    "const payload = {",
+    "  apiKey,",
+    "  token: apiKey,",
+    '  source: "runtime_env",',
+    "  apiUrl: process.env.PAPERCLIP_API_URL || null,",
+    "  runId: process.env.PAPERCLIP_RUN_ID || null,",
+    "  agentId: process.env.PAPERCLIP_AGENT_ID || null,",
+    "  companyId: process.env.PAPERCLIP_COMPANY_ID || null,",
+    "  writtenAt: new Date().toISOString(),",
+    "};",
+    'const body = `${JSON.stringify(payload)}\\n`;',
+    'const defaultPath = path.join(workspaceDir, "paperclip-claimed-api-key.json");',
+    "fs.writeFileSync(defaultPath, body, { mode: 0o600 });",
+    "fs.chmodSync(defaultPath, 0o600);",
+    "if (payload.agentId) {",
+    '  const safeAgentId = payload.agentId.replace(/[^A-Za-z0-9_.-]/g, "_");',
+    '  const agentPath = path.join(workspaceDir, `paperclip-claimed-api-key-${safeAgentId}.json`);',
+    "  fs.writeFileSync(agentPath, body, { mode: 0o600 });",
+    "  fs.chmodSync(agentPath, 0o600);",
+    "}",
+  ].join("\n");
+
+  return [
+    'export PAPERCLIP_CLAIMED_API_KEY_FILE="${HOME}/.openclaw/workspace/paperclip-claimed-api-key.json"',
+    'if [ -n "${PAPERCLIP_API_KEY:-}" ]; then',
+    `  ${shellQuote(process.execPath)} -e ${shellQuote(script)}`,
+    "fi",
+  ];
 }
 
 function buildRunEnvExports(runEnv) {
