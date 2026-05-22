@@ -1817,6 +1817,15 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 &resolved_backend,
                 execution_location.clone(),
             ),
+            WorkerBackend::FoundryMaaS => run_foundry_maas_request_with_codex_fallback(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+                execution_location.clone(),
+            ),
             WorkerBackend::GithubCopilot => run_github_copilot_request(
                 &request,
                 workspace_root.as_path(),
@@ -2646,6 +2655,7 @@ fn execution_mode_for_backend(backend: &WorkerBackend, has_script: bool) -> Exec
         | WorkerBackend::Claude
         | WorkerBackend::Zai
         | WorkerBackend::AzureOpenAI
+        | WorkerBackend::FoundryMaaS
         | WorkerBackend::GithubCopilot => ExecutionEvidenceMode::Code,
     }
 }
@@ -2934,8 +2944,27 @@ fn run_codex_usage_limit_fallback(
             resolved_backend,
             fallback_reason,
         ),
+        "foundry"
+        | "foundry-maas"
+        | "foundry_maas"
+        | "azure-maas"
+        | "azure_maas"
+        | "azure-model-inference"
+        | "azure_model_inference"
+        | "azure-ai-model-inference"
+        | "azure_ai_model_inference"
+        | "azure-foundry-maas"
+        | "azure_foundry_maas" => run_foundry_maas_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            fallback_reason,
+        ),
         other => bail!(
-            "unsupported NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND '{}'; expected zai, azure-openai, workers-ai, or disabled",
+            "unsupported NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND '{}'; expected zai, azure-openai, foundry-maas, workers-ai, or disabled",
             other
         ),
     }
@@ -3075,8 +3104,39 @@ fn run_azure_openai_request_with_codex_fallback(
                         )
                     })
                 }
+                "foundry"
+                | "foundry-maas"
+                | "foundry_maas"
+                | "azure-maas"
+                | "azure_maas"
+                | "azure-model-inference"
+                | "azure_model_inference"
+                | "azure-ai-model-inference"
+                | "azure_ai_model_inference"
+                | "azure-foundry-maas"
+                | "azure_foundry_maas" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_foundry_maas_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and Foundry MaaS fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
                 other => bail!(
-                    "unsupported NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND '{}'; expected codex, zai, workers-ai, or disabled",
+                    "unsupported NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND '{}'; expected codex, zai, foundry-maas, workers-ai, or disabled",
                     other
                 ),
             }
@@ -3415,6 +3475,373 @@ fn run_azure_openai_request(
     })
 }
 
+fn run_foundry_maas_request_with_codex_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+) -> Result<BackendExecutionResult> {
+    match run_foundry_maas_request(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        None,
+    ) {
+        Ok(result) => Ok(result),
+        Err(foundry_error) => {
+            let foundry_error_text = foundry_error.to_string();
+            let fallback = foundry_maas_fallback_backend();
+            match fallback.as_str() {
+                "off" | "none" | "disabled" => Err(foundry_error),
+                "codex" | "codex-local" | "codex_local" | "openai" => {
+                    let fallback_reason = Some(format!(
+                        "foundry_maas_unavailable: {}",
+                        summarize_for_chat(&foundry_error_text, 600)
+                    ));
+                    run_codex_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        execution_location,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Foundry MaaS backend failed and Codex fallback also failed; Foundry error: {}",
+                            summarize_for_chat(&foundry_error_text, 600)
+                        )
+                    })
+                }
+                "zai" | "z-ai" | "glm" | "zhipu" => {
+                    let fallback_reason = Some(format!(
+                        "foundry_maas_unavailable: {}",
+                        summarize_for_chat(&foundry_error_text, 600)
+                    ));
+                    run_zai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Foundry MaaS backend failed and ZAI fallback also failed; Foundry error: {}",
+                            summarize_for_chat(&foundry_error_text, 600)
+                        )
+                    })
+                }
+                "azure"
+                | "azure-openai"
+                | "azure_openai"
+                | "azureopenai"
+                | "azure-ai"
+                | "azure_ai"
+                | "azure-foundry"
+                | "azure_foundry" => {
+                    let fallback_reason = Some(format!(
+                        "foundry_maas_unavailable: {}",
+                        summarize_for_chat(&foundry_error_text, 600)
+                    ));
+                    run_azure_openai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Foundry MaaS backend failed and Azure OpenAI fallback also failed; Foundry error: {}",
+                            summarize_for_chat(&foundry_error_text, 600)
+                        )
+                    })
+                }
+                other => bail!(
+                    "unsupported NANOCLAW_FOUNDRY_MAAS_FALLBACK_BACKEND '{}'; expected codex, azure-openai, zai, or disabled",
+                    other
+                ),
+            }
+        }
+    }
+}
+
+fn foundry_maas_fallback_backend() -> String {
+    non_empty_env("NANOCLAW_FOUNDRY_MAAS_FALLBACK_BACKEND")
+        .or_else(|| non_empty_env("NANOCLAW_AZURE_AI_FOUNDRY_FALLBACK_BACKEND"))
+        .or_else(|| non_empty_env("NANOCLAW_AZURE_FOUNDRY_FALLBACK_BACKEND"))
+        .unwrap_or_else(|| "codex".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn run_foundry_maas_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    _prior_turns: usize,
+    _instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    fallback_reason: Option<String>,
+) -> Result<BackendExecutionResult> {
+    if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
+        bail!(error);
+    }
+
+    let token = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_KEY",
+            "AZURE_AI_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_FOUNDRY_API_KEY",
+            "AZURE_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_API_KEY",
+            "AZURE_MODEL_INFERENCE_API_KEY",
+            "NANOCLAW_FOUNDRY_MAAS_API_KEY",
+            "FOUNDRY_MAAS_API_KEY",
+            "NANOCLAW_AZURE_AI_API_KEY",
+            "AZURE_AI_API_KEY",
+            "NANOCLAW_AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+        ],
+    )
+    .ok_or_else(|| {
+        if fallback_reason.is_some() {
+            anyhow::anyhow!(
+                "codex usage limit reached and Foundry MaaS fallback is enabled, but no Azure AI Foundry key is configured; set NANOCLAW_AZURE_AI_FOUNDRY_API_KEY"
+            )
+        } else {
+            anyhow::anyhow!(
+                "Foundry MaaS backend is enabled, but no Azure AI Foundry key is configured; set NANOCLAW_AZURE_AI_FOUNDRY_API_KEY"
+            )
+        }
+    })?;
+    let endpoint = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT",
+            "AZURE_AI_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_FOUNDRY_ENDPOINT",
+            "AZURE_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_ENDPOINT",
+            "AZURE_MODEL_INFERENCE_ENDPOINT",
+            "NANOCLAW_FOUNDRY_MAAS_ENDPOINT",
+            "FOUNDRY_MAAS_ENDPOINT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_BASE_URL",
+            "AZURE_AI_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_FOUNDRY_BASE_URL",
+            "AZURE_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+            "AZURE_OPENAI_ENDPOINT",
+            "NANOCLAW_AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_BASE_URL",
+        ],
+    )
+    .context("Foundry MaaS backend requires NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT")?;
+    let model = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_MODEL",
+            "AZURE_AI_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_FOUNDRY_MODEL",
+            "AZURE_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_MODEL",
+            "AZURE_MODEL_INFERENCE_MODEL",
+            "NANOCLAW_FOUNDRY_MAAS_MODEL",
+            "FOUNDRY_MAAS_MODEL",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
+        ],
+    )
+    .context("Foundry MaaS backend requires NANOCLAW_AZURE_AI_FOUNDRY_MODEL")?;
+    let api_version = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION",
+            "AZURE_AI_FOUNDRY_API_VERSION",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_API_VERSION",
+            "AZURE_MODEL_INFERENCE_API_VERSION",
+            "NANOCLAW_FOUNDRY_MAAS_API_VERSION",
+            "FOUNDRY_MAAS_API_VERSION",
+        ],
+    )
+    .unwrap_or_else(|| "2024-05-01-preview".to_string());
+    let target = build_foundry_maas_chat_target(&endpoint, &model, &api_version)?;
+    let prompt = build_worker_prompt(request, workspace_root, session_state)?;
+    let temperature = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_FOUNDRY_MAAS_TEMPERATURE",
+            "FOUNDRY_MAAS_TEMPERATURE",
+            "NANOCLAW_AZURE_AI_FOUNDRY_TEMPERATURE",
+            "AZURE_AI_FOUNDRY_TEMPERATURE",
+        ],
+    )
+    .and_then(|value| value.parse::<f64>().ok())
+    .unwrap_or(0.2);
+    let max_tokens = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_FOUNDRY_MAAS_MAX_TOKENS",
+            "FOUNDRY_MAAS_MAX_TOKENS",
+            "NANOCLAW_AZURE_AI_FOUNDRY_MAX_TOKENS",
+            "AZURE_AI_FOUNDRY_MAX_TOKENS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(2048);
+    let timeout = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_FOUNDRY_MAAS_TIMEOUT_MS",
+            "FOUNDRY_MAAS_TIMEOUT_MS",
+            "NANOCLAW_AZURE_AI_FOUNDRY_TIMEOUT_MS",
+            "AZURE_AI_FOUNDRY_TIMEOUT_MS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value >= 1000)
+    .map(Duration::from_millis)
+    .unwrap_or_else(|| Duration::from_secs(120));
+
+    let mut payload = serde_json::Map::new();
+    if target.include_model {
+        payload.insert("model".to_string(), Value::String(model.clone()));
+    }
+    payload.insert(
+        "messages".to_string(),
+        Value::Array(vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "You are a NanoClaw provider backend. Return only the operator-facing message that should be written back through the existing OpenClaw/OMX/Paperclip evidence path. Do not claim code, shell, PR, or deploy execution unless the prompt includes concrete evidence."
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": prompt,
+            }),
+        ]),
+    );
+    if let Some(number) = serde_json::Number::from_f64(temperature) {
+        payload.insert("temperature".to_string(), Value::Number(number));
+    }
+    payload.insert(
+        "max_tokens".to_string(),
+        Value::Number(serde_json::Number::from(max_tokens)),
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build Foundry MaaS HTTP client")?;
+    let response = client
+        .post(&target.url)
+        .header("content-type", "application/json")
+        .header("api-key", &token)
+        .bearer_auth(&token)
+        .json(&Value::Object(payload))
+        .send()
+        .context("failed to send request to Foundry MaaS")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read Foundry MaaS response body")?;
+    if !status.is_success() {
+        bail!(
+            "Foundry MaaS execution failed with status {} for endpoint {}: {}",
+            status,
+            redact_azure_openai_url(&target.url),
+            summarize_workers_ai_body(&body)
+        );
+    }
+
+    let result: Value = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "failed to parse Foundry MaaS response: {}",
+            summarize_workers_ai_body(&body)
+        )
+    })?;
+    let text = extract_azure_openai_text(&result).unwrap_or_default();
+    if text.trim().is_empty() {
+        bail!("Foundry MaaS execution produced empty output");
+    }
+    if is_paperclip_gateway_request(request) {
+        if let Some(blocker) = detect_paperclip_control_plane_blocker(&text) {
+            bail!("foundry-maas execution blocked: {blocker}");
+        }
+    }
+
+    let usage = parse_azure_openai_usage(&result);
+    let cost_usd = usage.as_ref().and_then(|usage| {
+        estimate_azure_openai_cost_usd_with_config(&model, usage, read_foundry_maas_cost_config())
+    });
+    let capability_manifest = derive_capability_manifest(
+        &request.request_plane,
+        DeriveCapabilityManifestInput::default(),
+    );
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\nbackend=foundry-maas\nprovider=azure_foundry_maas\nbiller=azure\nbilling_type=azure_credits\nmodel={}\nfallback_reason={:?}\nendpoint={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nresponse=\n{}\n",
+        request.invocation_id,
+        request.session.id,
+        workspace_root.display(),
+        model,
+        fallback_reason,
+        redact_azure_openai_url(&target.url),
+        usage.as_ref().map(|value| value.input_tokens).unwrap_or(0),
+        usage.as_ref()
+            .map(|value| value.cached_input_tokens)
+            .unwrap_or(0),
+        usage.as_ref().map(|value| value.output_tokens).unwrap_or(0),
+        cost_usd
+            .map(|value| format!("{value:.8}"))
+            .unwrap_or_else(|| "-".to_string()),
+        request.request_plane.as_str(),
+        text
+    );
+
+    Ok(BackendExecutionResult {
+        text,
+        log_body,
+        metadata: BackendExecutionMetadata {
+            backend: WorkerBackend::FoundryMaaS,
+            provider: Some("azure_foundry_maas".to_string()),
+            biller: Some("azure".to_string()),
+            billing_type: Some("azure_credits".to_string()),
+            model: Some(model),
+            usage,
+            cost_usd,
+            effective_capabilities: capability_manifest,
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
+            secret_handles: Vec::new(),
+            mount_summary: vec![ExecutionMountSummaryEntry {
+                host_path: Some(workspace_root.display().to_string()),
+                container_path: None,
+                readonly: false,
+                kind: ExecutionMountKind::Project,
+            }],
+            fallback_reason,
+            external_run_id: None,
+        },
+    })
+}
+
 fn build_azure_openai_chat_target(
     endpoint: &str,
     deployment: &str,
@@ -3490,6 +3917,82 @@ fn build_azure_openai_chat_target(
     Ok(AzureOpenAIChatTarget {
         url: parsed.to_string(),
         include_model: false,
+    })
+}
+
+fn build_foundry_maas_chat_target(
+    endpoint: &str,
+    model: &str,
+    api_version: &str,
+) -> Result<AzureOpenAIChatTarget> {
+    let endpoint = endpoint.trim();
+    let model = model.trim();
+    let api_version = api_version.trim();
+    if model.is_empty() {
+        bail!("Foundry MaaS model is required");
+    }
+
+    let mut parsed = reqwest::Url::parse(endpoint)
+        .context("NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT must be a valid absolute URL")?;
+    let path = parsed.path().trim_end_matches('/').to_string();
+
+    if path.ends_with("/chat/completions") {
+        if path.contains("/models/") || path.ends_with("/models/chat/completions") {
+            append_api_version_if_missing(&mut parsed, api_version);
+        }
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if let Some(index) = path.find("/openai/v1") {
+        let prefix = &path[..index + "/openai/v1".len()];
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if path.contains("/api/projects/") && !path.contains("/openai/") {
+        parsed.set_path(&format!("{path}/openai/v1/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if path.ends_with("/models") || path.contains("/models/") {
+        let prefix = match path.find("/models") {
+            Some(index) => &path[..index + "/models".len()],
+            None => path.as_str(),
+        };
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        append_api_version_if_missing(&mut parsed, api_version);
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if parsed
+        .host_str()
+        .map(|host| host.ends_with(".openai.azure.com"))
+        .unwrap_or(false)
+    {
+        parsed.set_path("/openai/v1/chat/completions");
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    parsed.set_path("/models/chat/completions");
+    append_api_version_if_missing(&mut parsed, api_version);
+    Ok(AzureOpenAIChatTarget {
+        url: parsed.to_string(),
+        include_model: true,
     })
 }
 
@@ -3707,6 +4210,36 @@ fn read_azure_openai_cost_config() -> AzureOpenAICostConfig {
     }
 }
 
+fn read_foundry_maas_cost_config() -> AzureOpenAICostConfig {
+    AzureOpenAICostConfig {
+        overrides: read_foundry_maas_cost_rate_overrides(),
+        rate_card: read_azure_openai_cost_rate_card(),
+    }
+}
+
+fn read_foundry_maas_cost_rate_overrides() -> AzureOpenAICostRateOverrides {
+    AzureOpenAICostRateOverrides {
+        input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_FOUNDRY_MAAS_INPUT_USD_PER_1M",
+            "FOUNDRY_MAAS_INPUT_USD_PER_1M",
+            "NANOCLAW_AZURE_AI_FOUNDRY_INPUT_USD_PER_1M",
+            "AZURE_AI_FOUNDRY_INPUT_USD_PER_1M",
+        ]),
+        cached_input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M",
+            "FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M",
+            "NANOCLAW_AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M",
+            "AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M",
+        ]),
+        output_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_FOUNDRY_MAAS_OUTPUT_USD_PER_1M",
+            "FOUNDRY_MAAS_OUTPUT_USD_PER_1M",
+            "NANOCLAW_AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M",
+            "AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M",
+        ]),
+    }
+}
+
 fn read_azure_openai_cost_rate_card() -> BTreeMap<String, AzureOpenAICostRates> {
     let Some(raw) = [
         "NANOCLAW_AZURE_OPENAI_RATE_CARD_JSON",
@@ -3717,8 +4250,7 @@ fn read_azure_openai_cost_rate_card() -> BTreeMap<String, AzureOpenAICostRates> 
         "AZURE_FOUNDRY_RATE_CARD_JSON",
     ]
     .iter()
-    .find_map(|key| non_empty_env(key))
-    else {
+    .find_map(|key| non_empty_env(key)) else {
         return BTreeMap::new();
     };
 
@@ -5094,6 +5626,7 @@ fn run_kind_for_backend(backend: &WorkerBackend, is_script: bool) -> ExecutionRu
         WorkerBackend::Claude => ExecutionRunKind::Claude,
         WorkerBackend::Zai => ExecutionRunKind::Custom("zai".to_string()),
         WorkerBackend::AzureOpenAI => ExecutionRunKind::Custom("azure-openai".to_string()),
+        WorkerBackend::FoundryMaaS => ExecutionRunKind::Custom("foundry-maas".to_string()),
         WorkerBackend::GithubCopilot => ExecutionRunKind::Custom("github-copilot".to_string()),
         WorkerBackend::WorkersAI => ExecutionRunKind::WorkersAI,
         WorkerBackend::Custom(value) => ExecutionRunKind::Custom(value.clone()),
@@ -5483,28 +6016,26 @@ mod tests {
 
     use super::{
         build_azure_openai_chat_target, build_execution_evidence, build_execution_metadata,
-        build_execution_session, build_github_copilot_command,
+        build_execution_session, build_foundry_maas_chat_target, build_github_copilot_command,
         build_worker_process_failure_response, build_worker_transport_failure_response,
         collect_git_evidence, connect_to_worker_socket, decode_worker_outcome_with_context,
         default_codex_sandbox_for_request, detect_paperclip_control_plane_blocker,
-        estimate_azure_openai_cost_usd_with_config,
-        estimate_azure_openai_cost_usd_with_overrides, execute_worker_request,
-        extract_azure_openai_text, is_codex_usage_limit_error,
+        estimate_azure_openai_cost_usd_with_config, estimate_azure_openai_cost_usd_with_overrides,
+        execute_worker_request, extract_azure_openai_text, is_codex_usage_limit_error,
         normalize_azure_openai_fallback_backend, normalize_azure_openai_rate_model_name,
-        normalize_branch_name, normalize_github_repo_ref, parse_azure_openai_usage,
-        parse_azure_openai_cost_rate_card, parse_codex_jsonl, parse_git_log_refs,
+        normalize_branch_name, normalize_github_repo_ref, parse_azure_openai_cost_rate_card,
+        parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
         parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
         run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
-        should_use_remote_lane,
-        validate_execution_response_evidence, wait_for_worker_socket, write_json,
-        AzureOpenAICostConfig, AzureOpenAICostRateOverrides, BackendExecutionMetadata,
+        should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
+        write_json, AzureOpenAICostConfig, AzureOpenAICostRateOverrides, BackendExecutionMetadata,
         BackendExecutionResult, BuildExecutionEvidenceInput, ContainerExecutor,
         DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
         ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
         ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutionVerificationRef,
         ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor,
-        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest,
-        WorkerResponse, EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
 
     #[test]
@@ -5831,6 +6362,54 @@ mod tests {
     }
 
     #[test]
+    fn builds_foundry_maas_models_chat_target() {
+        let target = build_foundry_maas_chat_target(
+            "https://example.services.ai.azure.com/models",
+            "DeepSeek-V3.2",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_foundry_maas_openai_v1_chat_target() {
+        let target = build_foundry_maas_chat_target(
+            "https://example.services.ai.azure.com/openai/v1/",
+            "Kimi-K2-Thinking",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/openai/v1/chat/completions"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_foundry_maas_base_services_chat_target() {
+        let target = build_foundry_maas_chat_target(
+            "https://example.services.ai.azure.com",
+            "Mistral-Large-3",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
     fn preserves_existing_azure_foundry_models_api_version() {
         let target = build_azure_openai_chat_target(
             "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview",
@@ -5994,6 +6573,19 @@ mod tests {
             normalize_azure_openai_fallback_backend(Some("disabled".to_string())),
             "disabled"
         );
+    }
+
+    #[test]
+    fn foundry_maas_backend_aliases_parse() {
+        assert_eq!(
+            WorkerBackend::parse("foundry-maas"),
+            WorkerBackend::FoundryMaaS
+        );
+        assert_eq!(
+            WorkerBackend::parse("azure-model-inference"),
+            WorkerBackend::FoundryMaaS
+        );
+        assert_eq!(WorkerBackend::FoundryMaaS.as_str(), "foundry-maas");
     }
 
     #[test]

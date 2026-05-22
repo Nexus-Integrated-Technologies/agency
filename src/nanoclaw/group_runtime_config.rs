@@ -143,6 +143,12 @@ fn apply_model_env(
                 model.to_string(),
             );
         }
+        Some(WorkerBackend::FoundryMaaS) => {
+            env.insert(
+                "NANOCLAW_AZURE_AI_FOUNDRY_MODEL".to_string(),
+                model.to_string(),
+            );
+        }
         Some(WorkerBackend::WorkersAI) => {
             env.insert("NANOCLAW_WORKERS_AI_MODEL".to_string(), model.to_string());
         }
@@ -197,6 +203,26 @@ mod tests {
             env.get("NANOCLAW_CLI_SCOPE").map(String::as_str),
             Some("operator")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn maps_foundry_maas_model_to_provider_env() -> Result<()> {
+        let config = GroupRuntimeConfig::from_json(Some(
+            r#"{"provider":"foundry-maas","model":"DeepSeek-V3.2","assistant_name":"Planner"}"#,
+        ))?;
+        assert_eq!(config.backend_override(), Some(WorkerBackend::FoundryMaaS));
+        let env = config.execution_env();
+        assert_eq!(
+            env.get("NANOCLAW_WORKER_BACKEND").map(String::as_str),
+            Some("foundry-maas")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_AI_FOUNDRY_MODEL")
+                .map(String::as_str),
+            Some("DeepSeek-V3.2")
+        );
+        assert!(!env.contains_key("NANOCLAW_AZURE_OPENAI_DEPLOYMENT"));
         Ok(())
     }
 }

@@ -1517,12 +1517,20 @@ fn paperclip_runtime_env(paperclip: Option<&GatewayPaperclipPayload>) -> BTreeMa
         "NANOCLAW_AZURE_FOUNDRY_API_KEY",
         "AZURE_AI_API_KEY",
         "NANOCLAW_AZURE_AI_API_KEY",
+        "FOUNDRY_MAAS_API_KEY",
+        "NANOCLAW_FOUNDRY_MAAS_API_KEY",
+        "AZURE_MODEL_INFERENCE_API_KEY",
+        "NANOCLAW_AZURE_MODEL_INFERENCE_API_KEY",
         "AZURE_OPENAI_ENDPOINT",
         "NANOCLAW_AZURE_OPENAI_ENDPOINT",
         "AZURE_AI_FOUNDRY_ENDPOINT",
         "NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT",
         "AZURE_FOUNDRY_ENDPOINT",
         "NANOCLAW_AZURE_FOUNDRY_ENDPOINT",
+        "FOUNDRY_MAAS_ENDPOINT",
+        "NANOCLAW_FOUNDRY_MAAS_ENDPOINT",
+        "AZURE_MODEL_INFERENCE_ENDPOINT",
+        "NANOCLAW_AZURE_MODEL_INFERENCE_ENDPOINT",
         "AZURE_OPENAI_BASE_URL",
         "NANOCLAW_AZURE_OPENAI_BASE_URL",
         "AZURE_AI_FOUNDRY_BASE_URL",
@@ -1541,6 +1549,10 @@ fn paperclip_runtime_env(paperclip: Option<&GatewayPaperclipPayload>) -> BTreeMa
         "NANOCLAW_AZURE_AI_FOUNDRY_MODEL",
         "AZURE_FOUNDRY_MODEL",
         "NANOCLAW_AZURE_FOUNDRY_MODEL",
+        "FOUNDRY_MAAS_MODEL",
+        "NANOCLAW_FOUNDRY_MAAS_MODEL",
+        "AZURE_MODEL_INFERENCE_MODEL",
+        "NANOCLAW_AZURE_MODEL_INFERENCE_MODEL",
         "AZURE_OPENAI_DEPLOYMENT_NAME",
         "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
         "AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
@@ -1551,6 +1563,22 @@ fn paperclip_runtime_env(paperclip: Option<&GatewayPaperclipPayload>) -> BTreeMa
         "NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION",
         "AZURE_FOUNDRY_API_VERSION",
         "NANOCLAW_AZURE_FOUNDRY_API_VERSION",
+        "FOUNDRY_MAAS_API_VERSION",
+        "NANOCLAW_FOUNDRY_MAAS_API_VERSION",
+        "AZURE_MODEL_INFERENCE_API_VERSION",
+        "NANOCLAW_AZURE_MODEL_INFERENCE_API_VERSION",
+        "FOUNDRY_MAAS_INPUT_USD_PER_1M",
+        "NANOCLAW_FOUNDRY_MAAS_INPUT_USD_PER_1M",
+        "AZURE_AI_FOUNDRY_INPUT_USD_PER_1M",
+        "NANOCLAW_AZURE_AI_FOUNDRY_INPUT_USD_PER_1M",
+        "FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M",
+        "NANOCLAW_FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M",
+        "AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M",
+        "NANOCLAW_AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M",
+        "FOUNDRY_MAAS_OUTPUT_USD_PER_1M",
+        "NANOCLAW_FOUNDRY_MAAS_OUTPUT_USD_PER_1M",
+        "AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M",
+        "NANOCLAW_AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M",
         "NANOCLAW_AZURE_OPENAI_RATE_CARD_JSON",
         "AZURE_OPENAI_RATE_CARD_JSON",
         "NANOCLAW_AZURE_AI_FOUNDRY_RATE_CARD_JSON",
@@ -1559,6 +1587,9 @@ fn paperclip_runtime_env(paperclip: Option<&GatewayPaperclipPayload>) -> BTreeMa
         "AZURE_FOUNDRY_RATE_CARD_JSON",
         "NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND",
         "NANOCLAW_AZURE_FALLBACK_BACKEND",
+        "NANOCLAW_FOUNDRY_MAAS_FALLBACK_BACKEND",
+        "NANOCLAW_AZURE_AI_FOUNDRY_FALLBACK_BACKEND",
+        "NANOCLAW_AZURE_FOUNDRY_FALLBACK_BACKEND",
     ];
 
     let mut env = BTreeMap::new();
@@ -1600,12 +1631,20 @@ fn codespaces_runtime_env(mut env: BTreeMap<String, String>) -> BTreeMap<String,
     env.remove("NANOCLAW_AZURE_FOUNDRY_API_KEY");
     env.remove("AZURE_AI_API_KEY");
     env.remove("NANOCLAW_AZURE_AI_API_KEY");
+    env.remove("FOUNDRY_MAAS_API_KEY");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_API_KEY");
+    env.remove("AZURE_MODEL_INFERENCE_API_KEY");
+    env.remove("NANOCLAW_AZURE_MODEL_INFERENCE_API_KEY");
     env.remove("AZURE_OPENAI_ENDPOINT");
     env.remove("NANOCLAW_AZURE_OPENAI_ENDPOINT");
     env.remove("AZURE_AI_FOUNDRY_ENDPOINT");
     env.remove("NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT");
     env.remove("AZURE_FOUNDRY_ENDPOINT");
     env.remove("NANOCLAW_AZURE_FOUNDRY_ENDPOINT");
+    env.remove("FOUNDRY_MAAS_ENDPOINT");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_ENDPOINT");
+    env.remove("AZURE_MODEL_INFERENCE_ENDPOINT");
+    env.remove("NANOCLAW_AZURE_MODEL_INFERENCE_ENDPOINT");
     env.remove("AZURE_OPENAI_BASE_URL");
     env.remove("NANOCLAW_AZURE_OPENAI_BASE_URL");
     env.remove("AZURE_AI_FOUNDRY_BASE_URL");
@@ -1624,6 +1663,10 @@ fn codespaces_runtime_env(mut env: BTreeMap<String, String>) -> BTreeMap<String,
     env.remove("NANOCLAW_AZURE_AI_FOUNDRY_MODEL");
     env.remove("AZURE_FOUNDRY_MODEL");
     env.remove("NANOCLAW_AZURE_FOUNDRY_MODEL");
+    env.remove("FOUNDRY_MAAS_MODEL");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_MODEL");
+    env.remove("AZURE_MODEL_INFERENCE_MODEL");
+    env.remove("NANOCLAW_AZURE_MODEL_INFERENCE_MODEL");
     env.remove("AZURE_OPENAI_DEPLOYMENT_NAME");
     env.remove("NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME");
     env.remove("AZURE_AI_FOUNDRY_DEPLOYMENT_NAME");
@@ -1634,12 +1677,31 @@ fn codespaces_runtime_env(mut env: BTreeMap<String, String>) -> BTreeMap<String,
     env.remove("NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION");
     env.remove("AZURE_FOUNDRY_API_VERSION");
     env.remove("NANOCLAW_AZURE_FOUNDRY_API_VERSION");
+    env.remove("FOUNDRY_MAAS_API_VERSION");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_API_VERSION");
+    env.remove("AZURE_MODEL_INFERENCE_API_VERSION");
+    env.remove("NANOCLAW_AZURE_MODEL_INFERENCE_API_VERSION");
+    env.remove("FOUNDRY_MAAS_INPUT_USD_PER_1M");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_INPUT_USD_PER_1M");
+    env.remove("AZURE_AI_FOUNDRY_INPUT_USD_PER_1M");
+    env.remove("NANOCLAW_AZURE_AI_FOUNDRY_INPUT_USD_PER_1M");
+    env.remove("FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M");
+    env.remove("AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M");
+    env.remove("NANOCLAW_AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M");
+    env.remove("FOUNDRY_MAAS_OUTPUT_USD_PER_1M");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_OUTPUT_USD_PER_1M");
+    env.remove("AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M");
+    env.remove("NANOCLAW_AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M");
     env.remove("NANOCLAW_AZURE_OPENAI_RATE_CARD_JSON");
     env.remove("AZURE_OPENAI_RATE_CARD_JSON");
     env.remove("NANOCLAW_AZURE_AI_FOUNDRY_RATE_CARD_JSON");
     env.remove("AZURE_AI_FOUNDRY_RATE_CARD_JSON");
     env.remove("NANOCLAW_AZURE_FOUNDRY_RATE_CARD_JSON");
     env.remove("AZURE_FOUNDRY_RATE_CARD_JSON");
+    env.remove("NANOCLAW_FOUNDRY_MAAS_FALLBACK_BACKEND");
+    env.remove("NANOCLAW_AZURE_AI_FOUNDRY_FALLBACK_BACKEND");
+    env.remove("NANOCLAW_AZURE_FOUNDRY_FALLBACK_BACKEND");
     env.insert(
         "PAPERCLIP_REMOTE_HANDOFF".to_string(),
         "gateway_writeback".to_string(),
@@ -1926,6 +1988,10 @@ fn deployment_for_gateway_model_slot(slot: GatewayModelSlot) -> Option<String> {
         "AZURE_AI_FOUNDRY_MODEL",
         "NANOCLAW_AZURE_FOUNDRY_MODEL",
         "AZURE_FOUNDRY_MODEL",
+        "NANOCLAW_AZURE_MODEL_INFERENCE_MODEL",
+        "AZURE_MODEL_INFERENCE_MODEL",
+        "NANOCLAW_FOUNDRY_MAAS_MODEL",
+        "FOUNDRY_MAAS_MODEL",
     ])
 }
 
@@ -2029,7 +2095,10 @@ fn gateway_runtime_env(
             .as_deref()
             .or_else(|| {
                 (!suppress_generic_model
-                    && !matches!(backend_hint.as_ref(), Some(WorkerBackend::AzureOpenAI)))
+                    && !matches!(
+                        backend_hint.as_ref(),
+                        Some(WorkerBackend::AzureOpenAI | WorkerBackend::FoundryMaaS)
+                    ))
                 .then_some(gateway.model.as_deref())
                 .flatten()
             })
@@ -2067,6 +2136,24 @@ fn gateway_runtime_env(
                 deployment.to_string(),
             );
         }
+        if let Some(model) = gateway
+            .azure_model
+            .as_deref()
+            .or(gateway.azure_deployment.as_deref())
+            .or_else(|| {
+                (!suppress_generic_model
+                    && matches!(backend_hint.as_ref(), Some(WorkerBackend::FoundryMaaS)))
+                .then_some(gateway.model.as_deref())
+                .flatten()
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            env.insert(
+                "NANOCLAW_AZURE_AI_FOUNDRY_MODEL".to_string(),
+                model.to_string(),
+            );
+        }
         if let Some(endpoint) = gateway
             .azure_endpoint
             .as_deref()
@@ -2077,6 +2164,12 @@ fn gateway_runtime_env(
                 "NANOCLAW_AZURE_OPENAI_ENDPOINT".to_string(),
                 endpoint.to_string(),
             );
+            if matches!(backend_hint.as_ref(), Some(WorkerBackend::FoundryMaaS)) {
+                env.insert(
+                    "NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT".to_string(),
+                    endpoint.to_string(),
+                );
+            }
         }
         if let Some(api_version) = gateway
             .azure_api_version
@@ -2088,6 +2181,12 @@ fn gateway_runtime_env(
                 "NANOCLAW_AZURE_OPENAI_API_VERSION".to_string(),
                 api_version.to_string(),
             );
+            if matches!(backend_hint.as_ref(), Some(WorkerBackend::FoundryMaaS)) {
+                env.insert(
+                    "NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION".to_string(),
+                    api_version.to_string(),
+                );
+            }
         }
         if let Some(fallback_backend) = gateway
             .azure_fallback_backend
@@ -2148,13 +2247,31 @@ fn gateway_runtime_env(
             route.reason.clone(),
         );
         if let Some(deployment) = route.deployment.as_deref() {
-            env.entry("NANOCLAW_AZURE_OPENAI_DEPLOYMENT".to_string())
-                .or_insert_with(|| deployment.to_string());
-            env.entry("NANOCLAW_AZURE_AI_FOUNDRY_MODEL".to_string())
-                .or_insert_with(|| deployment.to_string());
+            match route.backend {
+                WorkerBackend::FoundryMaaS => {
+                    env.entry("NANOCLAW_AZURE_AI_FOUNDRY_MODEL".to_string())
+                        .or_insert_with(|| deployment.to_string());
+                }
+                WorkerBackend::AzureOpenAI => {
+                    env.entry("NANOCLAW_AZURE_OPENAI_DEPLOYMENT".to_string())
+                        .or_insert_with(|| deployment.to_string());
+                    env.entry("NANOCLAW_AZURE_AI_FOUNDRY_MODEL".to_string())
+                        .or_insert_with(|| deployment.to_string());
+                }
+                _ => {
+                    env.entry("NANOCLAW_AZURE_OPENAI_DEPLOYMENT".to_string())
+                        .or_insert_with(|| deployment.to_string());
+                    env.entry("NANOCLAW_AZURE_AI_FOUNDRY_MODEL".to_string())
+                        .or_insert_with(|| deployment.to_string());
+                }
+            }
         }
         if matches!(route.backend, WorkerBackend::AzureOpenAI) {
             env.entry("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND".to_string())
+                .or_insert_with(|| "codex".to_string());
+        }
+        if matches!(route.backend, WorkerBackend::FoundryMaaS) {
+            env.entry("NANOCLAW_FOUNDRY_MAAS_FALLBACK_BACKEND".to_string())
                 .or_insert_with(|| "codex".to_string());
         }
         if matches!(route.backend, WorkerBackend::Codex) {
@@ -3483,6 +3600,50 @@ mod tests {
                 .map(String::as_str),
             Some("zai")
         );
+        assert!(!env.contains_key("NANOCLAW_ZAI_MODEL"));
+    }
+
+    #[test]
+    fn gateway_hints_can_select_foundry_maas_backend_and_model() {
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                gateway: Some(GatewayHints {
+                    execution_lane: Some("host".to_string()),
+                    worker_backend: Some("foundry-maas".to_string()),
+                    model: Some("DeepSeek-V3.2".to_string()),
+                    azure_endpoint: Some(
+                        "https://example.services.ai.azure.com/models".to_string(),
+                    ),
+                    azure_api_version: Some("2024-05-01-preview".to_string()),
+                    azure_fallback_backend: Some("codex".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            gateway_backend_override(&params),
+            Some(WorkerBackend::FoundryMaaS)
+        );
+        let env = gateway_runtime_env(&params, None, None);
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_AI_FOUNDRY_MODEL")
+                .map(String::as_str),
+            Some("DeepSeek-V3.2")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT")
+                .map(String::as_str),
+            Some("https://example.services.ai.azure.com/models")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION")
+                .map(String::as_str),
+            Some("2024-05-01-preview")
+        );
+        assert!(!env.contains_key("NANOCLAW_AZURE_OPENAI_DEPLOYMENT"));
         assert!(!env.contains_key("NANOCLAW_ZAI_MODEL"));
     }
 

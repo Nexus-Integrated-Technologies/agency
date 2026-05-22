@@ -11,9 +11,13 @@ remain inspectable.
 
 - Primary gateway backend: `azure-openai`
 - Azure deployment: currently `nanoclaw-gpt-4-1-mini`; Foundry deployments such
-  as `DeepSeek-V3.1`, `DeepSeek-R1-0528`, Mistral, Grok, Llama, or Model Router
-  can be selected by changing the deployment/model env without bypassing the
-  gateway.
+  as `service01-foundry-tiny`, `service01-foundry-planner`,
+  `service01-foundry-reasoner`, and related slots can be selected by changing
+  the deployment/model env without bypassing the gateway.
+- Azure AI Foundry MaaS backend: `foundry-maas`, used for marketplace/provider
+  models such as DeepSeek, Kimi, Mistral, Grok, Llama, or Model Router when
+  those are exposed through the Azure AI Model Inference/OpenAI-compatible
+  Foundry endpoint rather than as Azure OpenAI deployments.
 - Azure fallback backend: `codex`
 - Codex usage-limit fallback: `azure-openai`, configurable with
   `NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND`
@@ -51,14 +55,20 @@ NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND=codex
 NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND=azure-openai
 ```
 
-Foundry `AIServices` resources are supported through either endpoint shape:
+Azure OpenAI-compatible deployments are supported through the `azure-openai`
+backend:
 
 ```text
-# Deployment-scoped OpenAI-compatible route, including non-OpenAI Foundry deployments
+# Deployment-scoped Azure OpenAI route
 NANOCLAW_AZURE_OPENAI_ENDPOINT=https://<resource>.services.ai.azure.com
 NANOCLAW_AZURE_OPENAI_DEPLOYMENT=<deployment-name>
 NANOCLAW_AZURE_OPENAI_API_VERSION=2024-10-21
+```
 
+Foundry MaaS/provider models are supported through the dedicated `foundry-maas`
+backend:
+
+```text
 # Foundry project endpoint copied from the Foundry portal
 NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project-name>
 NANOCLAW_AZURE_AI_FOUNDRY_MODEL=<deployment-name>
@@ -67,6 +77,11 @@ NANOCLAW_AZURE_AI_FOUNDRY_MODEL=<deployment-name>
 NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/models
 NANOCLAW_AZURE_AI_FOUNDRY_MODEL=<deployment-or-model-name>
 NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION=2024-05-01-preview
+
+# Equivalent explicit model-inference aliases
+NANOCLAW_AZURE_MODEL_INFERENCE_ENDPOINT=https://<resource>.services.ai.azure.com/models
+NANOCLAW_AZURE_MODEL_INFERENCE_MODEL=<deployment-or-model-name>
+NANOCLAW_AZURE_MODEL_INFERENCE_API_VERSION=2024-05-01-preview
 ```
 
 Per-run gateway hints can override provider routing without changing the
@@ -88,6 +103,7 @@ container:
 Supported `workerBackend` values include:
 
 - `azure-openai`
+- `foundry-maas`
 - `codex`
 - `zai`
 - `github-copilot`
@@ -96,6 +112,7 @@ Supported `workerBackend` values include:
 Supported Azure fallback values now include:
 
 - `codex`
+- `foundry-maas`
 - `zai`
 - `workers-ai`
 - `disabled`
@@ -136,6 +153,17 @@ NANOCLAW_AZURE_AI_FOUNDRY_RATE_CARD_JSON={
 Use the actual Azure pricing shown for the deployed model/region. The gateway
 uses this only for estimates; Azure Cost Management remains the financial
 source of truth.
+
+For `foundry-maas`, per-model rate cards are preferred because marketplace
+model pricing varies materially by provider:
+
+```text
+NANOCLAW_MODEL_ROUTE_PLANNER_BACKEND=foundry-maas
+NANOCLAW_MODEL_ROUTE_PLANNER_MODEL=DeepSeek-V3.2
+NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/models
+NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION=2024-05-01-preview
+NANOCLAW_AZURE_AI_FOUNDRY_RATE_CARD_JSON={"DeepSeek-V3.2":{"input_usd_per_1m":0.27,"cached_input_usd_per_1m":0.07,"output_usd_per_1m":1.10}}
+```
 
 ## Service01 Model Matrix
 
@@ -348,3 +376,16 @@ python3 scripts/openclaw_azure_paid_smoke.py
 The command invokes `nanoclaw exec-worker-stdio` with
 `backend_override=AzureOpenAI` and prints only sanitized metadata. It performs a
 real paid provider call.
+
+For a Foundry MaaS/provider-model smoke, configure
+`NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT`, `NANOCLAW_AZURE_AI_FOUNDRY_MODEL`, and the
+matching key, then run:
+
+```bash
+python3 scripts/openclaw_foundry_maas_paid_smoke.py
+```
+
+That command invokes `nanoclaw exec-worker-stdio` with
+`backend_override=FoundryMaaS` and prints only sanitized metadata. It also
+performs a real paid provider call, so do not run it from timers or automated
+heartbeats.
