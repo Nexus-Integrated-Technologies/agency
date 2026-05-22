@@ -3,6 +3,14 @@ name = "rust_agency"
 version = "0.2.0"
 edition = "2021"
 default-run = "nanoclaw"
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+[[bin]]
+name = "nanoclaw"
+path = "src/bin/nanoclaw.rs"
 
 [features]
 default = []

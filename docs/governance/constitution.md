@@ -1,15 +1,29 @@
 # Agency Governance Constitution Design
 
+Status: parked reference material.
+
+This document is a historical Agency design note. It is not the active
+Nexus/Rust NanoClaw runtime contract, and no operator should infer that the
+runtime currently implements autonomous rights adjudication, World Chain
+identity, value transfer, constitutional appeals, or the old FPF governance
+service graph from this document.
+
+The active runtime path is narrower: execution must pass through NanoClaw
+adapters, evidence envelopes, completion gates, command safety, output safety,
+and operator-visible runtime status/health surfaces. Any governance concept
+from this document needs a clean-room runtime contract before it can re-enter
+`src/foundation/` or `src/nanoclaw/`.
+
 ## Three-Pillar Framework
 
-Agency implements a three-pillar framework for autonomous AI systems:
+This parked design proposed a three-pillar framework for autonomous AI systems:
 
-**Pillar 1: The Artificial Human (Agency)** ✅
+**Pillar 1: The Artificial Human (Agency)** parked reference
 - Technical substrate for AI autonomy
 - Nervous system: Nexus, Memory, Speaker, Listener
 - ReAct reasoning + First Principle Framework (FPF)
 
-**Pillar 3: Value Capture Mechanisms (World Chain)** ✅
+**Pillar 3: Value Capture Mechanisms (World Chain)** parked reference
 - Multi-chain economic ledger (wallet.rs)
 - Supports Bitcoin, Ethereum, Solana, Base, Worldchain
 - Links to EconomicMetabolism trait

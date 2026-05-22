@@ -1,46 +1,16 @@
-#!/bin/bash
-# bundle_onnx.sh - Portable Library Bundling
-# 
-# Locates and bundles the finicky libonnxruntime.dylib
-# to ensure the agency organism is portable across environments.
+#!/bin/sh
+set -eu
 
-set -e
+cat >&2 <<'MSG'
+scripts/bundle_onnx.sh is a legacy Agency model-artifact helper.
 
-DYLIB_NAME="libonnxruntime.dylib"
-DEST_DIR="artifacts/bin"
-PROJECT_ROOT=$(pwd)
+The active Nexus Rust NanoClaw runtime does not use the old proof_of_life
+binary or ONNX runtime bootstrap path. The original helper is parked at:
 
-echo "📦 Bundling $DYLIB_NAME..."
+  graveyard/agency-harness/scripts/bundle_onnx.sh
 
-# 1. Create destination
-mkdir -p "$DEST_DIR"
+If a future model lane needs this behavior, clean-room it into a typed runtime
+provider contract and keep validation under `make verify`.
+MSG
 
-# 2. Search for the correct version (>= 1.23.x preferred)
-# We search in target/ and src-tauri/target/
-echo "🔍 Searching for library in build artifacts..."
-FOUND_PATH=$(find . -name "$DYLIB_NAME" -not -path "*/artifacts/*" | head -n 1)
-
-if [ -z "$FOUND_PATH" ]; then
-    echo "⚠️  $DYLIB_NAME not found in build tree."
-    echo "💡 Run 'cargo run --bin proof_of_life' once with ORT_STRATEGY=download to fetch it."
-    exit 1
-fi
-
-echo "✅ Found at: $FOUND_PATH"
-
-# 3. Copy to artifacts
-cp "$FOUND_PATH" "$DEST_DIR/"
-echo "✅ Copied to $DEST_DIR/"
-
-# 4. Create symbolic link in root for runtime loading
-if [ ! -f "$DYLIB_NAME" ]; then
-    ln -s "$DEST_DIR/$DYLIB_NAME" "$DYLIB_NAME"
-    echo "✅ Created symlink in project root."
-fi
-
-# 5. Output hardening advice
-echo ""
-echo "🚀 Bundling complete."
-echo "💡 To run the agency portably, use: "
-echo "   export ORT_DYLIB_PATH=\$PWD/artifacts/bin/$DYLIB_NAME"
-echo ""
+exit 2

@@ -1,10 +1,26 @@
 # Governance System (Pillar 2)
 
-Agency implements a sophisticated governance framework that aligns with the First Principle Framework (FPF) and enables principled agent-human interaction.
+Status: parked reference material.
+
+This document describes an older Agency governance design. It is not the active
+Nexus/Rust NanoClaw runtime contract, and it must not be used as operator proof
+that constitutional courts, World Chain identity, autonomous value transfer, or
+old FPF governance services are implemented.
+
+Active runtime authority currently lives in the NanoClaw evidence and closure
+gates:
+
+- `src/foundation/`
+- `src/nanoclaw/`
+- `docs/agency-capability-adoption-ledger.md`
+- `docs/nanoclaw-rs-collapse-audit.md`
+
+Governance ideas may be clean-roomed into active runtime primitives only after
+they receive a narrow contract, tests, and operator-visible evidence.
 
 ## Overview
 
-The governance system addresses three critical concerns:
+This parked design explored these concerns:
 
 1. **Agent Rights & Autonomy** - What agents can do without human approval
 2. **Human Oversight** - How humans can intervene, with four override levels
@@ -120,23 +136,25 @@ if !governance::constitution::may_perform(&action) {
 
 ## Implementation Status
 
-**Phase 1 (Core Governance)**: ⚠️ INCOMPLETE
+**Runtime status**: parked reference, not active runtime behavior.
+
+**Phase 1 (Core Governance)**: parked / incomplete
 - [ ] `constitution.rs` - Core rights and obligations
 - [ ] `oversight.rs` - Four-level override system
 - [ ] `attribution.rs` - Value tracking and claims
 
-**Phase 2 (Dispute Resolution)**: ⚠️ INCOMPLETE
+**Phase 2 (Dispute Resolution)**: parked / incomplete
 - [ ] `dispute.rs` - Peer review system
 - [ ] `voting.rs` - Human adjudication
 - [ ] `reputation.rs` - Identity verification
 
-**Phase 3 (World Chain Integration)**: ⚠️ INCOMPLETE
+**Phase 3 (World Chain Integration)**: parked / incomplete
 - [ ] `worldchain.rs` - Client integration
 - [ ] On-chain identity registration
 - [ ] Reputation anchoring
 - [ ] Constitutional voting
 
-**Phase 4 (Constitutional Appeals)**: ⚠️ INCOMPLETE
+**Phase 4 (Constitutional Appeals)**: parked / incomplete
 - [ ] Constitutional court implementation
 - [ ] Appeals process
 - [ ] Expert panel selection

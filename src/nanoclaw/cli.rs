@@ -1,18 +1,27 @@
-use std::fs;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
+use rusqlite::{Connection, OpenFlags};
+use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::foundation::{
-    ExecutionLane, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
+    ExecutionLane, Group, HostOsControlApprovalDecision, HostOsControlApprovalStatus, RequestPlane,
     TaskContextMode, TaskScheduleType, TaskStatus,
 };
 
 use super::dev_environment::DigitalOceanDevEnvironment;
 use super::executor::{
-    run_worker_daemon, run_worker_from_paths, run_worker_stdio, ExecutionLaneRouter,
+    build_execution_session, run_worker_daemon, run_worker_from_paths, run_worker_stdio,
+    ExecutionLaneRouter,
 };
 use super::github_webhook::{handle_github_webhook, GithubWebhookPayload};
+use super::group_runtime_config::GroupRuntimeConfig;
 use super::host_os_control::{
     approval_notification_text, build_default_context, replay_approved_host_os_control_request,
     resolution_notification_text, resolve_host_os_control_request, run_host_os_control_task,
@@ -24,7 +33,7 @@ use super::linear::{
     LinearIssueCommentUpsertTaskInput, LinearIssueQualityTaskInput, LinearIssueTransitionTaskInput,
     LinearPmMemoryTaskInput, LinearTeamsTaskInput,
 };
-use super::local_channel::LocalInboundEnvelope;
+use super::local_channel::{LocalChannel, LocalInboundEnvelope};
 use super::observability::{
     ingest_observability_event, ObservabilityEventStatus, ObservabilitySeverity,
 };
@@ -32,21 +41,4510 @@ use super::openclaw_gateway::{describe_openclaw_gateway_readiness, start_opencla
 use super::pm_automation::start_pm_automation_loop;
 use super::remote_control::{build_remote_control_context, describe_remote_control};
 use super::runtime::LocalRuntime;
+use super::runtime_channels::{
+    runtime_channel_registry, RuntimeChannelDescriptor, RuntimeChannelRegistry,
+    RuntimeChannelStatus,
+};
 use super::scheduler::TaskScheduleInput;
 use super::service_slack::{ensure_registered_group, send_recorded_slack_message};
+use super::session_storage::{
+    ensure_session_sidecars, record_on_wake_message, session_sidecar_paths,
+};
 use super::slack::SlackChannel;
 use super::slack_runtime::SlackRuntime;
+use super::source_disposition::source_disposition_report;
 use super::swarm::{
     cancel_swarm_objective_run, create_swarm_objective_run, get_swarm_run_details,
     list_swarm_run_details, pump_swarm_once, CreateSwarmObjectiveRunInput,
+};
+use super::tool_registry::{
+    built_in_tool_adapter_contracts, load_external_tool_adapter_contracts,
+    validate_built_in_tool_adapter_contracts,
 };
 use super::webhook_server::start_webhook_server;
 use super::{NanoclawApp, NanoclawConfig};
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -- [bootstrap|show-config|gateway <show-config>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <teams|issue-quality|pm-memory|comment-upsert|transition>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
+        "usage: cargo run -- [bootstrap|show-config|runtime <status|state|state-action|source-disposition|inspect|health|repair|cleanup|poll|serve|stop|reload>|group-runtime <show|set>|session <show|wake>|gateway <show-config|serve>|provenance <list|show>|approval <list|show|resolve>|host-os <run|replay>|swarm <create|list|show|cancel|pump>|observability <ingest|list|show>|remote-control <status|run|replay>|task <list|due|add|pause|resume|delete|complete --manual-override|run-due>|local <send|run|outbox>|slack <run|import-groups>|linear <legacy>|github-webhook <event-type> <payload-file>|show-dev-env|prepare-dev-env|seed-cargo-cache|sync-dev-env|exec-dev-env <command...>]"
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeServeProfile {
+    Full,
+    Gateway,
+    Webhook,
+    Pm,
+    Slack,
+}
+
+impl RuntimeServeProfile {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "full" => Ok(Self::Full),
+            "gateway" => Ok(Self::Gateway),
+            "webhook" => Ok(Self::Webhook),
+            "pm" => Ok(Self::Pm),
+            "slack" => Ok(Self::Slack),
+            other => anyhow::bail!("unsupported runtime serve profile '{}'", other),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Gateway => "gateway",
+            Self::Webhook => "webhook",
+            Self::Pm => "pm",
+            Self::Slack => "slack",
+        }
+    }
+
+    fn all() -> [Self; 5] {
+        [
+            Self::Full,
+            Self::Gateway,
+            Self::Webhook,
+            Self::Pm,
+            Self::Slack,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeServeArgs {
+    profile: RuntimeServeProfile,
+    lane_override: Option<ExecutionLane>,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeCleanupArgs {
+    apply: bool,
+    include_state_residue: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeHealthArgs {
+    limit: usize,
+    strict: bool,
+    notify_local: Option<String>,
+    notify_always: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRepairMode {
+    Plan,
+    Apply,
+}
+
+impl RuntimeRepairMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeRepairArgs {
+    mode: RuntimeRepairMode,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeStateActionMode {
+    Plan,
+    Apply,
+}
+
+impl RuntimeStateActionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeStateActionArgs {
+    mode: RuntimeStateActionMode,
+    limit: usize,
+    confirm: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskCompleteArgs {
+    task_id: String,
+    result: Option<String>,
+}
+
+fn parse_task_complete_args<I>(args: &mut I) -> Result<TaskCompleteArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut manual_override = false;
+    let mut values = Vec::<String>::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--manual-override" => manual_override = true,
+            other if other.starts_with("--") => {
+                anyhow::bail!("unexpected task complete argument '{}'", other)
+            }
+            _ => values.push(arg),
+        }
+    }
+
+    if !manual_override {
+        anyhow::bail!(
+            "task complete requires --manual-override; execution-driven completion must use structured execution evidence"
+        );
+    }
+    let Some(task_id) = values.first().cloned() else {
+        anyhow::bail!("task complete requires a task id");
+    };
+    let result = values
+        .get(1..)
+        .unwrap_or_default()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    Ok(TaskCompleteArgs {
+        task_id,
+        result: (!result.is_empty()).then_some(result),
+    })
+}
+
+fn parse_runtime_serve_args<I>(args: &mut I) -> Result<RuntimeServeArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut profile = RuntimeServeProfile::Full;
+    let mut lane_override = None::<ExecutionLane>;
+    let mut read_only = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                profile = RuntimeServeProfile::parse(&value)?;
+            }
+            "--lane" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                lane_override = Some(ExecutionLane::parse(&value));
+            }
+            "--read-only" => read_only = true,
+            other => anyhow::bail!("unexpected runtime serve argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeServeArgs {
+        profile,
+        lane_override,
+        read_only,
+    })
+}
+
+fn parse_runtime_control_args<I>(args: &mut I, label: &str) -> Result<RuntimeServeProfile>
+where
+    I: Iterator<Item = String>,
+{
+    let mut profile = RuntimeServeProfile::Full;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                profile = RuntimeServeProfile::parse(&value)?;
+            }
+            other => anyhow::bail!("unexpected runtime {label} argument '{}'", other),
+        }
+    }
+
+    Ok(profile)
+}
+
+fn parse_runtime_cleanup_args<I>(args: &mut I) -> Result<RuntimeCleanupArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut apply = false;
+    let mut include_state_residue = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--state-residue" => include_state_residue = true,
+            other => anyhow::bail!("unexpected runtime cleanup argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeCleanupArgs {
+        apply,
+        include_state_residue,
+    })
+}
+
+fn parse_runtime_health_args<I>(args: &mut I) -> Result<RuntimeHealthArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = 10;
+    let mut strict = false;
+    let mut notify_local = None::<String>;
+    let mut notify_always = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid runtime health --limit value {value}"))?
+                    .max(1);
+            }
+            "--strict" => strict = true,
+            "--notify-local" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    anyhow::bail!("runtime health --notify-local requires a non-empty chat id");
+                }
+                notify_local = Some(value);
+            }
+            "--notify-always" => notify_always = true,
+            other => anyhow::bail!("unexpected runtime health argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeHealthArgs {
+        limit,
+        strict,
+        notify_local,
+        notify_always,
+    })
+}
+
+fn parse_runtime_repair_args<I>(args: &mut I) -> Result<RuntimeRepairArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = 10;
+    let mut mode = None::<RuntimeRepairMode>;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--plan" => {
+                if mode.replace(RuntimeRepairMode::Plan).is_some() {
+                    anyhow::bail!("runtime repair accepts only one of --plan or --apply");
+                }
+            }
+            "--apply" => {
+                if mode.replace(RuntimeRepairMode::Apply).is_some() {
+                    anyhow::bail!("runtime repair accepts only one of --plan or --apply");
+                }
+            }
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid runtime repair --limit value {value}"))?
+                    .max(1);
+            }
+            other => anyhow::bail!("unexpected runtime repair argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeRepairArgs {
+        mode: mode.unwrap_or(RuntimeRepairMode::Plan),
+        limit,
+    })
+}
+
+fn parse_runtime_state_action_args<I>(args: &mut I) -> Result<RuntimeStateActionArgs>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = 10;
+    let mut mode = None::<RuntimeStateActionMode>;
+    let mut confirm = None::<String>;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--plan" => {
+                if mode.replace(RuntimeStateActionMode::Plan).is_some() {
+                    anyhow::bail!("runtime state-action accepts only one of --plan or --apply");
+                }
+            }
+            "--apply" => {
+                if mode.replace(RuntimeStateActionMode::Apply).is_some() {
+                    anyhow::bail!("runtime state-action accepts only one of --plan or --apply");
+                }
+            }
+            "--confirm" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    anyhow::bail!("runtime state-action --confirm requires a non-empty action id");
+                }
+                confirm = Some(value);
+            }
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid runtime state-action --limit value {value}"))?
+                    .max(1);
+            }
+            other => anyhow::bail!("unexpected runtime state-action argument '{}'", other),
+        }
+    }
+
+    Ok(RuntimeStateActionArgs {
+        mode: mode.unwrap_or(RuntimeStateActionMode::Plan),
+        limit,
+        confirm,
+    })
+}
+
+fn parse_limit_args<I>(args: &mut I, default_limit: usize, label: &str) -> Result<usize>
+where
+    I: Iterator<Item = String>,
+{
+    let mut limit = default_limit;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let Some(value) = args.next() else {
+                    print_usage();
+                    std::process::exit(2);
+                };
+                limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid {label} --limit value {value}"))?
+                    .max(1);
+            }
+            other => anyhow::bail!("unexpected {label} argument '{}'", other),
+        }
+    }
+    Ok(limit)
+}
+
+fn runtime_control_dir(config: &NanoclawConfig) -> PathBuf {
+    config.data_dir.join("runtime")
+}
+
+fn runtime_pid_path(config: &NanoclawConfig, profile: RuntimeServeProfile) -> PathBuf {
+    runtime_control_dir(config).join(format!("{}.pid", profile.as_str()))
+}
+
+fn runtime_startup_events_path(config: &NanoclawConfig) -> PathBuf {
+    runtime_control_dir(config).join("startup-events.jsonl")
+}
+
+fn runtime_pid_status_json(config: &NanoclawConfig) -> serde_json::Value {
+    let mut profiles = serde_json::Map::new();
+    for profile in RuntimeServeProfile::all() {
+        let profile_state = runtime_pid_profile_state_json(config, profile);
+        profiles.insert(
+            profile.as_str().to_string(),
+            json!({
+                "pidFile": profile_state["pidFile"],
+                "pid": profile_state["pid"],
+                "pidFileExists": profile_state["pidFileExists"],
+            }),
+        );
+    }
+    json!({
+        "controlDir": runtime_control_dir(config).display().to_string(),
+        "profiles": profiles,
+    })
+}
+
+struct RuntimePidFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for RuntimePidFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn write_runtime_pid_file(
+    config: &NanoclawConfig,
+    profile: RuntimeServeProfile,
+) -> Result<RuntimePidFileGuard> {
+    let control_dir = runtime_control_dir(config);
+    fs::create_dir_all(&control_dir)
+        .with_context(|| format!("failed to create {}", control_dir.display()))?;
+    let path = runtime_pid_path(config, profile);
+    fs::write(&path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(RuntimePidFileGuard { path })
+}
+
+fn read_runtime_pid(path: &Path) -> Result<u32> {
+    let value =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid runtime pid file {}", path.display()))
+}
+
+fn signal_runtime_profile(
+    config: &NanoclawConfig,
+    profile: RuntimeServeProfile,
+    signal: &str,
+    remove_pid_file_on_success: bool,
+) -> Result<()> {
+    let path = runtime_pid_path(config, profile);
+    let pid = read_runtime_pid(&path)?;
+    let status = Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to invoke kill for pid {pid}"))?;
+    if !status.success() {
+        anyhow::bail!(
+            "failed to signal runtime profile '{}' pid {} with {}: {}",
+            profile.as_str(),
+            pid,
+            signal,
+            status
+        );
+    }
+    if remove_pid_file_on_success {
+        let _ = fs::remove_file(&path);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "profile": profile.as_str(),
+            "pid": pid,
+            "signal": signal,
+            "pidFile": path.display().to_string(),
+        }))?
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeHealthCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl RuntimeHealthCheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+
+    fn severity(self) -> &'static str {
+        match self {
+            Self::Pass => "info",
+            Self::Warn => "warning",
+            Self::Fail => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeHealthCheck {
+    id: &'static str,
+    status: RuntimeHealthCheckStatus,
+    message: String,
+    evidence: Value,
+}
+
+fn runtime_health_check(
+    id: &'static str,
+    status: RuntimeHealthCheckStatus,
+    message: impl Into<String>,
+    evidence: Value,
+) -> RuntimeHealthCheck {
+    RuntimeHealthCheck {
+        id,
+        status,
+        message: message.into(),
+        evidence,
+    }
+}
+
+fn runtime_health_check_json(check: &RuntimeHealthCheck) -> Value {
+    json!({
+        "id": check.id,
+        "status": check.status.as_str(),
+        "severity": check.status.severity(),
+        "message": check.message,
+        "evidence": check.evidence,
+    })
+}
+
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn runtime_pid_profile_state_json(config: &NanoclawConfig, profile: RuntimeServeProfile) -> Value {
+    let pid_file = runtime_pid_path(config, profile);
+    if !pid_file.exists() {
+        return json!({
+            "profile": profile.as_str(),
+            "pidFile": pid_file.display().to_string(),
+            "pidFileExists": false,
+            "pid": null,
+            "state": "absent",
+            "running": false,
+        });
+    }
+
+    match fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        Some(pid) => {
+            let running = process_is_running(pid);
+            json!({
+                "profile": profile.as_str(),
+                "pidFile": pid_file.display().to_string(),
+                "pidFileExists": true,
+                "pid": pid,
+                "state": if running { "running" } else { "stale" },
+                "running": running,
+            })
+        }
+        None => json!({
+            "profile": profile.as_str(),
+            "pidFile": pid_file.display().to_string(),
+            "pidFileExists": true,
+            "pid": null,
+            "state": "invalid",
+            "running": false,
+        }),
+    }
+}
+
+fn append_runtime_startup_event(config: &NanoclawConfig, event: &Value) -> Result<()> {
+    let control_dir = runtime_control_dir(config);
+    fs::create_dir_all(&control_dir)
+        .with_context(|| format!("failed to create {}", control_dir.display()))?;
+    let path = runtime_startup_events_path(config);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(event)?)
+        .with_context(|| format!("failed to append {}", path.display()))?;
+    Ok(())
+}
+
+fn record_runtime_startup_event(
+    config: &NanoclawConfig,
+    serve_args: &RuntimeServeArgs,
+    phase: &str,
+    status: &str,
+    message: impl Into<String>,
+    evidence: Value,
+) -> Result<Value> {
+    let event = json!({
+        "schemaVersion": "2026-05-20",
+        "eventId": Uuid::new_v4().to_string(),
+        "timestamp": Utc::now().to_rfc3339(),
+        "profile": serve_args.profile.as_str(),
+        "phase": phase,
+        "status": status,
+        "readOnly": serve_args.read_only,
+        "laneOverride": serve_args.lane_override.as_ref().map(ExecutionLane::as_str),
+        "processId": std::process::id(),
+        "message": message.into(),
+        "evidence": evidence,
+    });
+    append_runtime_startup_event(config, &event)?;
+    Ok(event)
+}
+
+fn runtime_startup_events_json(config: &NanoclawConfig, limit: usize) -> Value {
+    let path = runtime_startup_events_path(config);
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let mut total_records = 0usize;
+            let mut invalid_records = 0usize;
+            let mut recent = Vec::<Value>::new();
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                total_records += 1;
+                match serde_json::from_str::<Value>(line) {
+                    Ok(value) => {
+                        recent.push(value);
+                    }
+                    Err(error) => {
+                        invalid_records += 1;
+                        recent.push(json!({
+                            "schemaVersion": "2026-05-20",
+                            "status": "invalid",
+                            "message": "runtime startup event record could not be parsed",
+                            "error": error.to_string(),
+                        }));
+                    }
+                }
+                if recent.len() > limit {
+                    recent.remove(0);
+                }
+            }
+            json!({
+                "file": path_state_json(&path),
+                "totalRecords": total_records,
+                "invalidRecords": invalid_records,
+                "shown": recent.len(),
+                "recent": recent,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+            "file": path_state_json(&path),
+            "totalRecords": 0,
+            "invalidRecords": 0,
+            "shown": 0,
+            "recent": [],
+        }),
+        Err(error) => json!({
+            "file": path_state_json(&path),
+            "totalRecords": null,
+            "invalidRecords": null,
+            "shown": 0,
+            "recent": [],
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn runtime_startup_failure_summary(events: &Value) -> (usize, BTreeMap<String, usize>, Value) {
+    let mut failed = 0usize;
+    let mut by_profile = BTreeMap::<String, usize>::new();
+    let mut latest_failed = Value::Null;
+
+    if let Some(recent_events) = events.get("recent").and_then(Value::as_array) {
+        for event in recent_events {
+            if event.get("status").and_then(Value::as_str) != Some("failed") {
+                continue;
+            }
+            failed += 1;
+            let profile = event
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            *by_profile.entry(profile).or_default() += 1;
+            latest_failed = event.clone();
+        }
+    }
+
+    (failed, by_profile, latest_failed)
+}
+
+fn runtime_missing_config_recovery_suggestion(
+    profile: &str,
+    channel_id: &str,
+    missing_config: &str,
+) -> Value {
+    let restart_profile = match profile {
+        "full" | "gateway" | "webhook" | "pm" | "slack" => profile,
+        _ => match channel_id {
+            "openclaw_gateway" => "gateway",
+            "github_webhook" => "webhook",
+            "observability_webhook" => "webhook",
+            "slack_socket" => "slack",
+            "pm_automation" => "pm",
+            _ => profile,
+        },
+    };
+
+    match missing_config {
+        "NANOCLAW_OPENCLAW_GATEWAY_TOKEN" => json!({
+            "key": "openclaw_gateway_token",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Set NANOCLAW_OPENCLAW_GATEWAY_TOKEN in the runtime secret source, then restart the gateway-capable runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_secret",
+                    "target": "NANOCLAW_OPENCLAW_GATEWAY_TOKEN",
+                    "description": "Generate or retrieve a high-entropy gateway token and set it in the launch/service environment; do not commit it to the repo."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the token is present."
+                }
+            ],
+        }),
+        "NANOCLAW_OPENCLAW_GATEWAY_PORT" => json!({
+            "key": "openclaw_gateway_port",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Set NANOCLAW_OPENCLAW_GATEWAY_PORT to a nonzero control-plane port, then restart the gateway-capable runtime profile.",
+            "requiresSecret": false,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_config",
+                    "target": "NANOCLAW_OPENCLAW_GATEWAY_PORT",
+                    "description": "Choose the gateway bind port used by the local control plane."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the port is configured."
+                }
+            ],
+        }),
+        "NANOCLAW_SLACK_ENV_FILE or project .env" => json!({
+            "key": "slack_env_file",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Provide a Slack env file via NANOCLAW_SLACK_ENV_FILE or project .env before starting the Slack/full runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_config",
+                    "target": "NANOCLAW_SLACK_ENV_FILE",
+                    "description": "Point NanoClaw at a local env file that contains Slack Socket Mode credentials."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the env file is readable."
+                }
+            ],
+        }),
+        "SLACK_BOT_TOKEN" | "SLACK_APP_TOKEN" => json!({
+            "key": format!("slack_{}", missing_config.trim_start_matches("SLACK_").to_ascii_lowercase()),
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": format!("Add {missing_config} to the configured Slack env file, then restart the Slack/full runtime profile."),
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_secret",
+                    "target": missing_config,
+                    "description": "Set the missing Slack credential in the configured env file; do not commit it to the repo."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the Slack credential is present."
+                }
+            ],
+        }),
+        "GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN" => json!({
+            "key": "webhook_auth_secret",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Set GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN before starting the webhook/full runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_secret",
+                    "target": "GITHUB_WEBHOOK_SECRET or OBSERVABILITY_WEBHOOK_TOKEN",
+                    "description": "Configure at least one webhook authentication mechanism for operator-facing webhook ingress."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after webhook auth material is present."
+                }
+            ],
+        }),
+        "LINEAR_WEBHOOK_SECRET" => json!({
+            "key": "legacy_linear_webhook_secret",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "If legacy Linear webhook support is intentionally enabled, set LINEAR_WEBHOOK_SECRET; otherwise leave the discontinued Linear lane disabled.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "confirm_legacy_lane",
+                    "target": "NANOCLAW_LINEAR_LEGACY_ENABLED",
+                    "description": "Confirm that the discontinued Linear lane is intentionally being used."
+                },
+                {
+                    "kind": "set_secret",
+                    "target": "LINEAR_WEBHOOK_SECRET",
+                    "description": "Set the legacy Linear webhook signing secret only when that legacy lane is required."
+                }
+            ],
+        }),
+        "NANOCLAW_LINEAR_LEGACY_ENABLED=true" => json!({
+            "key": "legacy_linear_disabled",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Avoid the discontinued pm profile unless legacy Linear automation is intentionally re-enabled.",
+            "requiresSecret": false,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "select_supported_profile",
+                    "target": "runtime serve --profile",
+                    "description": "Use full, gateway, webhook, or slack unless this instance explicitly needs legacy Linear PM automation."
+                },
+                {
+                    "kind": "set_config",
+                    "target": "NANOCLAW_LINEAR_LEGACY_ENABLED=true",
+                    "description": "Only set this when the operator deliberately accepts the legacy Linear lane."
+                }
+            ],
+        }),
+        "LINEAR_CHAT_JID" | "LINEAR_API_KEY or LINEAR_WRITE_API_KEY" => json!({
+            "key": "legacy_linear_pm_config",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": format!("Configure {missing_config} only if the discontinued Linear PM lane is intentionally re-enabled."),
+            "requiresSecret": missing_config.contains("API_KEY"),
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "confirm_legacy_lane",
+                    "target": "pm_automation",
+                    "description": "Confirm the instance is intentionally using the discontinued legacy Linear PM automation lane."
+                },
+                {
+                    "kind": "set_config",
+                    "target": missing_config,
+                    "description": "Set the missing legacy Linear PM configuration only after confirming the lane is required."
+                }
+            ],
+        }),
+        other if other.starts_with("readable Slack env file:") => json!({
+            "key": "slack_env_file_readable",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": "Fix the configured Slack env file path or permissions before starting the Slack/full runtime profile.",
+            "requiresSecret": true,
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "fix_file_access",
+                    "target": "NANOCLAW_SLACK_ENV_FILE",
+                    "description": "Ensure the configured Slack env file exists and is readable by the runtime process."
+                },
+                {
+                    "kind": "restart_profile",
+                    "profile": restart_profile,
+                    "command": format!("cargo run --quiet --bin nanoclaw -- runtime serve --profile {restart_profile}"),
+                    "description": "Restart the affected runtime profile after the file is readable."
+                }
+            ],
+        }),
+        _ => json!({
+            "key": "runtime_channel_missing_config",
+            "profile": profile,
+            "channelId": channel_id,
+            "missingConfig": missing_config,
+            "summary": format!("Configure {missing_config} for runtime channel {channel_id}, then rerun runtime health."),
+            "requiresSecret": missing_config.contains("TOKEN")
+                || missing_config.contains("SECRET")
+                || missing_config.contains("KEY"),
+            "safeToAutomate": false,
+            "operatorActions": [
+                {
+                    "kind": "set_config",
+                    "target": missing_config,
+                    "description": "Set the missing runtime channel configuration from the operator-controlled environment."
+                },
+                {
+                    "kind": "verify",
+                    "command": "cargo run --quiet --bin nanoclaw -- runtime health --limit 5",
+                    "description": "Rerun runtime health after the configuration is present."
+                }
+            ],
+        }),
+    }
+}
+
+fn runtime_startup_recovery_suggestions(events: &Value) -> Vec<Value> {
+    let mut suggestions = BTreeMap::<String, (usize, Value)>::new();
+
+    if let Some(recent_events) = events.get("recent").and_then(Value::as_array) {
+        for event in recent_events {
+            if event.get("status").and_then(Value::as_str) != Some("failed") {
+                continue;
+            }
+            let event_id = event
+                .get("eventId")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let profile = event
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let failures = event
+                .get("evidence")
+                .and_then(|evidence| evidence.get("failures"))
+                .and_then(Value::as_array);
+            let Some(failures) = failures else {
+                continue;
+            };
+
+            for failure in failures {
+                let channel_id = failure
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let missing_configs = failure
+                    .get("missingConfig")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str);
+                for missing_config in missing_configs {
+                    let key = format!("{profile}:{channel_id}:{missing_config}");
+                    let entry = suggestions.entry(key).or_insert_with(|| {
+                        (
+                            0,
+                            runtime_missing_config_recovery_suggestion(
+                                profile,
+                                channel_id,
+                                missing_config,
+                            ),
+                        )
+                    });
+                    entry.0 += 1;
+                    if let Some(object) = entry.1.as_object_mut() {
+                        object.insert("occurrences".to_string(), json!(entry.0));
+                        object.insert("latestEventId".to_string(), json!(event_id));
+                    }
+                }
+            }
+        }
+    }
+
+    suggestions
+        .into_values()
+        .map(|(_, suggestion)| suggestion)
+        .collect()
+}
+
+fn runtime_cleanup_json(config: &NanoclawConfig, args: RuntimeCleanupArgs) -> Value {
+    let mut candidates = Vec::<Value>::new();
+    let mut removed = Vec::<Value>::new();
+    let mut errors = Vec::<Value>::new();
+
+    for profile in RuntimeServeProfile::all() {
+        let state = runtime_pid_profile_state_json(config, profile);
+        let state_name = state
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if !matches!(state_name, "stale" | "invalid") {
+            continue;
+        }
+
+        let pid_file = runtime_pid_path(config, profile);
+        let mut candidate = json!({
+            "profile": profile.as_str(),
+            "state": state_name,
+            "pid": state.get("pid").cloned().unwrap_or(Value::Null),
+            "pidFile": pid_file.display().to_string(),
+            "removed": false,
+        });
+
+        if args.apply {
+            match fs::remove_file(&pid_file) {
+                Ok(()) => {
+                    candidate["removed"] = Value::Bool(true);
+                    removed.push(candidate.clone());
+                }
+                Err(error) => {
+                    errors.push(json!({
+                        "profile": profile.as_str(),
+                        "pidFile": pid_file.display().to_string(),
+                        "error": error.to_string(),
+                    }));
+                }
+            }
+        }
+
+        candidates.push(candidate);
+    }
+
+    let mut report = json!({
+        "ok": errors.is_empty(),
+        "applied": args.apply,
+        "summary": {
+            "candidates": candidates.len(),
+            "removed": removed.len(),
+            "errors": errors.len(),
+        },
+        "controlDir": runtime_control_dir(config).display().to_string(),
+        "candidates": candidates,
+        "removed": removed,
+        "errors": errors,
+    });
+
+    if args.include_state_residue {
+        report["stateResidue"] = runtime_state_residue_json(config);
+    }
+
+    report
+}
+
+fn runtime_health_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
+    let counts = app.db.counts()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_provenance = app.db.list_execution_provenance(None, limit)?;
+    let recent_evidence = app.db.list_execution_evidence(None, limit)?;
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Failed)
+        .count();
+    let active_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Active)
+        .count();
+    let failed_evidence = recent_evidence
+        .iter()
+        .filter(|record| record.status == "failed")
+        .count();
+    let mut checks = Vec::<RuntimeHealthCheck>::new();
+
+    checks.push(runtime_health_check(
+        "data_dir",
+        if app.config.data_dir.is_dir() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if app.config.data_dir.is_dir() {
+            "data directory is present"
+        } else {
+            "data directory is missing"
+        },
+        json!({ "path": app.config.data_dir.display().to_string() }),
+    ));
+
+    checks.push(runtime_health_check(
+        "store_dir",
+        if app.config.store_dir.is_dir() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if app.config.store_dir.is_dir() {
+            "store directory is present"
+        } else {
+            "store directory is missing"
+        },
+        json!({ "path": app.config.store_dir.display().to_string() }),
+    ));
+
+    let profile_states = RuntimeServeProfile::all()
+        .iter()
+        .map(|profile| runtime_pid_profile_state_json(&app.config, *profile))
+        .collect::<Vec<_>>();
+    let stale_or_invalid_profiles = profile_states
+        .iter()
+        .filter(|profile| {
+            matches!(
+                profile.get("state").and_then(Value::as_str),
+                Some("stale" | "invalid")
+            )
+        })
+        .count();
+    checks.push(runtime_health_check(
+        "runtime_pid_files",
+        if stale_or_invalid_profiles == 0 {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if stale_or_invalid_profiles == 0 {
+            "runtime PID files are clean"
+        } else {
+            "one or more runtime PID files are stale or invalid"
+        },
+        json!({
+            "controlDir": runtime_control_dir(&app.config).display().to_string(),
+            "profiles": profile_states,
+            "staleOrInvalid": stale_or_invalid_profiles,
+        }),
+    ));
+
+    let startup_events = runtime_startup_events_json(&app.config, limit);
+    let (failed_startup_events, failed_startup_profiles, latest_failed_startup) =
+        runtime_startup_failure_summary(&startup_events);
+    let recovery_suggestions = runtime_startup_recovery_suggestions(&startup_events);
+    let startup_event_status = if failed_startup_events >= 3 {
+        RuntimeHealthCheckStatus::Fail
+    } else if failed_startup_events > 0 {
+        RuntimeHealthCheckStatus::Warn
+    } else {
+        RuntimeHealthCheckStatus::Pass
+    };
+    checks.push(runtime_health_check(
+        "runtime_startup_events",
+        startup_event_status,
+        match startup_event_status {
+            RuntimeHealthCheckStatus::Pass => {
+                "no recent runtime startup or preflight failures are recorded"
+            }
+            RuntimeHealthCheckStatus::Warn => {
+                "recent runtime startup or preflight failure needs operator review"
+            }
+            RuntimeHealthCheckStatus::Fail => {
+                "repeated runtime startup or preflight failures need operator action"
+            }
+        },
+        json!({
+            "failedRecent": failed_startup_events,
+            "failedProfiles": failed_startup_profiles,
+            "latestFailed": latest_failed_startup,
+            "startupEvents": startup_events,
+            "repeatFailureThreshold": 3,
+            "recoverySuggestions": recovery_suggestions,
+        }),
+    ));
+
+    let gateway_token_configured = !app.config.openclaw_gateway_token.trim().is_empty();
+    let gateway_check = if app.config.openclaw_gateway_port > 0 && !gateway_token_configured {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Fail,
+            "gateway port is enabled without a gateway token",
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    } else if app.config.openclaw_gateway_port == 0 && gateway_token_configured {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Warn,
+            "gateway token is configured but the gateway port is disabled",
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    } else {
+        runtime_health_check(
+            "openclaw_gateway_config",
+            RuntimeHealthCheckStatus::Pass,
+            if gateway_token_configured {
+                "gateway configuration is complete"
+            } else {
+                "gateway is disabled"
+            },
+            describe_openclaw_gateway_readiness(&app.config),
+        )
+    };
+    checks.push(gateway_check);
+
+    let webhook_missing_auth = app.config.linear_webhook_port > 0
+        && (!app.config.linear_legacy_enabled
+            || app.config.linear_webhook_secret.trim().is_empty())
+        && app.config.github_webhook_secret.trim().is_empty()
+        && app.config.observability_webhook_token.trim().is_empty();
+    checks.push(runtime_health_check(
+        "webhook_auth",
+        if webhook_missing_auth {
+            RuntimeHealthCheckStatus::Fail
+        } else {
+            RuntimeHealthCheckStatus::Pass
+        },
+        if app.config.linear_webhook_port == 0 {
+            "webhook server is disabled"
+        } else if webhook_missing_auth {
+            "webhook server is enabled without any configured webhook auth material"
+        } else {
+            "webhook auth material is configured"
+        },
+        json!({
+            "port": app.config.linear_webhook_port,
+            "linearLegacyEnabled": app.config.linear_legacy_enabled,
+            "linearSignatureRequired": app.config.linear_legacy_enabled && !app.config.linear_webhook_secret.trim().is_empty(),
+            "githubSignatureRequired": !app.config.github_webhook_secret.trim().is_empty(),
+            "observabilityTokenConfigured": !app.config.observability_webhook_token.trim().is_empty(),
+        }),
+    ));
+
+    checks.push(runtime_health_check(
+        "scheduled_task_backlog",
+        if due_tasks.is_empty() {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if due_tasks.is_empty() {
+            "no scheduled tasks are currently due"
+        } else {
+            "scheduled tasks are due and need a runtime poll"
+        },
+        json!({
+            "total": tasks.len(),
+            "active": active_tasks,
+            "due": due_tasks.len(),
+            "failed": failed_tasks,
+        }),
+    ));
+
+    checks.push(runtime_health_check(
+        "failed_tasks",
+        if failed_tasks == 0 {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Warn
+        },
+        if failed_tasks == 0 {
+            "no failed scheduled tasks are recorded"
+        } else {
+            "failed scheduled tasks are recorded"
+        },
+        json!({ "failed": failed_tasks, "total": tasks.len() }),
+    ));
+
+    let evidence_status = if !recent_provenance.is_empty() && recent_evidence.is_empty() {
+        RuntimeHealthCheckStatus::Warn
+    } else if failed_evidence > 0 {
+        RuntimeHealthCheckStatus::Warn
+    } else {
+        RuntimeHealthCheckStatus::Pass
+    };
+    checks.push(runtime_health_check(
+        "execution_evidence",
+        evidence_status,
+        match evidence_status {
+            RuntimeHealthCheckStatus::Pass => "recent execution evidence is consistent",
+            RuntimeHealthCheckStatus::Warn => {
+                "recent execution history needs operator review for missing or failed evidence"
+            }
+            RuntimeHealthCheckStatus::Fail => "recent execution evidence is invalid",
+        },
+        json!({
+            "recentProvenance": recent_provenance.len(),
+            "recentEvidence": recent_evidence.len(),
+            "failedEvidence": failed_evidence,
+        }),
+    ));
+
+    let tool_adapters = runtime_tool_adapter_registry_json(&app.config);
+    let tool_adapters_ok = tool_adapters.get("ok").and_then(Value::as_bool) == Some(true);
+    checks.push(runtime_health_check(
+        "tool_adapter_registry",
+        if tool_adapters_ok {
+            RuntimeHealthCheckStatus::Pass
+        } else {
+            RuntimeHealthCheckStatus::Fail
+        },
+        if tool_adapters_ok {
+            "tool adapter registry contracts are valid"
+        } else {
+            "tool adapter registry has invalid contracts"
+        },
+        tool_adapters,
+    ));
+
+    let runtime_channels = runtime_channel_registry(&app.config);
+    let runtime_channel_status = if runtime_channels.summary.misconfigured > 0 {
+        RuntimeHealthCheckStatus::Fail
+    } else if runtime_channels.summary.degraded > 0 {
+        RuntimeHealthCheckStatus::Warn
+    } else {
+        RuntimeHealthCheckStatus::Pass
+    };
+    checks.push(runtime_health_check(
+        "runtime_channels",
+        runtime_channel_status,
+        match runtime_channel_status {
+            RuntimeHealthCheckStatus::Pass => "runtime channels have declared ownership",
+            RuntimeHealthCheckStatus::Warn => {
+                "runtime channels have declared ownership with degraded configuration"
+            }
+            RuntimeHealthCheckStatus::Fail => {
+                "runtime channels have declared ownership but some channels are misconfigured"
+            }
+        },
+        json!(runtime_channels),
+    ));
+
+    let failing = checks
+        .iter()
+        .filter(|check| check.status == RuntimeHealthCheckStatus::Fail)
+        .count();
+    let warning = checks
+        .iter()
+        .filter(|check| check.status == RuntimeHealthCheckStatus::Warn)
+        .count();
+    let status = if failing > 0 {
+        "unhealthy"
+    } else if warning > 0 {
+        "degraded"
+    } else {
+        "healthy"
+    };
+
+    Ok(json!({
+        "ok": failing == 0,
+        "status": status,
+        "summary": {
+            "checks": checks.len(),
+            "passing": checks.len().saturating_sub(failing + warning),
+            "warnings": warning,
+            "failing": failing,
+        },
+        "runtime": runtime_status_json(&app.config),
+        "counts": {
+            "chats": counts.chats,
+            "messages": counts.messages,
+            "scheduledTasks": counts.scheduled_tasks,
+            "registeredGroups": counts.registered_groups,
+        },
+        "checks": checks.iter().map(runtime_health_check_json).collect::<Vec<_>>(),
+    }))
+}
+
+fn runtime_tool_adapter_registry_json(config: &NanoclawConfig) -> Value {
+    let built_in_contracts = built_in_tool_adapter_contracts();
+    let built_in_reports = validate_built_in_tool_adapter_contracts();
+    let external_path = config.tool_adapter_manifest_path();
+    let external_exists = external_path.exists();
+    let external_result = load_external_tool_adapter_contracts(&external_path);
+
+    let (external_ok, external_status, external_count, external_ids, external_error) =
+        match external_result {
+            Ok(contracts) => {
+                let status = if external_exists {
+                    if contracts.is_empty() {
+                        "empty"
+                    } else {
+                        "loaded"
+                    }
+                } else {
+                    "missing"
+                };
+                (
+                    true,
+                    status,
+                    contracts.len(),
+                    contracts
+                        .iter()
+                        .map(|contract| contract.id.clone())
+                        .collect::<Vec<_>>(),
+                    Value::Null,
+                )
+            }
+            Err(error) => (
+                false,
+                "invalid",
+                0,
+                Vec::new(),
+                Value::String(error.to_string()),
+            ),
+        };
+
+    let built_in_ok = built_in_reports.is_empty();
+    json!({
+        "ok": built_in_ok && external_ok,
+        "builtIn": {
+            "ok": built_in_ok,
+            "count": built_in_contracts.len(),
+            "ids": built_in_contracts
+                .iter()
+                .map(|contract| contract.id.clone())
+                .collect::<Vec<_>>(),
+            "validationReports": validation_reports_json(&built_in_reports),
+        },
+        "external": {
+            "ok": external_ok,
+            "path": external_path.display().to_string(),
+            "exists": external_exists,
+            "status": external_status,
+            "count": external_count,
+            "ids": external_ids,
+            "error": external_error,
+        },
+    })
+}
+
+fn validation_reports_json(
+    reports: &[super::tool_registry::ToolAdapterContractValidationReport],
+) -> Vec<Value> {
+    reports
+        .iter()
+        .map(|report| {
+            json!({
+                "id": report.id,
+                "violations": report.violations.iter().map(|violation| {
+                    json!({
+                        "field": violation.field,
+                        "message": violation.message,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+fn runtime_status_json(config: &NanoclawConfig) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "activeBinary": "nanoclaw",
+        "dataDir": config.data_dir.display().to_string(),
+        "storeDir": config.store_dir.display().to_string(),
+        "control": runtime_pid_status_json(config),
+        "local": {
+            "enabled": true,
+            "mode": "poll",
+            "inboxDir": config.data_dir.join("channels").join("local").join("inbox").display().to_string(),
+            "outboxDir": config.data_dir.join("channels").join("local").join("outbox").display().to_string(),
+        },
+        "slack": {
+            "envFile": config
+                .slack_env_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "pollIntervalMs": config.slack_poll_interval_ms,
+        },
+        "webhook": {
+            "enabled": config.linear_webhook_port > 0,
+            "port": config.linear_webhook_port,
+            "linearLegacyEnabled": config.linear_legacy_enabled,
+            "linearSignatureRequired": config.linear_legacy_enabled && !config.linear_webhook_secret.trim().is_empty(),
+            "githubSignatureRequired": !config.github_webhook_secret.trim().is_empty(),
+            "observabilityTokenConfigured": !config.observability_webhook_token.trim().is_empty(),
+        },
+        "pmAutomation": {
+            "enabled": config.linear_legacy_enabled && !config.linear_chat_jid.trim().is_empty(),
+            "status": if config.linear_legacy_enabled { "legacy-enabled" } else { "discontinued" },
+            "linearChatJidConfigured": !config.linear_chat_jid.trim().is_empty(),
+            "teamKeysConfigured": !config.linear_pm_team_keys.is_empty(),
+        },
+        "openclawGateway": describe_openclaw_gateway_readiness(config),
+        "execution": {
+            "defaultLane": config.execution_lane.as_str(),
+            "gatewayLane": config.openclaw_gateway_execution_lane.as_str(),
+        },
+        "toolAdapters": runtime_tool_adapter_registry_json(config),
+        "runtimeChannels": json!(runtime_channel_registry(config)),
+        "serveProfiles": ["full", "gateway", "webhook", "pm", "slack"],
+    })
+}
+
+fn path_state_json(path: &Path) -> Value {
+    match fs::metadata(path) {
+        Ok(metadata) => json!({
+            "path": path.display().to_string(),
+            "exists": true,
+            "isDir": metadata.is_dir(),
+            "isFile": metadata.is_file(),
+            "bytes": if metadata.is_file() {
+                Value::from(metadata.len())
+            } else {
+                Value::Null
+            },
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "isDir": false,
+            "isFile": false,
+            "bytes": null,
+        }),
+        Err(error) => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "isDir": false,
+            "isFile": false,
+            "bytes": null,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn dir_inventory_json(path: &Path) -> Value {
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut json_files = 0usize;
+    let mut other = 0usize;
+    let mut errors = Vec::<Value>::new();
+
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let entry_path = entry.path();
+                        match entry.file_type() {
+                            Ok(file_type) if file_type.is_dir() => dirs += 1,
+                            Ok(file_type) if file_type.is_file() => {
+                                files += 1;
+                                if entry_path.extension().and_then(|ext| ext.to_str())
+                                    == Some("json")
+                                {
+                                    json_files += 1;
+                                } else {
+                                    other += 1;
+                                }
+                            }
+                            Ok(_) => other += 1,
+                            Err(error) => errors.push(json!({
+                                "path": entry_path.display().to_string(),
+                                "error": error.to_string(),
+                            })),
+                        }
+                    }
+                    Err(error) => errors.push(json!({ "error": error.to_string() })),
+                }
+            }
+            json!({
+                "path": path.display().to_string(),
+                "exists": true,
+                "files": files,
+                "dirs": dirs,
+                "jsonFiles": json_files,
+                "otherEntries": other,
+                "errors": errors,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "files": 0,
+            "dirs": 0,
+            "jsonFiles": 0,
+            "otherEntries": 0,
+            "errors": [],
+        }),
+        Err(error) => json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "files": 0,
+            "dirs": 0,
+            "jsonFiles": 0,
+            "otherEntries": 0,
+            "errors": [{ "error": error.to_string() }],
+        }),
+    }
+}
+
+fn runtime_state_residue_item_json(
+    key: &str,
+    classification: &str,
+    path: PathBuf,
+    active: bool,
+    recommendation: &str,
+) -> Value {
+    let inventory = if path.is_dir() {
+        dir_inventory_json(&path)
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "key": key,
+        "classification": classification,
+        "activeRuntimePath": active,
+        "recommendation": recommendation,
+        "state": path_state_json(&path),
+        "inventory": inventory,
+    })
+}
+
+fn runtime_state_residue_operator_action_json(item: &Value) -> Value {
+    let key = item.get("key").and_then(Value::as_str).unwrap_or("unknown");
+    let classification = item
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let path = item
+        .get("state")
+        .and_then(|state| state.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let exists = item
+        .get("state")
+        .and_then(|state| state.get("exists"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let (action, destructive, next_step) = match classification {
+        "legacy_vector_cache" => (
+            "purge_candidate",
+            true,
+            "confirm no active runtime contract references this cache before any separate operator-approved purge",
+        ),
+        "legacy_vector_store" | "legacy_embedding_db" | "legacy_history_jsonl" => (
+            "migration_candidate",
+            false,
+            "migrate only through an explicit runtime contract, then archive or purge in a separate operator-approved step",
+        ),
+        "legacy_source_reference" => (
+            "preserve_reference",
+            false,
+            "keep parked as source/reference material; do not delete through runtime cleanup",
+        ),
+        _ => (
+            "review_candidate",
+            false,
+            "review manually before deciding whether this belongs to active runtime state",
+        ),
+    };
+
+    json!({
+        "key": key,
+        "classification": classification,
+        "path": path,
+        "exists": exists,
+        "status": if exists { "needs_operator_decision" } else { "not_present" },
+        "action": action,
+        "approvalRequired": true,
+        "destructive": destructive,
+        "safeDefault": "leave_in_place",
+        "nextStep": next_step,
+    })
+}
+
+fn runtime_state_residue_json(config: &NanoclawConfig) -> Value {
+    let active_roots = vec![
+        runtime_state_residue_item_json(
+            "central_db",
+            "active_central_db",
+            config.db_path.clone(),
+            true,
+            "preserve; active runtime database",
+        ),
+        runtime_state_residue_item_json(
+            "data_dir",
+            "active_runtime_data",
+            config.data_dir.clone(),
+            true,
+            "preserve; active runtime data root",
+        ),
+        runtime_state_residue_item_json(
+            "groups_dir",
+            "active_group_roots",
+            config.groups_dir.clone(),
+            true,
+            "preserve; active group runtime roots",
+        ),
+        runtime_state_residue_item_json(
+            "store_dir",
+            "active_store_root",
+            config.store_dir.clone(),
+            true,
+            "preserve; active store root containing the central DB",
+        ),
+        runtime_state_residue_item_json(
+            "runtime_control_dir",
+            "active_runtime_control",
+            runtime_control_dir(config),
+            true,
+            "preserve; PID cleanup is handled separately by runtime cleanup",
+        ),
+        runtime_state_residue_item_json(
+            "executor_sessions_dir",
+            "active_execution_sidecars",
+            config.data_dir.join("executor").join("sessions"),
+            true,
+            "preserve; active execution sidecar root",
+        ),
+        runtime_state_residue_item_json(
+            "container_cache_dir",
+            "active_execution_cache",
+            config.data_dir.join("executor").join("container-cache"),
+            true,
+            "preserve unless an operator explicitly purges execution cache",
+        ),
+    ];
+
+    let legacy_candidates = vec![
+        runtime_state_residue_item_json(
+            "fastembed_cache",
+            "legacy_vector_cache",
+            config.project_root.join(".fastembed_cache"),
+            false,
+            "legacy Agency vector cache; ignore or delete only after explicit operator approval",
+        ),
+        runtime_state_residue_item_json(
+            "root_memory_json",
+            "legacy_vector_store",
+            config.project_root.join("memory.json"),
+            false,
+            "legacy memory server store; migrate only if a runtime contract needs it",
+        ),
+        runtime_state_residue_item_json(
+            "store_memory_json",
+            "legacy_vector_store",
+            config.store_dir.join("memory.json"),
+            false,
+            "legacy memory store candidate; not used by the active NanoClaw runtime",
+        ),
+        runtime_state_residue_item_json(
+            "store_agency_memory_json",
+            "legacy_vector_store",
+            config.store_dir.join("agency_memory.json"),
+            false,
+            "legacy memory store candidate; not used by the active NanoClaw runtime",
+        ),
+        runtime_state_residue_item_json(
+            "store_embeddings_db",
+            "legacy_embedding_db",
+            config.store_dir.join("embeddings.db"),
+            false,
+            "legacy embedding DB candidate; not used by the active NanoClaw runtime",
+        ),
+        runtime_state_residue_item_json(
+            "agency_history_jsonl",
+            "legacy_history_jsonl",
+            config.data_dir.join("agency_history.jsonl"),
+            false,
+            "legacy history file; migrate into session sidecars only through an explicit migration",
+        ),
+        runtime_state_residue_item_json(
+            "src_memory",
+            "legacy_source_reference",
+            config.project_root.join("src").join("memory"),
+            false,
+            "source reference only; do not runtime-delete from cleanup commands",
+        ),
+        runtime_state_residue_item_json(
+            "src_services_memory",
+            "legacy_source_reference",
+            config
+                .project_root
+                .join("src")
+                .join("services")
+                .join("memory.rs"),
+            false,
+            "source reference only; do not runtime-delete from cleanup commands",
+        ),
+    ];
+    let present_legacy_candidates = legacy_candidates
+        .iter()
+        .filter(|item| {
+            item.get("state")
+                .and_then(|state| state.get("exists"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .count();
+    let operator_actions = legacy_candidates
+        .iter()
+        .map(runtime_state_residue_operator_action_json)
+        .collect::<Vec<_>>();
+
+    json!({
+        "policy": {
+            "destructiveCleanup": "manual-only",
+            "cleanupCommandDeletesState": false,
+            "operatorActionRequired": true,
+            "note": "This inventory is report-only; runtime cleanup only removes stale or invalid PID files.",
+        },
+        "summary": {
+            "activeRoots": active_roots.len(),
+            "legacyCandidates": legacy_candidates.len(),
+            "presentLegacyCandidates": present_legacy_candidates,
+            "operatorActions": operator_actions.len(),
+        },
+        "activeRoots": active_roots,
+        "legacyCandidates": legacy_candidates,
+        "operatorActions": operator_actions,
+    })
+}
+
+fn runtime_state_action_receipts_dir(config: &NanoclawConfig) -> PathBuf {
+    runtime_control_dir(config).join("state-actions")
+}
+
+fn runtime_state_action_archive_dir(config: &NanoclawConfig) -> PathBuf {
+    runtime_control_dir(config).join("state-archive")
+}
+
+fn runtime_state_action_id(key: &str, apply_action: &str) -> String {
+    format!("state-residue:{key}:{apply_action}")
+}
+
+fn runtime_state_action_safe_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn runtime_state_action_apply_shape(
+    classification: &str,
+    exists: bool,
+    active_runtime_path: bool,
+) -> (&'static str, &'static str, bool, &'static str) {
+    if !exists {
+        return (
+            "noop",
+            "not_present",
+            false,
+            "legacy residue path is not present; leave in place",
+        );
+    }
+    if active_runtime_path {
+        return (
+            "preserve_active_runtime",
+            "blocked",
+            false,
+            "active runtime paths cannot be mutated by state-action",
+        );
+    }
+
+    match classification {
+        "legacy_vector_cache"
+        | "legacy_vector_store"
+        | "legacy_embedding_db"
+        | "legacy_history_jsonl" => (
+            "archive_legacy_state",
+            "ready_to_apply",
+            true,
+            "non-destructively move legacy residue into the runtime state archive and write a receipt",
+        ),
+        "legacy_source_reference" => (
+            "preserve_reference",
+            "operator_required",
+            false,
+            "source references are parked for clean-room adoption decisions and cannot be moved by runtime state-action",
+        ),
+        _ => (
+            "manual_review",
+            "operator_required",
+            false,
+            "classification has no registered deterministic state action",
+        ),
+    }
+}
+
+fn runtime_state_action_plan_item(candidate: &Value, operator_action: Option<&Value>) -> Value {
+    let key = candidate
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let classification = candidate
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let active_runtime_path = candidate
+        .get("activeRuntimePath")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let state = candidate.get("state").cloned().unwrap_or(Value::Null);
+    let path = state.get("path").and_then(Value::as_str).unwrap_or("");
+    let exists = state
+        .get("exists")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let recommendation = candidate
+        .get("recommendation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let original_action = operator_action
+        .and_then(|action| action.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or("review_candidate");
+    let original_destructive = operator_action
+        .and_then(|action| action.get("destructive"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (apply_action, status, mutates_filesystem, reason) =
+        runtime_state_action_apply_shape(classification, exists, active_runtime_path);
+    let action_id = runtime_state_action_id(key, apply_action);
+
+    json!({
+        "schemaVersion": "2026-05-21",
+        "actionId": action_id,
+        "key": key,
+        "classification": classification,
+        "status": status,
+        "applyAction": apply_action,
+        "sourcePath": path,
+        "exists": exists,
+        "activeRuntimePath": active_runtime_path,
+        "approvalRequired": true,
+        "requiresConfirm": true,
+        "mutatesFilesystem": mutates_filesystem,
+        "destructive": false,
+        "originalOperatorAction": original_action,
+        "originalOperatorActionDestructive": original_destructive,
+        "safeDefault": "leave_in_place",
+        "recommendation": recommendation,
+        "reason": reason,
+        "receiptPolicy": if mutates_filesystem { "required_on_apply" } else { "not_applicable" },
+    })
+}
+
+fn runtime_state_action_plan_items(config: &NanoclawConfig) -> Vec<Value> {
+    let residue = runtime_state_residue_json(config);
+    let operator_actions = residue
+        .get("operatorActions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let operator_actions_by_key = operator_actions
+        .iter()
+        .filter_map(|action| {
+            action
+                .get("key")
+                .and_then(Value::as_str)
+                .map(|key| (key.to_string(), action.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    residue
+        .get("legacyCandidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|candidate| {
+            let key = candidate
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            runtime_state_action_plan_item(candidate, operator_actions_by_key.get(key))
+        })
+        .collect()
+}
+
+fn runtime_state_action_summary(items: &[Value]) -> Value {
+    let total = items.len();
+    let ready_to_apply = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("ready_to_apply"))
+        .count();
+    let operator_required = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("operator_required"))
+        .count();
+    let blocked = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("blocked"))
+        .count();
+    let not_present = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("not_present"))
+        .count();
+
+    json!({
+        "total": total,
+        "readyToApply": ready_to_apply,
+        "operatorRequired": operator_required,
+        "blocked": blocked,
+        "notPresent": not_present,
+    })
+}
+
+fn runtime_state_action_receipt_path(config: &NanoclawConfig, action_id: &str) -> PathBuf {
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let suffix = Uuid::new_v4();
+    runtime_state_action_receipts_dir(config).join(format!(
+        "{}-{}-{}.json",
+        stamp,
+        runtime_state_action_safe_segment(action_id),
+        suffix
+    ))
+}
+
+fn runtime_state_action_archive_target(
+    config: &NanoclawConfig,
+    item: &Value,
+    source_path: &Path,
+) -> PathBuf {
+    let key = item.get("key").and_then(Value::as_str).unwrap_or("unknown");
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let suffix = Uuid::new_v4();
+    let basename = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("residue");
+    runtime_state_action_archive_dir(config)
+        .join(format!(
+            "{}-{}-{}",
+            stamp,
+            runtime_state_action_safe_segment(key),
+            suffix
+        ))
+        .join(runtime_state_action_safe_segment(basename))
+}
+
+fn apply_runtime_state_action(config: &NanoclawConfig, item: &Value) -> Result<Value> {
+    let action_id = item
+        .get("actionId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let apply_action = item
+        .get("applyAction")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let source_path = item.get("sourcePath").and_then(Value::as_str).unwrap_or("");
+
+    if apply_action != "archive_legacy_state" || status != "ready_to_apply" {
+        return Ok(json!({
+            "actionId": action_id,
+            "applied": false,
+            "status": "skipped",
+            "reason": "state action is not registered as a ready non-destructive apply handler",
+            "receipt": null,
+        }));
+    }
+
+    let source_path = PathBuf::from(source_path);
+    if !source_path.exists() {
+        return Ok(json!({
+            "actionId": action_id,
+            "applied": false,
+            "status": "not_present",
+            "reason": "source path no longer exists",
+            "receipt": null,
+        }));
+    }
+
+    let archive_target = runtime_state_action_archive_target(config, item, &source_path);
+    if let Some(parent) = archive_target.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create runtime state archive directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::rename(&source_path, &archive_target).with_context(|| {
+        format!(
+            "failed to archive legacy runtime residue from {} to {}",
+            source_path.display(),
+            archive_target.display()
+        )
+    })?;
+
+    let receipt_path = runtime_state_action_receipt_path(config, action_id);
+    if let Some(parent) = receipt_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create runtime state action receipt directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let receipt = json!({
+        "schemaVersion": "2026-05-21",
+        "actionId": action_id,
+        "status": "applied",
+        "applyAction": apply_action,
+        "appliedAt": Utc::now().to_rfc3339(),
+        "sourcePath": source_path.display().to_string(),
+        "archivePath": archive_target.display().to_string(),
+        "rollback": {
+            "kind": "move_archive_back",
+            "description": "Stop the runtime, then move archivePath back to sourcePath if this archive action needs to be reverted.",
+            "sourcePath": source_path.display().to_string(),
+            "archivePath": archive_target.display().to_string(),
+        },
+        "item": item,
+    });
+    fs::write(&receipt_path, serde_json::to_string_pretty(&receipt)?).with_context(|| {
+        format!(
+            "failed to write runtime state action receipt {}",
+            receipt_path.display()
+        )
+    })?;
+
+    Ok(json!({
+        "actionId": action_id,
+        "applied": true,
+        "status": "applied",
+        "receipt": path_state_json(&receipt_path),
+        "archivePath": archive_target.display().to_string(),
+        "rollback": receipt["rollback"],
+    }))
+}
+
+fn runtime_state_action_json(
+    config: &NanoclawConfig,
+    args: RuntimeStateActionArgs,
+) -> Result<Value> {
+    let all_items = runtime_state_action_plan_items(config);
+    let shown_items = all_items
+        .iter()
+        .take(args.limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let summary = runtime_state_action_summary(&all_items);
+
+    match args.mode {
+        RuntimeStateActionMode::Plan => {
+            let status = if summary["readyToApply"].as_u64().unwrap_or(0) > 0 {
+                "ready_to_apply"
+            } else if summary["operatorRequired"].as_u64().unwrap_or(0) > 0 {
+                "operator_action_required"
+            } else if summary["blocked"].as_u64().unwrap_or(0) > 0 {
+                "blocked"
+            } else {
+                "no_state_actions"
+            };
+
+            Ok(json!({
+                "schemaVersion": "2026-05-21",
+                "mode": args.mode.as_str(),
+                "status": status,
+                "policy": {
+                    "mutationDefault": "off",
+                    "applyRequiresConfirm": true,
+                    "destructiveDeleteHandlers": false,
+                    "sourceReferenceMutation": false,
+                    "receiptRequired": true,
+                },
+                "summary": summary,
+                "shown": shown_items.len(),
+                "items": shown_items,
+            }))
+        }
+        RuntimeStateActionMode::Apply => {
+            let Some(confirm) = args.confirm.as_deref() else {
+                anyhow::bail!(
+                    "runtime state-action --apply requires --confirm <action-id> from a prior --plan"
+                );
+            };
+            let Some(item) = all_items
+                .iter()
+                .find(|item| item.get("actionId").and_then(Value::as_str) == Some(confirm))
+            else {
+                anyhow::bail!("unknown runtime state-action confirmation id '{confirm}'");
+            };
+            let apply_result = apply_runtime_state_action(config, item)?;
+            Ok(json!({
+                "schemaVersion": "2026-05-21",
+                "mode": args.mode.as_str(),
+                "status": if apply_result["applied"].as_bool() == Some(true) { "applied" } else { "nothing_applied" },
+                "policy": {
+                    "mutationDefault": "off",
+                    "applyRequiresConfirm": true,
+                    "destructiveDeleteHandlers": false,
+                    "sourceReferenceMutation": false,
+                    "receiptRequired": true,
+                },
+                "confirmedActionId": confirm,
+                "result": apply_result,
+            }))
+        }
+    }
+}
+
+fn print_runtime_state_action(config: NanoclawConfig, args: RuntimeStateActionArgs) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_state_action_json(&config, args)?)?
+    );
+    Ok(())
+}
+
+fn print_runtime_source_disposition(config: NanoclawConfig, limit: usize) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&source_disposition_report(&config, limit)?)?
+    );
+    Ok(())
+}
+
+fn sqlite_table_count_json(path: &Path, table: &str) -> Value {
+    if !path.exists() {
+        return json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "table": table,
+            "count": null,
+        });
+    }
+
+    match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            match conn.query_row(&sql, [], |row| row.get::<_, i64>(0)) {
+                Ok(count) => json!({
+                    "path": path.display().to_string(),
+                    "exists": true,
+                    "table": table,
+                    "count": count,
+                }),
+                Err(error) => json!({
+                    "path": path.display().to_string(),
+                    "exists": true,
+                    "table": table,
+                    "count": null,
+                    "error": error.to_string(),
+                }),
+            }
+        }
+        Err(error) => json!({
+            "path": path.display().to_string(),
+            "exists": true,
+            "table": table,
+            "count": null,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn runtime_session_sidecar_state_json(
+    config: &NanoclawConfig,
+    group_folder: &str,
+    session_id: &str,
+) -> Value {
+    let session = build_execution_session(
+        &config.data_dir,
+        group_folder,
+        session_id,
+        &config.groups_dir.join(group_folder),
+    );
+    let paths = session_sidecar_paths(&session);
+
+    json!({
+        "groupFolder": group_folder,
+        "sessionId": session_id,
+        "sessionRoot": path_state_json(&paths.session_root),
+        "inboundDb": {
+            "file": path_state_json(&paths.inbound_db),
+            "messagesIn": sqlite_table_count_json(&paths.inbound_db, "messages_in"),
+            "destinations": sqlite_table_count_json(&paths.inbound_db, "destinations"),
+            "sessionRouting": sqlite_table_count_json(&paths.inbound_db, "session_routing"),
+        },
+        "outboundDb": {
+            "file": path_state_json(&paths.outbound_db),
+            "messagesOut": sqlite_table_count_json(&paths.outbound_db, "messages_out"),
+            "processingAck": sqlite_table_count_json(&paths.outbound_db, "processing_ack"),
+        },
+    })
+}
+
+fn runtime_state_json(app: &NanoclawApp, limit: usize) -> Result<Value> {
+    let counts = app.db.counts()?;
+    let groups = app.groups()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_tasks = tasks.iter().take(limit).cloned().collect::<Vec<_>>();
+    let mut task_status_counts = BTreeMap::<String, usize>::new();
+    for task in &tasks {
+        *task_status_counts
+            .entry(task.status.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    let local_root = app.config.data_dir.join("channels").join("local");
+    let executor_sessions_dir = app.config.data_dir.join("executor").join("sessions");
+    let mut linked_session_ids = BTreeSet::<String>::new();
+    let mut group_sessions = Vec::<Option<String>>::new();
+    let mut group_roots = Vec::<Value>::new();
+    let mut session_sidecars = Vec::<Value>::new();
+
+    for group in &groups {
+        let session_id = app.db.session_for_group(&group.folder)?;
+        if let Some(session_id) = session_id.as_deref() {
+            linked_session_ids.insert(session_id.to_string());
+        }
+        group_sessions.push(session_id);
+    }
+
+    for (group, session_id) in groups.iter().zip(group_sessions.iter()).take(limit) {
+        let group_root = app.config.groups_dir.join(&group.folder);
+        if let Some(session_id) = session_id.as_deref() {
+            session_sidecars.push(runtime_session_sidecar_state_json(
+                &app.config,
+                &group.folder,
+                session_id,
+            ));
+        }
+        group_roots.push(json!({
+            "folder": group.folder,
+            "jid": group.jid,
+            "name": group.name,
+            "isMain": group.is_main,
+            "root": path_state_json(&group_root),
+            "template": path_state_json(&group_root.join("CLAUDE.md")),
+            "sessionId": session_id,
+        }));
+    }
+
+    let mut orphan_session_dirs = Vec::<Value>::new();
+    if let Ok(entries) = fs::read_dir(&executor_sessions_dir) {
+        let mut dirs = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_dir() {
+                    return None;
+                }
+                let session_id = entry.file_name().to_string_lossy().to_string();
+                if linked_session_ids.contains(&session_id) {
+                    return None;
+                }
+                Some((session_id, path))
+            })
+            .collect::<Vec<_>>();
+        dirs.sort_by(|left, right| left.0.cmp(&right.0));
+        orphan_session_dirs = dirs
+            .into_iter()
+            .take(limit)
+            .map(|(session_id, path)| {
+                json!({
+                    "sessionId": session_id,
+                    "root": path_state_json(&path),
+                    "inventory": dir_inventory_json(&path),
+                })
+            })
+            .collect();
+    }
+
+    Ok(json!({
+        "ok": true,
+        "runtime": {
+            "activeBinary": "nanoclaw",
+            "control": runtime_pid_status_json(&app.config),
+            "startupEvents": runtime_startup_events_json(&app.config, limit),
+        },
+        "roots": {
+            "projectRoot": path_state_json(&app.config.project_root),
+            "dataDir": path_state_json(&app.config.data_dir),
+            "storeDir": path_state_json(&app.config.store_dir),
+            "groupsDir": path_state_json(&app.config.groups_dir),
+            "runtimeControlDir": path_state_json(&runtime_control_dir(&app.config)),
+            "executorSessionsDir": path_state_json(&executor_sessions_dir),
+        },
+        "centralDb": {
+            "file": path_state_json(app.db.path()),
+            "tables": {
+                "chats": counts.chats,
+                "messages": counts.messages,
+                "scheduledTasks": counts.scheduled_tasks,
+                "registeredGroups": counts.registered_groups,
+                "sessions": sqlite_table_count_json(app.db.path(), "sessions"),
+                "executionProvenance": sqlite_table_count_json(app.db.path(), "execution_provenance"),
+                "executionEvidence": sqlite_table_count_json(app.db.path(), "execution_evidence"),
+                "swarmRuns": sqlite_table_count_json(app.db.path(), "swarm_runs"),
+                "swarmTasks": sqlite_table_count_json(app.db.path(), "swarm_tasks"),
+                "observabilityEvents": sqlite_table_count_json(app.db.path(), "observability_events"),
+            },
+        },
+        "localChannel": {
+            "root": path_state_json(&local_root),
+            "inbox": dir_inventory_json(&local_root.join("inbox")),
+            "outbox": dir_inventory_json(&local_root.join("outbox")),
+            "processed": dir_inventory_json(&local_root.join("processed")),
+        },
+        "groupRoots": {
+            "root": path_state_json(&app.config.groups_dir),
+            "inventory": dir_inventory_json(&app.config.groups_dir),
+            "registeredTotal": groups.len(),
+            "shown": group_roots.len(),
+            "items": group_roots,
+        },
+        "sessionSidecars": {
+            "root": path_state_json(&executor_sessions_dir),
+            "linkedShown": session_sidecars.len(),
+            "linkedItems": session_sidecars,
+            "orphanShown": orphan_session_dirs.len(),
+            "orphanItems": orphan_session_dirs,
+        },
+        "stateResidue": runtime_state_residue_json(&app.config),
+        "queuedTasks": {
+            "total": tasks.len(),
+            "due": due_tasks.len(),
+            "byStatus": task_status_counts,
+            "recent": recent_tasks,
+        },
+    }))
+}
+
+fn print_runtime_status(config: &NanoclawConfig) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_status_json(config))?
+    );
+    Ok(())
+}
+
+fn print_runtime_state(config: NanoclawConfig, limit: usize) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_state_json(&app, limit)?)?
+    );
+    Ok(())
+}
+
+fn runtime_inspect_json(app: &NanoclawApp, limit: usize) -> Result<serde_json::Value> {
+    let counts = app.db.counts()?;
+    let tasks = app.list_tasks()?;
+    let due_tasks = app.due_tasks()?;
+    let recent_tasks = tasks.iter().take(limit).cloned().collect::<Vec<_>>();
+    let recent_provenance = app.db.list_execution_provenance(None, limit)?;
+    let recent_evidence = app.db.list_execution_evidence(None, limit)?;
+    let mut task_status_counts = BTreeMap::<String, usize>::new();
+    for task in &tasks {
+        *task_status_counts
+            .entry(task.status.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "runtime": runtime_status_json(&app.config),
+        "counts": {
+            "chats": counts.chats,
+            "messages": counts.messages,
+            "scheduledTasks": counts.scheduled_tasks,
+            "registeredGroups": counts.registered_groups,
+        },
+        "tasks": {
+            "total": tasks.len(),
+            "due": due_tasks.len(),
+            "byStatus": task_status_counts,
+            "recent": recent_tasks,
+        },
+        "recentExecutionProvenance": recent_provenance,
+        "recentExecutionEvidence": recent_evidence,
+    }))
+}
+
+fn runtime_health_alert_text(health: &Value) -> String {
+    let status = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let summary = health.get("summary").unwrap_or(&Value::Null);
+    let passing = summary
+        .get("passing")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let warnings = summary
+        .get("warnings")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let failing = summary
+        .get("failing")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let mut lines = vec![
+        format!("NanoClaw runtime health: {status}"),
+        format!("checks: {passing} passing, {warnings} warnings, {failing} failing"),
+    ];
+
+    let mut surfaced = 0usize;
+    if let Some(checks) = health.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let check_status = check
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if check_status == "pass" {
+                continue;
+            }
+            surfaced += 1;
+            let id = check.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            let message = check
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            lines.push(format!("- {id}: {check_status} - {message}"));
+            if let Some(suggestions) = check
+                .get("evidence")
+                .and_then(|evidence| evidence.get("recoverySuggestions"))
+                .and_then(Value::as_array)
+            {
+                for suggestion in suggestions.iter().take(3) {
+                    if let Some(summary) = suggestion.get("summary").and_then(Value::as_str) {
+                        lines.push(format!("  recovery: {summary}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if surfaced == 0 {
+        lines.push("- all checks passing".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn maybe_send_runtime_health_notification(
+    config: &NanoclawConfig,
+    args: &RuntimeHealthArgs,
+    health: &Value,
+) -> Result<Value> {
+    let Some(chat_jid) = args.notify_local.as_deref() else {
+        return Ok(json!({
+            "sent": false,
+            "reason": "not_configured",
+        }));
+    };
+
+    let status = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if status == "healthy" && !args.notify_always {
+        return Ok(json!({
+            "sent": false,
+            "reason": "healthy",
+            "chatJid": chat_jid,
+        }));
+    }
+
+    let channel = LocalChannel::new(&config.data_dir)?;
+    let envelope = channel.send_message(chat_jid, &runtime_health_alert_text(health))?;
+    Ok(json!({
+        "sent": true,
+        "chatJid": chat_jid,
+        "outboxId": envelope.id,
+        "timestamp": envelope.timestamp,
+    }))
+}
+
+fn runtime_repair_action_has_auto_apply_handler(kind: &str) -> bool {
+    let _ = kind;
+    false
+}
+
+fn runtime_repair_item_classification(suggestion: &Value) -> (&'static str, String) {
+    let requires_secret = suggestion
+        .get("requiresSecret")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let safe_to_automate = suggestion
+        .get("safeToAutomate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let action_kinds = suggestion
+        .get("operatorActions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| action.get("kind").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    if requires_secret {
+        return (
+            "operator_required",
+            "repair requires secret material controlled by the operator".to_string(),
+        );
+    }
+    if !safe_to_automate {
+        return (
+            "operator_required",
+            "repair is intentionally gated for operator decision".to_string(),
+        );
+    }
+    if action_kinds.is_empty() {
+        return (
+            "blocked",
+            "repair suggestion does not include deterministic actions".to_string(),
+        );
+    }
+    if action_kinds
+        .iter()
+        .all(|kind| runtime_repair_action_has_auto_apply_handler(kind))
+    {
+        return (
+            "auto_applyable",
+            "all repair actions have deterministic auto-apply handlers".to_string(),
+        );
+    }
+
+    (
+        "operator_required",
+        "one or more repair actions do not have a safe auto-apply handler".to_string(),
+    )
+}
+
+fn runtime_repair_item_from_suggestion(check_id: &str, suggestion: &Value) -> Value {
+    let key = suggestion
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or("runtime_recovery_suggestion");
+    let missing_config = suggestion
+        .get("missingConfig")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let summary = suggestion
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("runtime recovery suggestion needs operator review");
+    let (classification, reason) = runtime_repair_item_classification(suggestion);
+
+    json!({
+        "id": format!("{check_id}:{key}:{missing_config}"),
+        "sourceCheckId": check_id,
+        "kind": "runtime_recovery_suggestion",
+        "classification": classification,
+        "summary": summary,
+        "reason": reason,
+        "safeToAutomate": suggestion.get("safeToAutomate").cloned().unwrap_or(json!(false)),
+        "requiresSecret": suggestion.get("requiresSecret").cloned().unwrap_or(json!(true)),
+        "profile": suggestion.get("profile").cloned().unwrap_or(Value::Null),
+        "channelId": suggestion.get("channelId").cloned().unwrap_or(Value::Null),
+        "missingConfig": missing_config,
+        "occurrences": suggestion.get("occurrences").cloned().unwrap_or(json!(1)),
+        "latestEventId": suggestion.get("latestEventId").cloned().unwrap_or(Value::Null),
+        "operatorActions": suggestion.get("operatorActions").cloned().unwrap_or(json!([])),
+        "sourceSuggestion": suggestion.clone(),
+    })
+}
+
+fn runtime_startup_event_has_missing_config_failure(event: &Value) -> bool {
+    event
+        .get("evidence")
+        .and_then(|evidence| evidence.get("failures"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|failure| {
+            failure
+                .get("missingConfig")
+                .and_then(Value::as_array)
+                .map(|missing| {
+                    missing
+                        .iter()
+                        .any(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
+                })
+                .unwrap_or(false)
+        })
+}
+
+fn runtime_repair_diagnostic_item_from_startup_event(event: &Value) -> Value {
+    let event_id = event
+        .get("eventId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let profile = event
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let message = event
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("runtime startup failure has no deterministic repair mapping");
+
+    json!({
+        "id": format!("runtime_startup_events:diagnostic:{event_id}"),
+        "sourceCheckId": "runtime_startup_events",
+        "kind": "runtime_startup_failure_diagnostic",
+        "classification": "blocked",
+        "summary": format!("Inspect startup failure for profile {profile}: {message}"),
+        "reason": "no deterministic remediation is registered for this failure shape",
+        "safeToAutomate": false,
+        "requiresSecret": false,
+        "profile": profile,
+        "channelId": Value::Null,
+        "missingConfig": Value::Null,
+        "occurrences": 1,
+        "latestEventId": event_id,
+        "operatorActions": [{
+            "kind": "inspect_event",
+            "target": event_id,
+            "description": "Inspect the startup event evidence and add a remediation mapping only after the failure shape is understood."
+        }],
+        "sourceEvent": event.clone(),
+    })
+}
+
+fn runtime_repair_items_from_health(health: &Value) -> Vec<Value> {
+    let mut items = Vec::<Value>::new();
+    let mut seen = BTreeSet::<String>::new();
+
+    if let Some(checks) = health.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let check_id = check.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            if let Some(suggestions) = check
+                .get("evidence")
+                .and_then(|evidence| evidence.get("recoverySuggestions"))
+                .and_then(Value::as_array)
+            {
+                for suggestion in suggestions {
+                    let item = runtime_repair_item_from_suggestion(check_id, suggestion);
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if seen.insert(item_id) {
+                        items.push(item);
+                    }
+                }
+            }
+
+            if check_id != "runtime_startup_events" {
+                continue;
+            }
+            if let Some(events) = check
+                .get("evidence")
+                .and_then(|evidence| evidence.get("startupEvents"))
+                .and_then(|startup_events| startup_events.get("recent"))
+                .and_then(Value::as_array)
+            {
+                for event in events {
+                    if event.get("status").and_then(Value::as_str) != Some("failed") {
+                        continue;
+                    }
+                    if runtime_startup_event_has_missing_config_failure(event) {
+                        continue;
+                    }
+                    let item = runtime_repair_diagnostic_item_from_startup_event(event);
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if seen.insert(item_id) {
+                        items.push(item);
+                    }
+                }
+            }
+        }
+    }
+
+    items
+}
+
+fn runtime_repair_summary(items: &[Value]) -> Value {
+    let auto_applyable = items
+        .iter()
+        .filter(|item| item.get("classification").and_then(Value::as_str) == Some("auto_applyable"))
+        .count();
+    let operator_required = items
+        .iter()
+        .filter(|item| {
+            item.get("classification").and_then(Value::as_str) == Some("operator_required")
+        })
+        .count();
+    let blocked = items
+        .iter()
+        .filter(|item| item.get("classification").and_then(Value::as_str) == Some("blocked"))
+        .count();
+
+    json!({
+        "total": items.len(),
+        "autoApplyable": auto_applyable,
+        "operatorRequired": operator_required,
+        "blocked": blocked,
+    })
+}
+
+fn runtime_repair_apply_outcome(item: &Value) -> Value {
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let classification = item
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or("blocked");
+
+    match classification {
+        "auto_applyable" => json!({
+            "itemId": item_id,
+            "applied": false,
+            "status": "blocked",
+            "reason": "no deterministic auto-apply handler is registered for this repair item",
+        }),
+        "operator_required" => json!({
+            "itemId": item_id,
+            "applied": false,
+            "status": "skipped",
+            "reason": "operator action required; runtime repair will not write secrets, choose ports, enable legacy lanes, or restart long-running profiles automatically",
+        }),
+        _ => json!({
+            "itemId": item_id,
+            "applied": false,
+            "status": "blocked",
+            "reason": item.get("reason").cloned().unwrap_or(json!("repair item is blocked")),
+        }),
+    }
+}
+
+fn runtime_repair_json(app: &NanoclawApp, args: RuntimeRepairArgs) -> Result<Value> {
+    let health = runtime_health_json(app, args.limit)?;
+    let items = runtime_repair_items_from_health(&health);
+    let summary = runtime_repair_summary(&items);
+    let mut result = json!({
+        "schemaVersion": "2026-05-21",
+        "mode": args.mode.as_str(),
+        "ok": true,
+        "status": "nothing_to_repair",
+        "health": {
+            "status": health.get("status").cloned().unwrap_or(Value::Null),
+            "ok": health.get("ok").cloned().unwrap_or(Value::Null),
+            "summary": health.get("summary").cloned().unwrap_or(Value::Null),
+        },
+        "summary": summary,
+        "items": items,
+        "applyResults": [],
+    });
+
+    let total = result["summary"]["total"].as_u64().unwrap_or(0);
+    let auto_applyable = result["summary"]["autoApplyable"].as_u64().unwrap_or(0);
+    let operator_required = result["summary"]["operatorRequired"].as_u64().unwrap_or(0);
+    let blocked = result["summary"]["blocked"].as_u64().unwrap_or(0);
+
+    let status = match args.mode {
+        RuntimeRepairMode::Plan if total == 0 => "nothing_to_repair",
+        RuntimeRepairMode::Plan if blocked > 0 => "blocked",
+        RuntimeRepairMode::Plan if operator_required > 0 => "operator_action_required",
+        RuntimeRepairMode::Plan if auto_applyable > 0 => "ready_to_apply",
+        RuntimeRepairMode::Plan => "planned",
+        RuntimeRepairMode::Apply => {
+            let apply_results = result["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(runtime_repair_apply_outcome)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let applied_count = apply_results
+                .iter()
+                .filter(|outcome| outcome.get("applied").and_then(Value::as_bool) == Some(true))
+                .count();
+            let skipped_count = apply_results.len().saturating_sub(applied_count);
+            if let Value::Object(fields) = &mut result {
+                fields.insert("applyResults".to_string(), json!(apply_results));
+                fields.insert(
+                    "applySummary".to_string(),
+                    json!({
+                        "applied": applied_count,
+                        "skippedOrBlocked": skipped_count,
+                    }),
+                );
+            }
+            if applied_count > 0 {
+                "applied"
+            } else if skipped_count > 0 {
+                "nothing_applied"
+            } else {
+                "nothing_to_apply"
+            }
+        }
+    };
+
+    if let Value::Object(fields) = &mut result {
+        fields.insert("status".to_string(), json!(status));
+    }
+
+    Ok(result)
+}
+
+fn print_runtime_repair(config: NanoclawConfig, args: RuntimeRepairArgs) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_repair_json(&app, args)?)?
+    );
+    Ok(())
+}
+
+fn print_runtime_inspect(config: NanoclawConfig, limit: usize) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_inspect_json(&app, limit)?)?
+    );
+    Ok(())
+}
+
+fn print_runtime_health(config: NanoclawConfig, args: RuntimeHealthArgs) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    let mut health = runtime_health_json(&app, args.limit)?;
+    let notification = maybe_send_runtime_health_notification(&app.config, &args, &health)?;
+    if let Value::Object(fields) = &mut health {
+        fields.insert("notification".to_string(), notification);
+    }
+    println!("{}", serde_json::to_string_pretty(&health)?);
+    if args.strict && health.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("runtime health strict check failed");
+    }
+    Ok(())
+}
+
+fn print_runtime_cleanup(config: NanoclawConfig, args: RuntimeCleanupArgs) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&runtime_cleanup_json(&config, args))?
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parses_default_runtime_serve_profile() {
+        let mut args = Vec::<String>::new().into_iter();
+        let parsed = parse_runtime_serve_args(&mut args).unwrap();
+
+        assert_eq!(parsed.profile, RuntimeServeProfile::Full);
+        assert_eq!(parsed.lane_override, None);
+        assert!(!parsed.read_only);
+    }
+
+    #[test]
+    fn parses_runtime_serve_profile_lane_and_read_only() {
+        let mut args = vec![
+            "--profile".to_string(),
+            "gateway".to_string(),
+            "--lane".to_string(),
+            "omx".to_string(),
+            "--read-only".to_string(),
+        ]
+        .into_iter();
+        let parsed = parse_runtime_serve_args(&mut args).unwrap();
+
+        assert_eq!(parsed.profile, RuntimeServeProfile::Gateway);
+        assert_eq!(parsed.lane_override, Some(ExecutionLane::Omx));
+        assert!(parsed.read_only);
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_serve_profile() {
+        let mut args = vec!["--profile".to_string(), "legacy".to_string()].into_iter();
+        let error = parse_runtime_serve_args(&mut args).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported runtime serve profile"));
+    }
+
+    #[test]
+    fn parses_runtime_control_profile() {
+        let mut args = vec!["--profile".to_string(), "gateway".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_control_args(&mut args, "stop").unwrap(),
+            RuntimeServeProfile::Gateway
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_control_arg() {
+        let mut args = vec!["--force".to_string()].into_iter();
+        let error = parse_runtime_control_args(&mut args, "reload").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unexpected runtime reload argument"));
+    }
+
+    #[test]
+    fn parses_runtime_inspect_limit() {
+        let mut args = vec!["--limit".to_string(), "5".to_string()].into_iter();
+        assert_eq!(
+            parse_limit_args(&mut args, 10, "runtime inspect").unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn parses_runtime_state_limit() {
+        let mut args = vec!["--limit".to_string(), "4".to_string()].into_iter();
+        assert_eq!(parse_limit_args(&mut args, 10, "runtime state").unwrap(), 4);
+    }
+
+    #[test]
+    fn parses_runtime_cleanup_apply() {
+        let mut args = vec!["--apply".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_cleanup_args(&mut args).unwrap(),
+            RuntimeCleanupArgs {
+                apply: true,
+                include_state_residue: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_cleanup_state_residue_report() {
+        let mut args = vec!["--state-residue".to_string()].into_iter();
+        assert_eq!(
+            parse_runtime_cleanup_args(&mut args).unwrap(),
+            RuntimeCleanupArgs {
+                apply: false,
+                include_state_residue: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_health_strict_limit() {
+        let mut args = vec![
+            "--limit".to_string(),
+            "3".to_string(),
+            "--strict".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_health_args(&mut args).unwrap(),
+            RuntimeHealthArgs {
+                limit: 3,
+                strict: true,
+                notify_local: None,
+                notify_always: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_health_notification_target() {
+        let mut args = vec![
+            "--notify-local".to_string(),
+            "ops".to_string(),
+            "--notify-always".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_health_args(&mut args).unwrap(),
+            RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_repair_apply_limit() {
+        let mut args = vec![
+            "--apply".to_string(),
+            "--limit".to_string(),
+            "3".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_repair_args(&mut args).unwrap(),
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Apply,
+                limit: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_runtime_state_action_apply_confirm() {
+        let mut args = vec![
+            "--apply".to_string(),
+            "--confirm".to_string(),
+            "state-residue:agency_history_jsonl:archive_legacy_state".to_string(),
+            "--limit".to_string(),
+            "2".to_string(),
+        ]
+        .into_iter();
+        assert_eq!(
+            parse_runtime_state_action_args(&mut args).unwrap(),
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 2,
+                confirm: Some(
+                    "state-residue:agency_history_jsonl:archive_legacy_state".to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn task_complete_requires_manual_override() {
+        let mut args = vec!["task-1".to_string(), "done".to_string()].into_iter();
+        let error = parse_task_complete_args(&mut args).unwrap_err();
+
+        assert!(error.to_string().contains("requires --manual-override"));
+    }
+
+    #[test]
+    fn parses_task_complete_manual_override() {
+        let mut args = vec![
+            "--manual-override".to_string(),
+            "task-1".to_string(),
+            "operator".to_string(),
+            "verified".to_string(),
+        ]
+        .into_iter();
+        let parsed = parse_task_complete_args(&mut args).unwrap();
+
+        assert_eq!(parsed.task_id, "task-1");
+        assert_eq!(parsed.result.as_deref(), Some("operator verified"));
+    }
+
+    #[test]
+    fn detects_stale_runtime_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        fs::write(
+            runtime_pid_path(&config, RuntimeServeProfile::Full),
+            "999999999\n",
+        )?;
+
+        let state = runtime_pid_profile_state_json(&config, RuntimeServeProfile::Full);
+
+        assert_eq!(state["state"], "stale");
+        assert_eq!(state["pid"], 999999999);
+        assert_eq!(state["running"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_invalid_runtime_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        fs::write(
+            runtime_pid_path(&config, RuntimeServeProfile::Pm),
+            "not-a-pid\n",
+        )?;
+
+        let state = runtime_pid_profile_state_json(&config, RuntimeServeProfile::Pm);
+
+        assert_eq!(state["state"], "invalid");
+        assert_eq!(state["pid"], Value::Null);
+        assert_eq!(state["running"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_status_reports_tool_adapter_registry() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
+
+        let status = runtime_status_json(&config);
+
+        assert_eq!(status["toolAdapters"]["ok"], true);
+        assert_eq!(status["toolAdapters"]["external"]["status"], "missing");
+        assert!(
+            status["toolAdapters"]["builtIn"]["count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 7
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_status_reports_runtime_channel_registry() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
+        config.linear_webhook_port = 0;
+        config.openclaw_gateway_port = 0;
+        config.openclaw_gateway_token.clear();
+        config.linear_legacy_enabled = false;
+
+        let status = runtime_status_json(&config);
+        let channels = &status["runtimeChannels"];
+
+        assert_eq!(channels["ok"], true);
+        assert_eq!(channels["summary"]["total"], 6);
+        assert!(channels["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|channel| {
+                channel["id"] == "local"
+                    && channel["status"] == "ready"
+                    && channel["operatorVisible"] == true
+            }));
+        assert!(channels["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|channel| {
+                channel["id"] == "pm_automation"
+                    && channel["status"] == "legacy_disabled"
+                    && channel["legacy"] == true
+            }));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_flags_runtime_channel_misconfiguration() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        config.slack_env_file = None;
+        config.linear_webhook_port = 8789;
+        config.github_webhook_secret.clear();
+        config.observability_webhook_token.clear();
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+        let app = NanoclawApp::open(config)?;
+
+        let health = runtime_health_json(&app, 5)?;
+        let channel_check = health["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "runtime_channels")
+            .expect("runtime channel health check");
+
+        assert_eq!(channel_check["status"], "fail");
+        assert_eq!(channel_check["evidence"]["ok"], false);
+        assert_eq!(channel_check["evidence"]["summary"]["misconfigured"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_blocks_gateway_without_token() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+
+        let error = runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Gateway,
+                lane_override: None,
+                read_only: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("runtime_channel_misconfigured"));
+        assert!(error.contains("profile=gateway"));
+        assert!(error.contains("channel=openclaw_gateway"));
+        assert!(error.contains("NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+
+        let events = runtime_startup_events_json(&config, 5);
+        assert_eq!(events["totalRecords"], 1);
+        assert_eq!(events["recent"][0]["phase"], "preflight");
+        assert_eq!(events["recent"][0]["status"], "failed");
+        assert_eq!(events["recent"][0]["profile"], "gateway");
+        assert!(events["recent"][0]["evidence"]["failures"]
+            .to_string()
+            .contains("NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_blocks_slack_without_required_env_keys() -> Result<()> {
+        let temp = tempdir()?;
+        let env_file = temp.path().join(".env");
+        fs::write(&env_file, "SLACK_BOT_TOKEN=xoxb-test\n")?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = Some(env_file);
+
+        let error = runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Slack,
+                lane_override: None,
+                read_only: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("runtime_channel_misconfigured"));
+        assert!(error.contains("profile=slack"));
+        assert!(error.contains("channel=slack"));
+        assert!(error.contains("SLACK_APP_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_blocks_full_for_enabled_misconfigured_channel() -> Result<()> {
+        let temp = tempdir()?;
+        let env_file = temp.path().join(".env");
+        fs::write(
+            &env_file,
+            "SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\n",
+        )?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = Some(env_file);
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+
+        let error = runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Full,
+                lane_override: None,
+                read_only: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("profile=full"));
+        assert!(error.contains("channel=openclaw_gateway"));
+        assert!(error.contains("NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_allows_full_read_only_to_ignore_optional_servers() -> Result<()> {
+        let temp = tempdir()?;
+        let env_file = temp.path().join(".env");
+        fs::write(
+            &env_file,
+            "SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\n",
+        )?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = Some(env_file);
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token.clear();
+
+        runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Full,
+                lane_override: None,
+                read_only: true,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_serve_preflight_allows_ready_gateway() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.slack_env_file = None;
+        config.openclaw_gateway_port = 8788;
+        config.openclaw_gateway_token = "gateway-token".to_string();
+
+        runtime_serve_preflight(
+            &config,
+            &RuntimeServeArgs {
+                profile: RuntimeServeProfile::Gateway,
+                lane_override: None,
+                read_only: false,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_tool_adapter_registry_reports_invalid_external_manifest() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        fs::write(
+            config.tool_adapter_manifest_path(),
+            r#"[{
+                "id": "bad_shell",
+                "runtime_name": "bad-shell",
+                "mode": "shell",
+                "request_plane": "None",
+                "capabilities": {
+                    "web_request": false,
+                    "email_request": false,
+                    "browser": false,
+                    "repo_sync": false,
+                    "ssh": false,
+                    "host_command": false,
+                    "secret_broker": false,
+                    "os_control": false
+                },
+                "approval_policy": "not_required",
+                "artifact_kinds_required": [],
+                "verification_kinds_required": [],
+                "blockers_required_on_failure": false,
+                "workspace_required": false,
+                "operator_visible": false,
+                "source_material": null
+            }]"#,
+        )?;
+
+        let registry = runtime_tool_adapter_registry_json(&config);
+
+        assert_eq!(registry["ok"], false);
+        assert_eq!(registry["external"]["status"], "invalid");
+        assert!(registry["external"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed validation: bad_shell"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_dry_run_keeps_invalid_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Slack);
+        fs::write(&pid_path, "not-a-pid\n")?;
+
+        let report = runtime_cleanup_json(
+            &config,
+            RuntimeCleanupArgs {
+                apply: false,
+                include_state_residue: false,
+            },
+        );
+
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], false);
+        assert_eq!(report["summary"]["candidates"], 1);
+        assert!(pid_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cleanup_apply_removes_invalid_pid_file() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        fs::create_dir_all(runtime_control_dir(&config))?;
+        let pid_path = runtime_pid_path(&config, RuntimeServeProfile::Webhook);
+        fs::write(&pid_path, "not-a-pid\n")?;
+
+        let report = runtime_cleanup_json(
+            &config,
+            RuntimeCleanupArgs {
+                apply: true,
+                include_state_residue: false,
+            },
+        );
+
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], true);
+        assert_eq!(report["summary"]["removed"], 1);
+        assert!(!pid_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_residue_inventory_is_report_only() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(temp.path().join(".fastembed_cache"))?;
+        fs::create_dir_all(&config.data_dir)?;
+        fs::write(config.data_dir.join("agency_history.jsonl"), "{}\n")?;
+
+        let report = runtime_state_residue_json(&config);
+
+        assert_eq!(report["policy"]["cleanupCommandDeletesState"], false);
+        assert_eq!(report["policy"]["operatorActionRequired"], true);
+        assert_eq!(report["summary"]["presentLegacyCandidates"], 2);
+        assert_eq!(report["summary"]["operatorActions"], 8);
+        let legacy_keys = report["legacyCandidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["key"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(legacy_keys.contains("fastembed_cache"));
+        assert!(legacy_keys.contains("agency_history_jsonl"));
+        let actions = report["operatorActions"].as_array().unwrap();
+        let fastembed_action = actions
+            .iter()
+            .find(|item| item["key"] == "fastembed_cache")
+            .expect("fastembed cache action should exist");
+        assert_eq!(fastembed_action["action"], "purge_candidate");
+        assert_eq!(fastembed_action["destructive"], true);
+        assert_eq!(fastembed_action["approvalRequired"], true);
+        assert_eq!(fastembed_action["exists"], true);
+
+        let history_action = actions
+            .iter()
+            .find(|item| item["key"] == "agency_history_jsonl")
+            .expect("history action should exist");
+        assert_eq!(history_action["action"], "migration_candidate");
+        assert_eq!(history_action["destructive"], false);
+        assert_eq!(history_action["exists"], true);
+
+        let source_action = actions
+            .iter()
+            .find(|item| item["key"] == "src_memory")
+            .expect("source reference action should exist");
+        assert_eq!(source_action["action"], "preserve_reference");
+        assert_eq!(source_action["destructive"], false);
+        assert!(temp.path().join(".fastembed_cache").exists());
+        assert!(config.data_dir.join("agency_history.jsonl").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_plan_exposes_archivable_legacy_history() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(&config.data_dir)?;
+        fs::write(config.data_dir.join("agency_history.jsonl"), "{}\n")?;
+
+        let report = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Plan,
+                limit: 10,
+                confirm: None,
+            },
+        )?;
+
+        assert_eq!(report["status"], "ready_to_apply");
+        let items = report["items"].as_array().unwrap();
+        let history_action = items
+            .iter()
+            .find(|item| item["key"] == "agency_history_jsonl")
+            .expect("history action should exist");
+        assert_eq!(
+            history_action["actionId"],
+            "state-residue:agency_history_jsonl:archive_legacy_state"
+        );
+        assert_eq!(history_action["status"], "ready_to_apply");
+        assert_eq!(history_action["applyAction"], "archive_legacy_state");
+        assert_eq!(history_action["destructive"], false);
+        assert_eq!(history_action["requiresConfirm"], true);
+        assert_eq!(
+            history_action["originalOperatorAction"],
+            "migration_candidate"
+        );
+        assert!(config.data_dir.join("agency_history.jsonl").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_apply_requires_confirm() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+
+        let error = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 10,
+                confirm: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--confirm <action-id>"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_apply_archives_legacy_history_with_receipt() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(&config.data_dir)?;
+        let history_path = config.data_dir.join("agency_history.jsonl");
+        fs::write(&history_path, "{\"event\":\"legacy\"}\n")?;
+
+        let report = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 10,
+                confirm: Some(
+                    "state-residue:agency_history_jsonl:archive_legacy_state".to_string(),
+                ),
+            },
+        )?;
+
+        assert_eq!(report["status"], "applied");
+        assert_eq!(report["result"]["applied"], true);
+        assert!(!history_path.exists());
+        let archive_path = PathBuf::from(report["result"]["archivePath"].as_str().unwrap());
+        assert!(archive_path.exists());
+        assert_eq!(
+            fs::read_to_string(&archive_path)?,
+            "{\"event\":\"legacy\"}\n"
+        );
+        let receipt_path = PathBuf::from(
+            report["result"]["receipt"]["path"]
+                .as_str()
+                .expect("receipt path"),
+        );
+        assert!(receipt_path.exists());
+        let receipt = fs::read_to_string(receipt_path)?;
+        assert!(receipt.contains("state-residue:agency_history_jsonl:archive_legacy_state"));
+        assert!(receipt.contains("move_archive_back"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_action_apply_refuses_source_reference_mutation() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        fs::create_dir_all(config.project_root.join("src").join("memory"))?;
+
+        let report = runtime_state_action_json(
+            &config,
+            RuntimeStateActionArgs {
+                mode: RuntimeStateActionMode::Apply,
+                limit: 10,
+                confirm: Some("state-residue:src_memory:preserve_reference".to_string()),
+            },
+        )?;
+
+        assert_eq!(report["status"], "nothing_applied");
+        assert_eq!(report["result"]["applied"], false);
+        assert!(report["result"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not registered"));
+        assert!(config.project_root.join("src").join("memory").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_notification_skips_healthy_report_by_default() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        let health = json!({
+            "ok": true,
+            "status": "healthy",
+            "summary": {
+                "passing": 1,
+                "warnings": 0,
+                "failing": 0,
+            },
+            "checks": [],
+        });
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+
+        assert_eq!(notification["sent"], false);
+        assert_eq!(notification["reason"], "healthy");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_notification_writes_local_outbox_when_requested() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        let health = json!({
+            "ok": false,
+            "status": "unhealthy",
+            "summary": {
+                "passing": 0,
+                "warnings": 0,
+                "failing": 1,
+            },
+            "checks": [{
+                "id": "webhook_auth",
+                "status": "fail",
+                "message": "webhook server is enabled without auth",
+            }],
+        });
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 10,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+        let channel = LocalChannel::new(&config.data_dir)?;
+        let outbox = channel.read_outbox()?;
+
+        assert_eq!(notification["sent"], true);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].chat_jid, "ops");
+        assert!(outbox[0]
+            .text
+            .contains("NanoClaw runtime health: unhealthy"));
+        assert!(outbox[0].text.contains("webhook_auth"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_warns_on_recent_startup_failure() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "preflight",
+            "failed",
+            "synthetic gateway preflight failure",
+            json!({
+                "reason": "unit_test",
+                "failures": [{
+                    "id": "openclaw_gateway",
+                    "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                }],
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let health = runtime_health_json(&app, 5)?;
+        let check = health["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "runtime_startup_events")
+            .expect("runtime startup event health check should exist");
+
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(check["status"], "warn");
+        assert_eq!(check["evidence"]["failedRecent"], 1);
+        assert_eq!(check["evidence"]["failedProfiles"]["gateway"], 1);
+        assert_eq!(
+            check["evidence"]["recoverySuggestions"][0]["missingConfig"],
+            "NANOCLAW_OPENCLAW_GATEWAY_TOKEN"
+        );
+        assert!(check["evidence"]["recoverySuggestions"][0]["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_health_fails_on_repeated_startup_failures_and_notifies() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        for index in 0..3 {
+            record_runtime_startup_event(
+                &config,
+                &serve_args,
+                "preflight",
+                "failed",
+                format!("synthetic gateway preflight failure {index}"),
+                json!({
+                    "reason": "unit_test",
+                    "index": index,
+                    "failures": [{
+                        "id": "openclaw_gateway",
+                        "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                    }],
+                }),
+            )?;
+        }
+
+        let app = NanoclawApp::open(config.clone())?;
+        let health = runtime_health_json(&app, 5)?;
+        let notification = maybe_send_runtime_health_notification(
+            &config,
+            &RuntimeHealthArgs {
+                limit: 5,
+                strict: false,
+                notify_local: Some("ops".to_string()),
+                notify_always: false,
+            },
+            &health,
+        )?;
+        let channel = LocalChannel::new(&config.data_dir)?;
+        let outbox = channel.read_outbox()?;
+
+        assert_eq!(health["status"], "unhealthy");
+        assert_eq!(notification["sent"], true);
+        assert_eq!(outbox.len(), 1);
+        assert!(outbox[0].text.contains("runtime_startup_events"));
+        assert!(outbox[0]
+            .text
+            .contains("repeated runtime startup or preflight failures"));
+        assert!(outbox[0]
+            .text
+            .contains("Set NANOCLAW_OPENCLAW_GATEWAY_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_plan_dedupes_secret_recovery_as_operator_required() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        for index in 0..3 {
+            record_runtime_startup_event(
+                &config,
+                &serve_args,
+                "preflight",
+                "failed",
+                format!("synthetic gateway preflight failure {index}"),
+                json!({
+                    "reason": "unit_test",
+                    "failures": [{
+                        "id": "openclaw_gateway",
+                        "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                    }],
+                }),
+            )?;
+        }
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Plan,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "operator_action_required");
+        assert_eq!(repair["summary"]["total"], 1);
+        assert_eq!(repair["summary"]["operatorRequired"], 1);
+        assert_eq!(repair["items"][0]["classification"], "operator_required");
+        assert_eq!(
+            repair["items"][0]["missingConfig"],
+            "NANOCLAW_OPENCLAW_GATEWAY_TOKEN"
+        );
+        assert_eq!(repair["items"][0]["occurrences"], 3);
+        assert_eq!(repair["items"][0]["requiresSecret"], true);
+        assert_eq!(repair["items"][0]["safeToAutomate"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_apply_refuses_secret_bearing_recovery() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "preflight",
+            "failed",
+            "synthetic gateway preflight failure",
+            json!({
+                "reason": "unit_test",
+                "failures": [{
+                    "id": "openclaw_gateway",
+                    "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_TOKEN"],
+                }],
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Apply,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "nothing_applied");
+        assert_eq!(repair["applySummary"]["applied"], 0);
+        assert_eq!(repair["applySummary"]["skippedOrBlocked"], 1);
+        assert_eq!(repair["applyResults"][0]["applied"], false);
+        assert!(repair["applyResults"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("will not write secrets"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_plan_includes_non_secret_missing_config() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "preflight",
+            "failed",
+            "synthetic gateway preflight failure",
+            json!({
+                "reason": "unit_test",
+                "failures": [{
+                    "id": "openclaw_gateway",
+                    "missingConfig": ["NANOCLAW_OPENCLAW_GATEWAY_PORT"],
+                }],
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Plan,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "operator_action_required");
+        assert_eq!(repair["summary"]["total"], 1);
+        assert_eq!(repair["items"][0]["classification"], "operator_required");
+        assert_eq!(
+            repair["items"][0]["missingConfig"],
+            "NANOCLAW_OPENCLAW_GATEWAY_PORT"
+        );
+        assert_eq!(repair["items"][0]["requiresSecret"], false);
+        assert_eq!(repair["items"][0]["safeToAutomate"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_repair_plan_reports_unknown_startup_failure_as_blocked_diagnostic() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: None,
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "startup",
+            "failed",
+            "synthetic unknown startup failure",
+            json!({
+                "reason": "unit_test_unknown_shape",
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let repair = runtime_repair_json(
+            &app,
+            RuntimeRepairArgs {
+                mode: RuntimeRepairMode::Plan,
+                limit: 5,
+            },
+        )?;
+
+        assert_eq!(repair["status"], "blocked");
+        assert_eq!(repair["summary"]["total"], 1);
+        assert_eq!(repair["summary"]["blocked"], 1);
+        assert_eq!(
+            repair["items"][0]["kind"],
+            "runtime_startup_failure_diagnostic"
+        );
+        assert_eq!(repair["items"][0]["classification"], "blocked");
+        assert!(repair["items"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no deterministic remediation"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_reports_active_files_and_sidecars() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let app = NanoclawApp::open(config.clone())?;
+        let group = group_by_folder(&app, "main")?;
+        let session = ensure_cli_session(&app, &group)?;
+        let paths = ensure_session_sidecars(&session)?;
+        record_on_wake_message(&paths, &group, "wake")?;
+        let channel = LocalChannel::new(&config.data_dir)?;
+        channel.enqueue_inbound(LocalInboundEnvelope {
+            id: Some("local-in-1".to_string()),
+            chat_jid: "main".to_string(),
+            sender: "operator".to_string(),
+            sender_name: None,
+            content: "state probe".to_string(),
+            timestamp: Some("2026-05-20T00:00:00Z".to_string()),
+        })?;
+        channel.send_message("main", "state reply")?;
+
+        let state = runtime_state_json(&app, 5)?;
+
+        assert_eq!(state["ok"], true);
+        assert_eq!(state["centralDb"]["file"]["exists"], true);
+        assert_eq!(state["localChannel"]["inbox"]["jsonFiles"], 1);
+        assert_eq!(state["localChannel"]["outbox"]["jsonFiles"], 1);
+        assert_eq!(state["groupRoots"]["registeredTotal"], 1);
+        assert_eq!(state["sessionSidecars"]["linkedShown"], 1);
+        assert_eq!(
+            state["sessionSidecars"]["linkedItems"][0]["inboundDb"]["messagesIn"]["count"],
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_state_reports_startup_event_ledger() -> Result<()> {
+        let temp = tempdir()?;
+        let mut config = NanoclawConfig::from_env();
+        config.project_root = temp.path().to_path_buf();
+        config.data_dir = temp.path().join("data");
+        config.groups_dir = temp.path().join("groups");
+        config.store_dir = temp.path().join("store");
+        config.db_path = config.store_dir.join("messages.db");
+        let serve_args = RuntimeServeArgs {
+            profile: RuntimeServeProfile::Gateway,
+            lane_override: Some(ExecutionLane::Host),
+            read_only: false,
+        };
+        record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "startup",
+            "failed",
+            "synthetic startup failure",
+            json!({
+                "reason": "unit_test",
+            }),
+        )?;
+
+        let app = NanoclawApp::open(config)?;
+        let state = runtime_state_json(&app, 5)?;
+
+        assert_eq!(state["runtime"]["startupEvents"]["totalRecords"], 1);
+        assert_eq!(
+            state["runtime"]["startupEvents"]["recent"][0]["profile"],
+            "gateway"
+        );
+        assert_eq!(
+            state["runtime"]["startupEvents"]["recent"][0]["status"],
+            "failed"
+        );
+        assert_eq!(
+            state["runtime"]["startupEvents"]["recent"][0]["evidence"]["reason"],
+            "unit_test"
+        );
+        Ok(())
+    }
+}
+
+fn print_runtime_poll_summary(summary: super::runtime::RuntimePumpSummary) {
+    println!("inbound_messages: {}", summary.inbound_messages);
+    println!("processed_groups: {}", summary.processed_groups);
+    println!("scheduled_tasks_run: {}", summary.scheduled_tasks_run);
+    println!("scheduled_task_errors: {}", summary.scheduled_task_errors);
+    println!("swarm_tasks_run: {}", summary.swarm_tasks_run);
+    println!("swarm_task_errors: {}", summary.swarm_task_errors);
+    println!("outbound_messages: {}", summary.outbound_messages);
+}
+
+fn run_runtime_poll(config: NanoclawConfig, lane_override: Option<ExecutionLane>) -> Result<()> {
+    let app = NanoclawApp::open(config)?;
+    let executor = ExecutionLaneRouter::from_config(&app.config, lane_override)?;
+    let mut runtime = LocalRuntime::new(app, executor)?;
+    let summary = runtime.poll_once()?;
+    print_runtime_poll_summary(summary);
+    Ok(())
+}
+
+fn park_runtime(profile: RuntimeServeProfile) -> ! {
+    eprintln!("nanoclaw runtime profile '{}' is running", profile.as_str());
+    loop {
+        std::thread::park();
+    }
+}
+
+fn runtime_serve_required_channel_ids(profile: RuntimeServeProfile) -> &'static [&'static str] {
+    match profile {
+        RuntimeServeProfile::Full => &["slack"],
+        RuntimeServeProfile::Gateway => &["openclaw_gateway"],
+        RuntimeServeProfile::Webhook => &["webhook"],
+        RuntimeServeProfile::Pm => &["pm_automation", "slack"],
+        RuntimeServeProfile::Slack => &["slack"],
+    }
+}
+
+fn runtime_serve_channel_evidence(
+    registry: &RuntimeChannelRegistry,
+    profile: RuntimeServeProfile,
+) -> Value {
+    let profile_name = profile.as_str();
+    let required_channel_ids = runtime_serve_required_channel_ids(profile);
+    let channels = registry
+        .channels
+        .iter()
+        .filter(|channel| {
+            required_channel_ids.contains(&channel.id.as_str())
+                || channel
+                    .serve_profiles
+                    .iter()
+                    .any(|candidate| candidate == profile_name)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "summary": &registry.summary,
+        "requiredChannelIds": required_channel_ids,
+        "profileChannels": channels,
+    })
+}
+
+fn runtime_serve_preflight(config: &NanoclawConfig, serve_args: &RuntimeServeArgs) -> Result<()> {
+    let registry = runtime_channel_registry(config);
+    let failures = runtime_serve_preflight_failures(&registry, serve_args);
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let message = format_runtime_channel_preflight_error(serve_args.profile, &failures);
+    if let Err(error) = record_runtime_startup_event(
+        config,
+        serve_args,
+        "preflight",
+        "failed",
+        message.clone(),
+        json!({
+            "runtimeChannels": runtime_serve_channel_evidence(&registry, serve_args.profile),
+            "failures": failures,
+        }),
+    ) {
+        eprintln!("warning: failed to record runtime startup preflight evidence: {error}");
+    }
+
+    anyhow::bail!("{}", message)
+}
+
+fn runtime_serve_preflight_failures<'a>(
+    registry: &'a RuntimeChannelRegistry,
+    serve_args: &RuntimeServeArgs,
+) -> Vec<&'a RuntimeChannelDescriptor> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut failures = Vec::<&RuntimeChannelDescriptor>::new();
+
+    for id in runtime_serve_required_channel_ids(serve_args.profile) {
+        if let Some(channel) = registry.channels.iter().find(|channel| channel.id == *id) {
+            if channel.status != RuntimeChannelStatus::Ready && seen.insert(channel.id.clone()) {
+                failures.push(channel);
+            }
+        }
+    }
+
+    if !serve_args.read_only {
+        let profile = serve_args.profile.as_str();
+        for channel in registry.channels.iter().filter(|channel| {
+            channel
+                .serve_profiles
+                .iter()
+                .any(|candidate| candidate == profile)
+                && channel.status == RuntimeChannelStatus::Misconfigured
+        }) {
+            if seen.insert(channel.id.clone()) {
+                failures.push(channel);
+            }
+        }
+    }
+
+    failures
+}
+
+fn format_runtime_channel_preflight_error(
+    profile: RuntimeServeProfile,
+    failures: &[&RuntimeChannelDescriptor],
+) -> String {
+    let details = failures
+        .iter()
+        .map(|channel| {
+            let missing = if channel.missing_config.is_empty() {
+                "none".to_string()
+            } else {
+                channel.missing_config.join(",")
+            };
+            format!(
+                "channel={} status={} missing=[{}] configSource={} authRequired={} authConfigured={}",
+                channel.id,
+                channel.status_message,
+                missing,
+                channel.config_source,
+                channel.auth.required,
+                channel.auth.configured
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "runtime_channel_misconfigured profile={} {}",
+        profile.as_str(),
+        details
+    )
+}
+
+fn record_runtime_profile_running(
+    config: &NanoclawConfig,
+    serve_args: &RuntimeServeArgs,
+) -> Result<()> {
+    let registry = runtime_channel_registry(config);
+    record_runtime_startup_event(
+        config,
+        serve_args,
+        "startup",
+        "running",
+        format!(
+            "runtime profile '{}' entered its serving loop",
+            serve_args.profile.as_str()
+        ),
+        json!({
+            "control": runtime_pid_profile_state_json(config, serve_args.profile),
+            "runtimeChannels": runtime_serve_channel_evidence(&registry, serve_args.profile),
+        }),
+    )?;
+    Ok(())
+}
+
+fn run_runtime_serve_profile(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
+    let _pid_guard = write_runtime_pid_file(&config, serve_args.profile)?;
+    match serve_args.profile {
+        RuntimeServeProfile::Full => {
+            let app = NanoclawApp::open(config.clone())?;
+            if !serve_args.read_only {
+                start_webhook_server(app.config.clone())?;
+                start_pm_automation_loop(app.config.clone())?;
+                start_openclaw_gateway_server(app.config.clone())?;
+            }
+            let executor =
+                ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override.clone())?;
+            let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let running_config = app.config.clone();
+            let mut runtime = SlackRuntime::new(app, channel, executor);
+            record_runtime_profile_running(&running_config, &serve_args)?;
+            runtime.run_forever()?;
+        }
+        RuntimeServeProfile::Gateway => {
+            let running_config = config.clone();
+            let _app = NanoclawApp::open(config.clone())?;
+            start_openclaw_gateway_server(config)?;
+            record_runtime_profile_running(&running_config, &serve_args)?;
+            park_runtime(RuntimeServeProfile::Gateway);
+        }
+        RuntimeServeProfile::Webhook => {
+            let running_config = config.clone();
+            start_webhook_server(config)?;
+            record_runtime_profile_running(&running_config, &serve_args)?;
+            park_runtime(RuntimeServeProfile::Webhook);
+        }
+        RuntimeServeProfile::Pm => {
+            let running_config = config.clone();
+            start_pm_automation_loop(config)?;
+            record_runtime_profile_running(&running_config, &serve_args)?;
+            park_runtime(RuntimeServeProfile::Pm);
+        }
+        RuntimeServeProfile::Slack => {
+            let app = NanoclawApp::open(config)?;
+            let executor =
+                ExecutionLaneRouter::from_config(&app.config, serve_args.lane_override.clone())?;
+            let channel = SlackChannel::from_config(&app.config, serve_args.read_only)?;
+            let running_config = app.config.clone();
+            let mut runtime = SlackRuntime::new(app, channel, executor);
+            record_runtime_profile_running(&running_config, &serve_args)?;
+            runtime.run_forever()?;
+        }
+    }
+    Ok(())
+}
+
+fn run_runtime_serve(config: NanoclawConfig, serve_args: RuntimeServeArgs) -> Result<()> {
+    runtime_serve_preflight(&config, &serve_args)?;
+    let registry = runtime_channel_registry(&config);
+    record_runtime_startup_event(
+        &config,
+        &serve_args,
+        "startup",
+        "starting",
+        format!(
+            "runtime profile '{}' passed preflight and is starting",
+            serve_args.profile.as_str()
+        ),
+        json!({
+            "runtimeChannels": runtime_serve_channel_evidence(&registry, serve_args.profile),
+        }),
+    )?;
+
+    let result = run_runtime_serve_profile(config.clone(), serve_args.clone());
+    if let Err(error) = &result {
+        if let Err(record_error) = record_runtime_startup_event(
+            &config,
+            &serve_args,
+            "startup",
+            "failed",
+            error.to_string(),
+            json!({
+                "control": runtime_pid_profile_state_json(&config, serve_args.profile),
+                "runtimeChannels": runtime_serve_channel_evidence(
+                    &runtime_channel_registry(&config),
+                    serve_args.profile
+                ),
+            }),
+        ) {
+            eprintln!("warning: failed to record runtime startup failure evidence: {record_error}");
+        }
+    }
+    result
 }
 
 fn parse_lane_override<I>(args: &mut I) -> Result<Option<ExecutionLane>>
@@ -69,6 +4567,125 @@ fn parse_request_plane(value: Option<String>) -> RequestPlane {
     value
         .map(|value| RequestPlane::parse(&value))
         .unwrap_or(RequestPlane::None)
+}
+
+fn parse_group_runtime_set_args<I>(
+    existing: GroupRuntimeConfig,
+    args: &mut I,
+) -> Result<GroupRuntimeConfig>
+where
+    I: Iterator<Item = String>,
+{
+    let mut config = existing;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--provider" => {
+                config.provider = Some(
+                    args.next()
+                        .context("missing value after --provider")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--backend" => {
+                config.backend = Some(
+                    args.next()
+                        .context("missing value after --backend")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--model" => {
+                config.model = Some(
+                    args.next()
+                        .context("missing value after --model")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--effort" => {
+                config.effort = Some(
+                    args.next()
+                        .context("missing value after --effort")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--assistant-name" => {
+                config.assistant_name = Some(
+                    args.next()
+                        .context("missing value after --assistant-name")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--max-messages-per-prompt" => {
+                let value = args
+                    .next()
+                    .context("missing value after --max-messages-per-prompt")?;
+                let parsed = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --max-messages-per-prompt value {value}"))?;
+                if parsed == 0 {
+                    anyhow::bail!("--max-messages-per-prompt must be greater than zero");
+                }
+                config.max_messages_per_prompt = Some(parsed);
+            }
+            "--image-tag" => {
+                config.image_tag = Some(
+                    args.next()
+                        .context("missing value after --image-tag")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--cli-scope" => {
+                config.cli_scope = Some(
+                    args.next()
+                        .context("missing value after --cli-scope")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            "--clear-provider" => config.provider = None,
+            "--clear-backend" => config.backend = None,
+            "--clear-model" => config.model = None,
+            "--clear-effort" => config.effort = None,
+            "--clear-assistant-name" => config.assistant_name = None,
+            "--clear-max-messages-per-prompt" => config.max_messages_per_prompt = None,
+            "--clear-image-tag" => config.image_tag = None,
+            "--clear-cli-scope" => config.cli_scope = None,
+            other => anyhow::bail!("unexpected group-runtime set argument '{}'", other),
+        }
+    }
+    Ok(config)
+}
+
+fn group_by_folder(app: &NanoclawApp, group_folder: &str) -> Result<Group> {
+    app.groups()?
+        .into_iter()
+        .find(|group| group.folder == group_folder)
+        .with_context(|| format!("registered group not found: {group_folder}"))
+}
+
+fn ensure_cli_session(
+    app: &NanoclawApp,
+    group: &Group,
+) -> Result<super::executor::ExecutionSession> {
+    let session_id = app
+        .db
+        .session_for_group(&group.folder)?
+        .unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
+    app.db.upsert_session(&group.folder, &session_id)?;
+    let session = build_execution_session(
+        &app.config.data_dir,
+        &group.folder,
+        &session_id,
+        &app.config.groups_dir.join(&group.folder),
+    );
+    session.ensure_layout()?;
+    ensure_session_sidecars(&session)?;
+    Ok(session)
 }
 
 fn parse_host_os_action(action_kind: &str, args: &[String]) -> Result<HostOsControlAction> {
@@ -236,6 +4853,10 @@ fn notify_host_os_record(app: &mut NanoclawApp, chat_jid: Option<&str>, body: &s
 pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
     let mut args = args.into_iter();
     let command = args.next().unwrap_or_else(|| "bootstrap".to_string());
+    if matches!(command.as_str(), "--help" | "-h" | "help") {
+        print_usage();
+        return Ok(());
+    }
     if command == "exec-worker" {
         let Some(request_path) = args.next() else {
             print_usage();
@@ -350,6 +4971,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     .unwrap_or_else(|| "-".to_string())
             );
             println!("slack_poll_interval_ms: {}", config.slack_poll_interval_ms);
+            println!("linear_legacy_enabled: {}", config.linear_legacy_enabled);
             println!("linear_webhook_port: {}", config.linear_webhook_port);
             println!(
                 "observability_chat_jid: {}",
@@ -374,6 +4996,10 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
             println!(
                 "observability_adapters_path: {}",
                 config.observability_adapters_path.display()
+            );
+            println!(
+                "tool_adapters_path: {}",
+                config.tool_adapter_manifest_path().display()
             );
             println!(
                 "linear_chat_jid: {}",
@@ -419,6 +5045,124 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     .unwrap_or("-")
             );
         }
+        "runtime" => {
+            let Some(runtime_command) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            match runtime_command.as_str() {
+                "status" => print_runtime_status(&config)?,
+                "state" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime state")?;
+                    print_runtime_state(config, limit)?;
+                }
+                "state-action" => {
+                    let action_args = parse_runtime_state_action_args(&mut args)?;
+                    print_runtime_state_action(config, action_args)?;
+                }
+                "source-disposition" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime source-disposition")?;
+                    print_runtime_source_disposition(config, limit)?;
+                }
+                "inspect" => {
+                    let limit = parse_limit_args(&mut args, 10, "runtime inspect")?;
+                    print_runtime_inspect(config, limit)?;
+                }
+                "health" => {
+                    let health_args = parse_runtime_health_args(&mut args)?;
+                    print_runtime_health(config, health_args)?;
+                }
+                "repair" => {
+                    let repair_args = parse_runtime_repair_args(&mut args)?;
+                    print_runtime_repair(config, repair_args)?;
+                }
+                "cleanup" => {
+                    let cleanup_args = parse_runtime_cleanup_args(&mut args)?;
+                    print_runtime_cleanup(config, cleanup_args)?;
+                }
+                "poll" => {
+                    let lane_override = parse_lane_override(&mut args)?;
+                    run_runtime_poll(config, lane_override)?;
+                }
+                "serve" => {
+                    let serve_args = parse_runtime_serve_args(&mut args)?;
+                    run_runtime_serve(config, serve_args)?;
+                }
+                "stop" => {
+                    let profile = parse_runtime_control_args(&mut args, "stop")?;
+                    signal_runtime_profile(&config, profile, "-TERM", true)?;
+                }
+                "reload" => {
+                    let profile = parse_runtime_control_args(&mut args, "reload")?;
+                    signal_runtime_profile(&config, profile, "-HUP", false)?;
+                }
+                other => anyhow::bail!("unsupported runtime command '{}'", other),
+            }
+        }
+        "group-runtime" => {
+            let Some(group_command) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let Some(group_folder) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let app = NanoclawApp::open(config)?;
+            match group_command.as_str() {
+                "show" => {
+                    let runtime_config = app.group_runtime_config(&group_folder)?;
+                    println!("{}", serde_json::to_string_pretty(&runtime_config)?);
+                }
+                "set" => {
+                    let existing = app.group_runtime_config(&group_folder)?;
+                    let runtime_config = parse_group_runtime_set_args(existing, &mut args)?;
+                    app.set_group_runtime_config(&group_folder, &runtime_config)?;
+                    println!("{}", serde_json::to_string_pretty(&runtime_config)?);
+                }
+                other => anyhow::bail!("unsupported group-runtime command '{}'", other),
+            }
+        }
+        "session" => {
+            let Some(session_command) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let Some(group_folder) = args.next() else {
+                print_usage();
+                std::process::exit(2);
+            };
+            let app = NanoclawApp::open(config)?;
+            let group = group_by_folder(&app, &group_folder)?;
+            let session = ensure_cli_session(&app, &group)?;
+            let paths = ensure_session_sidecars(&session)?;
+            match session_command.as_str() {
+                "show" => {
+                    println!("session_id: {}", session.id);
+                    println!("session_root: {}", session.session_root);
+                    println!("inbound_db: {}", paths.inbound_db.display());
+                    println!("outbound_db: {}", paths.outbound_db.display());
+                }
+                "wake" => {
+                    let content = args.collect::<Vec<_>>().join(" ");
+                    let content = if content.trim().is_empty() {
+                        "Session wake event.".to_string()
+                    } else {
+                        content
+                    };
+                    let id = record_on_wake_message(&paths, &group, &content)?;
+                    app.db.record_destination_projection(
+                        &group.folder,
+                        &session.id,
+                        &paths.inbound_db,
+                        "session_on_wake",
+                    )?;
+                    println!("wake_message_id: {}", id);
+                    println!("inbound_db: {}", paths.inbound_db.display());
+                }
+                other => anyhow::bail!("unsupported session command '{}'", other),
+            }
+        }
         "gateway" => {
             let subcommand = args.next().unwrap_or_else(|| "show-config".to_string());
             match subcommand.as_str() {
@@ -429,6 +5173,13 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                             &config
                         ))?
                     );
+                }
+                "serve" => {
+                    let _app = NanoclawApp::open(config.clone())?;
+                    start_openclaw_gateway_server(config)?;
+                    loop {
+                        std::thread::park();
+                    }
                 }
                 other => anyhow::bail!("unsupported gateway command '{}'", other),
             }
@@ -1052,27 +5803,15 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
                     println!("deleted: {}", task_id);
                 }
                 "complete" => {
-                    let Some(task_id) = args.next() else {
-                        print_usage();
-                        std::process::exit(2);
-                    };
-                    let result = args.collect::<Vec<_>>().join(" ");
-                    let updated = app.complete_task_run(
-                        &task_id,
-                        0,
-                        if result.trim().is_empty() {
-                            None
-                        } else {
-                            Some(result)
-                        },
-                        None,
-                    )?;
+                    let parsed = parse_task_complete_args(&mut args)?;
+                    let updated =
+                        app.complete_task_run_manual_override(&parsed.task_id, parsed.result)?;
                     if let Some(task) = updated {
                         println!("completed: {}", task.id);
                         println!("status: {}", task.status.as_str());
                         println!("next_run: {}", task.next_run.as_deref().unwrap_or("-"));
                     } else {
-                        println!("task_not_found: {}", task_id);
+                        println!("task_not_found: {}", parsed.task_id);
                     }
                 }
                 "run-due" => {
@@ -1220,6 +5959,11 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
             }
         }
         "linear" => {
+            if !config.linear_legacy_enabled {
+                anyhow::bail!(
+                    "Linear integration is discontinued for this Nexus runtime; set NANOCLAW_LINEAR_LEGACY_ENABLED=true only for controlled legacy migration"
+                );
+            }
             let Some(linear_command) = args.next() else {
                 print_usage();
                 std::process::exit(2);

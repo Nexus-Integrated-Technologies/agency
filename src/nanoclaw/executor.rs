@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -12,6 +13,7 @@ use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::foundation::{
@@ -23,6 +25,7 @@ use crate::foundation::{
     SessionStore, TaskKind, TaskSignature,
 };
 
+use super::command_safety::first_blocking_command_safety_violation;
 use super::config::NanoclawConfig;
 use super::dev_environment::DigitalOceanDevEnvironment;
 use super::fpf_bridge::{
@@ -31,6 +34,7 @@ use super::fpf_bridge::{
 };
 use super::model_router::{resolve_worker_backend, ResolvedWorkerBackend, WorkerBackend};
 use super::omx::{OmxExecutionOptions, OmxRunnerClient};
+use super::output_safety::{output_safety_report_body, redact_sensitive_output};
 use super::request_plane::{get_request_plane_env, get_request_plane_text_error};
 use super::security_profile::{
     build_execution_provenance_record, derive_capability_manifest, get_capability_manifest_env,
@@ -40,10 +44,64 @@ use super::security_profile::{
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 const SOURCE_CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const DEFAULT_CONTAINER_CACHE_DIR: &str = "/tmp/nanoclaw-target";
 const DEFAULT_CODEX_SANDBOX: &str = "workspace-write";
+const DEFAULT_WORKERS_AI_PROXY_URL: &str = "https://lab.bybuddha.dev/paperclip.ai";
+
+fn summarize_workers_ai_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "empty response body".to_string();
+    }
+    const MAX_BYTES: usize = 1_024;
+    if trimmed.len() <= MAX_BYTES {
+        return trimmed.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}... [truncated {} bytes]",
+        &trimmed[..end],
+        trimmed.len() - end
+    )
+}
+
+fn normalize_workers_ai_proxy_url(raw_proxy_url: &str) -> Result<String> {
+    let raw = raw_proxy_url.trim();
+    let mut parsed =
+        reqwest::Url::parse(raw).context("PAPERCLIP_WORKERS_AI_PROXY_URL must be a valid URL")?;
+
+    let path_segments = parsed
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let mut normalized_segments = path_segments;
+
+    while normalized_segments.len() > 1
+        && normalized_segments.last() == Some(&"tasks")
+        && normalized_segments[normalized_segments.len() - 2] == "tasks"
+    {
+        normalized_segments.pop();
+    }
+
+    if normalized_segments.last() != Some(&"tasks") {
+        normalized_segments.push("tasks");
+    }
+
+    let next_path = if normalized_segments.is_empty() {
+        "/tasks".to_string()
+    } else {
+        format!("/{}", normalized_segments.join("/"))
+    };
+    parsed.set_path(&next_path);
+
+    Ok(parsed.to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionSession {
@@ -71,7 +129,7 @@ impl ExecutionSession {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("ncl-{}.sock", compact_session_suffix(&self.id)))
+        worker_socket_path(Path::new(&self.session_root), &self.id)
     }
 
     pub fn pid_path(&self) -> PathBuf {
@@ -98,6 +156,22 @@ fn compact_session_suffix(session_id: &str) -> String {
     } else {
         compact[compact.len() - 12..].to_string()
     }
+}
+
+fn worker_socket_path(session_root: &Path, session_id: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(session_root.display().to_string().as_bytes());
+    let digest = hasher.finalize();
+    let root_hash = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::env::temp_dir().join(format!(
+        "ncl-{}-{}.sock",
+        compact_session_suffix(session_id),
+        root_hash
+    ))
 }
 
 pub fn build_execution_session(
@@ -129,6 +203,7 @@ pub struct ExecutionRequest {
     pub omx: Option<OmxExecutionOptions>,
     pub assistant_name: String,
     pub request_plane: RequestPlane,
+    pub env: BTreeMap<String, String>,
     pub session: ExecutionSession,
     pub backend_override: Option<WorkerBackend>,
     pub task_signature: Option<TaskSignature>,
@@ -184,6 +259,130 @@ pub struct ExecutionMetadata {
     pub external_run_id: Option<String>,
 }
 
+pub const EXECUTION_EVIDENCE_SCHEMA_VERSION: &str = "2026-05-20";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEvidenceMode {
+    Code,
+    Shell,
+    Gateway,
+    Http,
+    Advisory,
+}
+
+impl ExecutionEvidenceMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Shell => "shell",
+            Self::Gateway => "gateway",
+            Self::Http => "http",
+            Self::Advisory => "advisory",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEvidenceStatus {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl ExecutionEvidenceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionWorkspaceEvidence {
+    pub root: Option<String>,
+    pub exists: bool,
+    pub local: bool,
+    pub group_folder: Option<String>,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionGitFileChange {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionGitCommitRef {
+    pub sha: String,
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionGitEvidence {
+    pub is_repo: bool,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub dirty: bool,
+    pub changed_files: Vec<ExecutionGitFileChange>,
+    pub commits: Vec<ExecutionGitCommitRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionVerificationRef {
+    pub kind: String,
+    pub command: Option<String>,
+    pub status: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecutionBlockerRef {
+    pub kind: String,
+    pub source: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionEvidence {
+    pub schema_version: String,
+    pub adapter_type: String,
+    pub mode: ExecutionEvidenceMode,
+    pub run_id: String,
+    pub status: ExecutionEvidenceStatus,
+    pub workspace: ExecutionWorkspaceEvidence,
+    pub git: ExecutionGitEvidence,
+    pub boundary: ExecutionBoundary,
+    pub artifacts: Vec<ExecutionArtifactRef>,
+    pub verification: Vec<ExecutionVerificationRef>,
+    pub blockers: Vec<ExecutionBlockerRef>,
+    pub provenance_id: Option<String>,
+    pub external_run_id: Option<String>,
+}
+
+pub struct BuildExecutionEvidenceInput<'a> {
+    pub adapter_type: &'a str,
+    pub mode: ExecutionEvidenceMode,
+    pub run_id: &'a str,
+    pub status: ExecutionEvidenceStatus,
+    pub session_id: &'a str,
+    pub group_folder: Option<&'a str>,
+    pub workspace_root: Option<&'a str>,
+    pub boundary: &'a ExecutionBoundary,
+    pub log_path: Option<&'a str>,
+    pub log_body: Option<&'a str>,
+    pub metadata: Option<&'a ExecutionMetadata>,
+    pub provenance_id: Option<&'a str>,
+    pub verification: Vec<ExecutionVerificationRef>,
+    pub blockers: Vec<ExecutionBlockerRef>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionResponse {
     pub text: String,
@@ -193,6 +392,277 @@ pub struct ExecutionResponse {
     pub log_body: Option<String>,
     pub provenance: Option<ExecutionProvenanceRecord>,
     pub metadata: Option<ExecutionMetadata>,
+    pub evidence: Option<ExecutionEvidence>,
+}
+
+pub fn build_execution_evidence(input: BuildExecutionEvidenceInput<'_>) -> ExecutionEvidence {
+    let artifacts = collect_execution_artifacts(
+        input.adapter_type,
+        input.log_path,
+        input.log_body,
+        input.metadata,
+    );
+    let workspace_exists = input
+        .workspace_root
+        .map(|root| Path::new(root).exists())
+        .unwrap_or(false);
+
+    ExecutionEvidence {
+        schema_version: EXECUTION_EVIDENCE_SCHEMA_VERSION.to_string(),
+        adapter_type: input.adapter_type.to_string(),
+        mode: input.mode,
+        run_id: input.run_id.to_string(),
+        status: input.status,
+        workspace: ExecutionWorkspaceEvidence {
+            root: input.workspace_root.map(str::to_string),
+            exists: workspace_exists,
+            local: workspace_exists,
+            group_folder: input.group_folder.map(str::to_string),
+            session_id: input.session_id.to_string(),
+        },
+        git: collect_git_evidence(input.workspace_root),
+        boundary: input.boundary.clone(),
+        artifacts,
+        verification: input.verification,
+        blockers: input.blockers,
+        provenance_id: input.provenance_id.map(str::to_string),
+        external_run_id: input
+            .metadata
+            .and_then(|metadata| metadata.external_run_id.clone()),
+    }
+}
+
+fn status_verification(
+    kind: &str,
+    command: Option<String>,
+    status: ExecutionEvidenceStatus,
+    summary: Option<String>,
+) -> ExecutionVerificationRef {
+    ExecutionVerificationRef {
+        kind: kind.to_string(),
+        command,
+        status: status.as_str().to_string(),
+        summary,
+    }
+}
+
+pub fn validate_execution_response_evidence(response: &ExecutionResponse) -> Result<()> {
+    let Some(evidence) = response.evidence.as_ref() else {
+        bail!(
+            "execution evidence missing for session {}",
+            response.session_id
+        );
+    };
+    validate_execution_evidence(evidence, Some(response.session_id.as_str()))
+}
+
+pub fn validate_execution_evidence(
+    evidence: &ExecutionEvidence,
+    expected_session_id: Option<&str>,
+) -> Result<()> {
+    if evidence.schema_version != EXECUTION_EVIDENCE_SCHEMA_VERSION {
+        bail!(
+            "execution evidence schema mismatch for run {}: expected {}, got {}",
+            evidence.run_id,
+            EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            evidence.schema_version
+        );
+    }
+    if evidence.run_id.trim().is_empty() {
+        bail!("execution evidence missing run_id");
+    }
+    if evidence.adapter_type.trim().is_empty() {
+        bail!(
+            "execution evidence missing adapter_type for run {}",
+            evidence.run_id
+        );
+    }
+    if let Some(expected_session_id) = expected_session_id {
+        if evidence.workspace.session_id != expected_session_id {
+            bail!(
+                "execution evidence session mismatch for run {}: response={}, evidence={}",
+                evidence.run_id,
+                expected_session_id,
+                evidence.workspace.session_id
+            );
+        }
+    }
+    if evidence.verification.is_empty() {
+        bail!(
+            "execution evidence missing verification for run {}",
+            evidence.run_id
+        );
+    }
+    if matches!(evidence.status, ExecutionEvidenceStatus::Succeeded)
+        && is_completion_capable_mode(&evidence.mode)
+        && evidence.artifacts.is_empty()
+    {
+        bail!(
+            "execution evidence missing artifacts for completion-capable run {}",
+            evidence.run_id
+        );
+    }
+    Ok(())
+}
+
+fn is_completion_capable_mode(mode: &ExecutionEvidenceMode) -> bool {
+    matches!(
+        mode,
+        ExecutionEvidenceMode::Code | ExecutionEvidenceMode::Shell | ExecutionEvidenceMode::Gateway
+    )
+}
+
+fn collect_execution_artifacts(
+    adapter_type: &str,
+    log_path: Option<&str>,
+    log_body: Option<&str>,
+    metadata: Option<&ExecutionMetadata>,
+) -> Vec<ExecutionArtifactRef> {
+    let raw_metadata_artifacts = metadata
+        .map(|metadata| metadata.artifacts.clone())
+        .unwrap_or_default();
+    let mut artifacts = Vec::new();
+    for artifact in raw_metadata_artifacts {
+        append_output_safety_report(
+            &mut artifacts,
+            adapter_type,
+            artifact.title.as_str(),
+            artifact.body.as_deref(),
+        );
+        artifacts.push(redact_execution_artifact_body(artifact));
+    }
+    if let Some(log_path) = log_path {
+        let already_present = artifacts
+            .iter()
+            .any(|artifact| artifact.location.as_deref() == Some(log_path));
+        if !already_present {
+            append_output_safety_report(&mut artifacts, adapter_type, "execution_log", log_body);
+            artifacts.push(ExecutionArtifactRef {
+                kind: "execution_log".to_string(),
+                title: format!("{adapter_type} execution log"),
+                location: Some(log_path.to_string()),
+                body: log_body.map(redact_sensitive_output),
+            });
+        }
+    }
+    if log_path.is_none() && log_body.is_some() {
+        append_output_safety_report(&mut artifacts, adapter_type, "execution_log", log_body);
+        artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: format!("{adapter_type} execution log"),
+            location: None,
+            body: log_body.map(redact_sensitive_output),
+        });
+    }
+    artifacts
+}
+
+fn redact_execution_artifact_body(mut artifact: ExecutionArtifactRef) -> ExecutionArtifactRef {
+    artifact.body = artifact.body.as_deref().map(redact_sensitive_output);
+    artifact
+}
+
+fn append_output_safety_report(
+    artifacts: &mut Vec<ExecutionArtifactRef>,
+    adapter_type: &str,
+    source: &str,
+    body: Option<&str>,
+) {
+    let Some(body) = body else {
+        return;
+    };
+    let Some(report_body) = output_safety_report_body(source, body) else {
+        return;
+    };
+    artifacts.push(ExecutionArtifactRef {
+        kind: "output_safety_report".to_string(),
+        title: format!("{adapter_type} output safety report"),
+        location: None,
+        body: Some(report_body),
+    });
+}
+
+fn collect_git_evidence(workspace_root: Option<&str>) -> ExecutionGitEvidence {
+    let Some(root) = workspace_root else {
+        return ExecutionGitEvidence::default();
+    };
+    let root = Path::new(root);
+    if !root.exists() {
+        return ExecutionGitEvidence::default();
+    }
+    let is_repo = git_output(root, &["rev-parse", "--is-inside-work-tree"])
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    if !is_repo {
+        return ExecutionGitEvidence::default();
+    }
+
+    let branch = git_output(root, &["branch", "--show-current"]);
+    let head_sha = git_output(root, &["rev-parse", "HEAD"]);
+    let changed_files = git_output(root, &["status", "--porcelain=v1"])
+        .map(|output| parse_git_status_porcelain(&output))
+        .unwrap_or_default();
+    let commits = git_output(root, &["log", "-5", "--pretty=format:%H%x1f%s"])
+        .map(|output| parse_git_log_refs(&output))
+        .unwrap_or_default();
+
+    ExecutionGitEvidence {
+        is_repo,
+        branch,
+        head_sha,
+        dirty: !changed_files.is_empty(),
+        changed_files,
+        commits,
+    }
+}
+
+fn git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    (!output.trim().is_empty()).then_some(output)
+}
+
+fn parse_git_status_porcelain(output: &str) -> Vec<ExecutionGitFileChange> {
+    output
+        .lines()
+        .filter_map(|line| {
+            if line.trim().is_empty() {
+                return None;
+            }
+            let status = line.get(0..2).unwrap_or("").trim().to_string();
+            let raw_path = line.get(3..).unwrap_or("").trim();
+            let path = raw_path
+                .rsplit_once(" -> ")
+                .map(|(_, renamed)| renamed)
+                .unwrap_or(raw_path)
+                .trim_matches('"')
+                .to_string();
+            Some(ExecutionGitFileChange { path, status })
+        })
+        .collect()
+}
+
+fn parse_git_log_refs(output: &str) -> Vec<ExecutionGitCommitRef> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (sha, subject) = line.split_once('\u{1f}')?;
+            Some(ExecutionGitCommitRef {
+                sha: sha.to_string(),
+                subject: (!subject.trim().is_empty()).then(|| subject.trim().to_string()),
+            })
+        })
+        .collect()
 }
 
 pub trait ExecutorBoundary {
@@ -262,13 +732,92 @@ impl ExecutorBoundary for RustSubprocessExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
         let payload = build_worker_request(request);
-        let mut stream = self.connect_or_start_daemon(&payload.session)?;
-        write_json(&mut stream, &payload)?;
-        stream
+        let mut stream = match self.connect_or_start_daemon(&payload.session) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Ok(build_worker_transport_failure_response(
+                    &payload,
+                    "worker_transport",
+                    "worker_daemon_start_error",
+                    &format!("failed to start or connect to worker daemon: {error}"),
+                    ExecutionEvidenceStatus::Failed,
+                    "",
+                    "",
+                    ExecutionLocation::Host,
+                    ExecutionBoundaryKind::Host,
+                ));
+            }
+        };
+        if let Err(error) = write_json(&mut stream, &payload) {
+            return Ok(build_worker_transport_failure_response(
+                &payload,
+                "worker_transport",
+                "worker_socket_write_error",
+                &format!("failed to write worker request over daemon socket: {error}"),
+                ExecutionEvidenceStatus::Failed,
+                "",
+                "",
+                ExecutionLocation::Host,
+                ExecutionBoundaryKind::Host,
+            ));
+        }
+        if let Err(error) = stream
             .shutdown(Shutdown::Write)
-            .context("failed to close worker socket write side")?;
-        let outcome: WorkerOutcome = read_json(&mut stream)?;
-        decode_worker_outcome(outcome)
+            .context("failed to close worker socket write side")
+        {
+            return Ok(build_worker_transport_failure_response(
+                &payload,
+                "worker_transport",
+                "worker_socket_shutdown_error",
+                &error.to_string(),
+                ExecutionEvidenceStatus::Failed,
+                "",
+                "",
+                ExecutionLocation::Host,
+                ExecutionBoundaryKind::Host,
+            ));
+        }
+        let outcome: WorkerOutcome = match read_json(&mut stream) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let status = if is_timeout_like_error(&error) {
+                    ExecutionEvidenceStatus::TimedOut
+                } else {
+                    ExecutionEvidenceStatus::Failed
+                };
+                let blocker_kind = if matches!(status, ExecutionEvidenceStatus::TimedOut) {
+                    "worker_request_timeout"
+                } else {
+                    "worker_response_error"
+                };
+                let message = if matches!(status, ExecutionEvidenceStatus::TimedOut) {
+                    format!(
+                        "worker did not return a payload before the request timeout ({} ms); set NANOCLAW_WORKER_REQUEST_TIMEOUT_MS higher for long local jobs: {error}",
+                        worker_request_timeout().as_millis()
+                    )
+                } else {
+                    format!("failed to read worker response over daemon socket: {error}")
+                };
+                return Ok(build_worker_transport_failure_response(
+                    &payload,
+                    "worker_transport",
+                    blocker_kind,
+                    &message,
+                    status,
+                    "",
+                    "",
+                    ExecutionLocation::Host,
+                    ExecutionBoundaryKind::Host,
+                ));
+            }
+        };
+        Ok(decode_worker_outcome_with_context(
+            outcome,
+            &payload,
+            "worker_transport",
+            ExecutionLocation::Host,
+            ExecutionBoundaryKind::Host,
+        ))
     }
 }
 
@@ -409,15 +958,22 @@ impl ExecutionLaneRouter {
 impl ExecutorBoundary for ExecutionLaneRouter {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         let request = self.decorate_request(request);
-        match self.lane_for_request(&request) {
+        let response = match self.lane_for_request(&request) {
             ExecutionLane::Auto | ExecutionLane::Host => self.host.execute(request),
             ExecutionLane::Container => self.container.execute(request),
             ExecutionLane::RemoteWorker => self.remote.execute(request),
             ExecutionLane::Omx => self.omx.execute(request),
-            ExecutionLane::Custom(value) => {
-                bail!("unsupported execution lane '{}'", value)
-            }
-        }
+            ExecutionLane::Custom(value) => Ok(build_blocked_execution_response(
+                &request,
+                "execution_lane",
+                ExecutionEvidenceMode::Code,
+                format!("unsupported execution lane '{}'", value).as_str(),
+                None,
+                None,
+            )),
+        }?;
+        validate_execution_response_evidence(&response)?;
+        Ok(response)
     }
 }
 
@@ -444,6 +1000,16 @@ impl ContainerExecutor {
     }
 }
 
+fn resolve_container_image(default_image: &str, env: &BTreeMap<String, String>) -> String {
+    env.get("NANOCLAW_CONTAINER_IMAGE")
+        .or_else(|| env.get("NANOCLAW_CONTAINER_IMAGE_TAG"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_image)
+        .to_string()
+}
+
 impl ExecutorBoundary for ContainerExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
@@ -455,6 +1021,7 @@ impl ExecutorBoundary for ContainerExecutor {
         })?;
 
         let payload = build_worker_request(request);
+        let container_image = resolve_container_image(&self.container_image, &payload.env);
         let runtime = resolve_container_runtime(self.container_runtime.as_deref())?;
         let mut command = Command::new(&runtime);
         command
@@ -489,7 +1056,7 @@ impl ExecutorBoundary for ContainerExecutor {
             .arg(self.source_crate_root.display().to_string())
             .arg("-e")
             .arg("NANOCLAW_EXECUTION_LOCATION=local_container")
-            .arg(&self.container_image)
+            .arg(&container_image)
             .arg("cargo")
             .arg("run")
             .arg("--quiet")
@@ -506,6 +1073,9 @@ impl ExecutorBoundary for ContainerExecutor {
             root: Some(payload.session.workspace_root.clone()),
             isolated: true,
         };
+        if let Some(evidence) = response.evidence.as_mut() {
+            evidence.boundary = response.boundary.clone();
+        }
         Ok(response)
     }
 }
@@ -534,13 +1104,36 @@ impl RemoteWorkerExecutor {
 impl ExecutorBoundary for RemoteWorkerExecutor {
     fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResponse> {
         request.session.ensure_layout()?;
-        self.dev_environment.sync_project()?;
-        self.dev_environment.sync_group_workspace(
-            Path::new(&request.session.workspace_root),
-            &request.group.folder,
-        )?;
-
+        let local_workspace_root = request.session.workspace_root.clone();
+        let group_folder = request.group.folder.clone();
         let payload = build_worker_request(remoteize_request(&self.remote_worker_root, request));
+        if let Err(error) = self.dev_environment.sync_project() {
+            return Ok(build_worker_process_failure_response(
+                &payload,
+                "remote_worker_process",
+                "remote worker project sync",
+                &format!("failed to sync project to remote worker: {error}"),
+                "",
+                "",
+                ExecutionLocation::RemoteWorker,
+                ExecutionBoundaryKind::RemoteWorker,
+            ));
+        }
+        if let Err(error) = self
+            .dev_environment
+            .sync_group_workspace(Path::new(&local_workspace_root), &group_folder)
+        {
+            return Ok(build_worker_process_failure_response(
+                &payload,
+                "remote_worker_process",
+                "remote worker workspace sync",
+                &format!("failed to sync group workspace to remote worker: {error}"),
+                "",
+                "",
+                ExecutionLocation::RemoteWorker,
+                ExecutionBoundaryKind::RemoteWorker,
+            ));
+        }
         let command = format!(
             "if [ -x {binary} ]; then NANOCLAW_EXECUTION_LOCATION=remote_worker {binary} exec-worker-stdio; else NANOCLAW_EXECUTION_LOCATION=remote_worker cargo run --quiet --manifest-path {manifest} --bin nanoclaw -- exec-worker-stdio; fi",
             binary = shell_quote(&self.remote_worker_binary),
@@ -548,15 +1141,51 @@ impl ExecutorBoundary for RemoteWorkerExecutor {
         );
         let stdin =
             serde_json::to_vec(&payload).context("failed to encode remote worker request")?;
-        let result = self.dev_environment.exec_with_stdin(&command, &stdin)?;
-        let outcome: WorkerOutcome = serde_json::from_str(&result.stdout)
-            .context("failed to parse remote worker response")?;
-        let mut response = decode_worker_outcome(outcome)?;
+        let result = match self.dev_environment.exec_with_stdin(&command, &stdin) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(build_worker_process_failure_response(
+                    &payload,
+                    "remote_worker_process",
+                    &command,
+                    &format!("remote worker command failed: {error}"),
+                    "",
+                    "",
+                    ExecutionLocation::RemoteWorker,
+                    ExecutionBoundaryKind::RemoteWorker,
+                ));
+            }
+        };
+        let outcome: WorkerOutcome = match serde_json::from_str(&result.stdout) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(build_worker_process_failure_response(
+                    &payload,
+                    "remote_worker_process",
+                    &command,
+                    &format!("failed to parse remote worker response: {error}"),
+                    result.stdout.trim(),
+                    "",
+                    ExecutionLocation::RemoteWorker,
+                    ExecutionBoundaryKind::RemoteWorker,
+                ));
+            }
+        };
+        let mut response = decode_worker_outcome_with_context(
+            outcome,
+            &payload,
+            "remote_worker_process",
+            ExecutionLocation::RemoteWorker,
+            ExecutionBoundaryKind::RemoteWorker,
+        );
         response.boundary = ExecutionBoundary {
             kind: ExecutionBoundaryKind::RemoteWorker,
             root: Some(payload.session.workspace_root.clone()),
             isolated: true,
         };
+        if let Some(evidence) = response.evidence.as_mut() {
+            evidence.boundary = response.boundary.clone();
+        }
         Ok(response)
     }
 }
@@ -620,6 +1249,7 @@ impl ExecutorBoundary for OmxExecutor {
             &request.prompt,
             workspace_root.as_path(),
             request.omx.as_ref(),
+            request.env.clone(),
         )?;
         record_response_session_turn(&mut session_state, &response.summary);
         session_state.last_plan = request.plan.clone();
@@ -674,51 +1304,92 @@ impl ExecutorBoundary for OmxExecutor {
             completed_at: response.status.is_terminal().then_some(now.clone()),
         });
 
+        let text = response.summary.clone();
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Omx,
+            root: Some(response.workspace_root.clone()),
+            isolated: true,
+        };
+        let session_id = response.session_id.clone();
+        let log_path = response.log_path.clone();
+        let log_body = response
+            .log_body
+            .clone()
+            .or_else(|| Some(response.summary.clone()));
+        let external_run_id = response.external_run_id.clone();
+        let artifacts = response
+            .artifacts
+            .into_iter()
+            .map(|artifact| ExecutionArtifactRef {
+                kind: artifact.kind,
+                title: artifact.title,
+                location: artifact.location,
+                body: artifact.body,
+            })
+            .collect();
+        let metadata = ExecutionMetadata {
+            backend: Some("omx".to_string()),
+            provider: None,
+            biller: None,
+            billing_type: None,
+            model: None,
+            usage: None,
+            cost_usd: None,
+            routing_decision: request.routing_decision.clone(),
+            objective: request.objective.clone(),
+            plan: request.plan.clone(),
+            session_state: Some(compact_session_state(&session_state, 6)),
+            gate_evaluation,
+            assurance: Some(assurance),
+            status: Some(response.status.as_str().to_string()),
+            question: response.question.clone(),
+            tmux_session: response.tmux_session.clone(),
+            team_name: response.team_name.clone(),
+            summary: Some(response.summary.clone()),
+            artifacts,
+            external_run_id: external_run_id.clone(),
+        };
+        let blockers = if matches!(response.status, super::omx::OmxSessionStatus::Failed) {
+            vec![ExecutionBlockerRef {
+                kind: "omx_failed".to_string(),
+                source: Some("omx".to_string()),
+                message: response.summary.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let evidence_status = omx_status_to_evidence_status(&response.status);
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "omx",
+            mode: ExecutionEvidenceMode::Gateway,
+            run_id: external_run_id.as_deref().unwrap_or(session_id.as_str()),
+            status: evidence_status,
+            session_id: session_id.as_str(),
+            group_folder: Some(request.group.folder.as_str()),
+            workspace_root: Some(response.workspace_root.as_str()),
+            boundary: &boundary,
+            log_path: log_path.as_deref(),
+            log_body: log_body.as_deref(),
+            metadata: Some(&metadata),
+            provenance_id: Some(provenance.id.as_str()),
+            verification: vec![status_verification(
+                "omx_session_status",
+                None,
+                evidence_status,
+                Some(response.summary.clone()),
+            )],
+            blockers,
+        });
+
         Ok(ExecutionResponse {
-            text: response.summary.clone(),
-            boundary: ExecutionBoundary {
-                kind: ExecutionBoundaryKind::Omx,
-                root: Some(response.workspace_root.clone()),
-                isolated: true,
-            },
-            session_id: response.session_id,
-            log_path: response.log_path,
-            log_body: response
-                .log_body
-                .clone()
-                .or_else(|| Some(response.summary.clone())),
+            text,
+            boundary,
+            session_id,
+            log_path,
+            log_body,
             provenance: Some(provenance),
-            metadata: Some(ExecutionMetadata {
-                backend: Some("omx".to_string()),
-                provider: None,
-                biller: None,
-                billing_type: None,
-                model: None,
-                usage: None,
-                cost_usd: None,
-                routing_decision: request.routing_decision.clone(),
-                objective: request.objective.clone(),
-                plan: request.plan.clone(),
-                session_state: Some(compact_session_state(&session_state, 6)),
-                gate_evaluation,
-                assurance: Some(assurance),
-                status: Some(response.status.as_str().to_string()),
-                question: response.question.clone(),
-                tmux_session: response.tmux_session.clone(),
-                team_name: response.team_name.clone(),
-                summary: Some(response.summary.clone()),
-                artifacts: response
-                    .artifacts
-                    .into_iter()
-                    .map(|artifact| ExecutionArtifactRef {
-                        kind: artifact.kind,
-                        title: artifact.title,
-                        location: artifact.location,
-                        body: artifact.body,
-                    })
-                    .collect(),
-                external_run_id: response.external_run_id.clone(),
-            }),
+            metadata: Some(metadata),
+            evidence: Some(evidence),
         })
     }
 }
@@ -749,27 +1420,52 @@ impl ExecutorBoundary for InProcessEchoExecutor {
                 )
             })
             .unwrap_or_else(|| "No inbound messages were provided.".to_string());
+        let text = format!(
+            "{} received {} message(s) for group '{}'.\n{}\nPrompt bytes: {}\nHandled at {}.",
+            self.assistant_name,
+            request.messages.len(),
+            request.group.name,
+            latest_summary,
+            request.prompt.len(),
+            Utc::now().to_rfc3339()
+        );
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::InProcess,
+            root: None,
+            isolated: false,
+        };
+        let session_id = request.session.id.clone();
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "in_process_echo",
+            mode: ExecutionEvidenceMode::Advisory,
+            run_id: session_id.as_str(),
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: session_id.as_str(),
+            group_folder: Some(request.group.folder.as_str()),
+            workspace_root: Some(request.session.workspace_root.as_str()),
+            boundary: &boundary,
+            log_path: None,
+            log_body: None,
+            metadata: None,
+            provenance_id: None,
+            verification: vec![status_verification(
+                "in_process_response",
+                None,
+                ExecutionEvidenceStatus::Succeeded,
+                Some("in-process advisory response generated".to_string()),
+            )],
+            blockers: Vec::new(),
+        });
 
         Ok(ExecutionResponse {
-            text: format!(
-                "{} received {} message(s) for group '{}'.\n{}\nPrompt bytes: {}\nHandled at {}.",
-                self.assistant_name,
-                request.messages.len(),
-                request.group.name,
-                latest_summary,
-                request.prompt.len(),
-                Utc::now().to_rfc3339()
-            ),
-            boundary: ExecutionBoundary {
-                kind: ExecutionBoundaryKind::InProcess,
-                root: None,
-                isolated: false,
-            },
-            session_id: request.session.id,
+            text,
+            boundary,
+            session_id,
             log_path: None,
             log_body: None,
             provenance: None,
             metadata: None,
+            evidence: Some(evidence),
         })
     }
 }
@@ -787,6 +1483,7 @@ struct WorkerRequest {
     omx: Option<OmxExecutionOptions>,
     assistant_name: String,
     request_plane: RequestPlane,
+    env: BTreeMap<String, String>,
     session: ExecutionSession,
     backend_override: Option<WorkerBackend>,
     task_signature: Option<TaskSignature>,
@@ -806,6 +1503,8 @@ struct WorkerResponse {
     log_body: Option<String>,
     provenance: Option<ExecutionProvenanceRecord>,
     metadata: Option<ExecutionMetadata>,
+    #[serde(default)]
+    evidence: Option<ExecutionEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,6 +1537,7 @@ struct BackendExecutionMetadata {
     secret_handles: Vec<String>,
     mount_summary: Vec<ExecutionMountSummaryEntry>,
     fallback_reason: Option<String>,
+    external_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -899,8 +1599,7 @@ fn run_worker_daemon_with_idle_timeout(session_root: &Path, idle_timeout: Durati
         .file_name()
         .and_then(|value| value.to_str())
         .context("failed to derive session id from session root")?;
-    let socket_path =
-        std::env::temp_dir().join(format!("ncl-{}.sock", compact_session_suffix(session_id)));
+    let socket_path = worker_socket_path(&session_root, session_id);
     let pid_path = state_root.join("worker.pid");
 
     fs::create_dir_all(&ipc_root)
@@ -926,6 +1625,13 @@ fn run_worker_daemon_with_idle_timeout(session_root: &Path, idle_timeout: Durati
                 stream
                     .set_nonblocking(false)
                     .context("failed to configure worker stream blocking mode")?;
+                let request_timeout = worker_request_timeout();
+                stream
+                    .set_read_timeout(Some(request_timeout))
+                    .context("failed to set worker stream read timeout")?;
+                stream
+                    .set_write_timeout(Some(request_timeout))
+                    .context("failed to set worker stream write timeout")?;
                 last_activity = Instant::now();
                 handle_daemon_connection(&mut stream)?;
             }
@@ -1062,12 +1768,13 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                     &session_state,
                     &resolved_backend,
                     execution_location.clone(),
+                    None,
                 ) {
                     Ok(res) => Ok(res),
                     Err(err) => {
                         let err_text = err.to_string();
-                        if err_text.contains("usage limit") || err_text.contains("usage_limit") || err_text.contains("exit status: 1") {
-                            run_workers_ai_request(
+                        if is_codex_usage_limit_error(&err_text) {
+                            run_codex_usage_limit_fallback(
                                 &request,
                                 workspace_root.as_path(),
                                 prior_turns,
@@ -1075,7 +1782,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                                 &session_state,
                                 &resolved_backend,
                                 execution_location.clone(),
-                                Some(format!("codex_fallback: {}", err_text)),
+                                err_text,
                             )
                         } else {
                             Err(err)
@@ -1092,6 +1799,41 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 &resolved_backend,
                 execution_location.clone(),
             ),
+            WorkerBackend::Zai => run_zai_request_with_codex_fallback(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+                execution_location.clone(),
+            ),
+            WorkerBackend::AzureOpenAI => run_azure_openai_request_with_codex_fallback(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+                execution_location.clone(),
+            ),
+            WorkerBackend::FoundryMaaS => run_foundry_maas_request_with_codex_fallback(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+                execution_location.clone(),
+            ),
+            WorkerBackend::GithubCopilot => run_github_copilot_request(
+                &request,
+                workspace_root.as_path(),
+                prior_turns,
+                &instruction_hint,
+                &session_state,
+                &resolved_backend,
+            ),
             WorkerBackend::WorkersAI => run_workers_ai_request(
                 &request,
                 workspace_root.as_path(),
@@ -1103,7 +1845,7 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 None,
             ),
             WorkerBackend::Custom(value) => {
-                bail!("unsupported worker backend '{}'", value)
+                Err(anyhow::anyhow!("unsupported worker backend '{}'", value))
             }
         }
     };
@@ -1177,45 +1919,361 @@ fn execute_worker_request(request: WorkerRequest) -> Result<WorkerResponse> {
                 gate_evaluation,
                 assurance,
             );
+            let boundary = ExecutionBoundary {
+                kind: ExecutionBoundaryKind::Host,
+                root: Some(request.session.workspace_root.clone()),
+                isolated: true,
+            };
+            let log_path_string = log_path.display().to_string();
+            let verification = request
+                .script
+                .as_ref()
+                .map(|script| {
+                    vec![status_verification(
+                        "command",
+                        Some(script.clone()),
+                        ExecutionEvidenceStatus::Succeeded,
+                        Some("host command completed successfully".to_string()),
+                    )]
+                })
+                .unwrap_or_else(|| {
+                    vec![status_verification(
+                        "backend_response",
+                        None,
+                        ExecutionEvidenceStatus::Succeeded,
+                        Some(format!(
+                            "{} backend returned a successful response",
+                            result.metadata.backend.as_str()
+                        )),
+                    )]
+                });
+            let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+                adapter_type: result.metadata.backend.as_str(),
+                mode: execution_mode_for_backend(
+                    &result.metadata.backend,
+                    request.script.is_some(),
+                ),
+                run_id: request.invocation_id.as_str(),
+                status: ExecutionEvidenceStatus::Succeeded,
+                session_id: request.session.id.as_str(),
+                group_folder: Some(request.session.group_folder.as_str()),
+                workspace_root: Some(request.session.workspace_root.as_str()),
+                boundary: &boundary,
+                log_path: Some(log_path_string.as_str()),
+                log_body: Some(result.log_body.as_str()),
+                metadata: Some(&execution_metadata),
+                provenance_id: Some(provenance.id.as_str()),
+                verification,
+                blockers: Vec::new(),
+            });
             Ok(WorkerResponse {
                 text: result.text,
-                boundary: ExecutionBoundary {
-                    kind: ExecutionBoundaryKind::Host,
-                    root: Some(request.session.workspace_root.clone()),
-                    isolated: true,
-                },
+                boundary,
                 session_id: request.session.id.clone(),
-                log_path: Some(log_path.display().to_string()),
+                log_path: Some(log_path_string),
                 log_body: Some(result.log_body),
                 provenance: Some(provenance),
                 metadata: Some(execution_metadata),
+                evidence: Some(evidence),
             })
         }
         Err(error) => {
+            let error_text = error.to_string();
             let _ = session_store.save(&session_state);
             let log_body = format!(
                 "invocation_id={}\nsession_id={}\nworkspace={}\nstatus=error\nerror={}\n",
-                request.invocation_id, request.session.id, request.session.workspace_root, error
+                request.invocation_id,
+                request.session.id,
+                request.session.workspace_root,
+                error_text
             );
-            let _ = fs::write(&log_path, log_body);
+            let _ = fs::write(&log_path, &log_body);
             let _ = append_history_entry(
                 &history_path,
                 SessionHistoryEntry {
-                    invocation_id: request.invocation_id,
-                    requested_at: request.requested_at,
+                    invocation_id: request.invocation_id.clone(),
+                    requested_at: request.requested_at.clone(),
                     message_count: request.messages.len(),
                     prompt_bytes: request.prompt.len(),
-                    script: request.script,
+                    script: request.script.clone(),
                     success: false,
                 },
             );
-            Err(error)
+            Ok(build_blocked_worker_response(
+                &request,
+                &resolved_backend.backend,
+                &error_text,
+                log_path.as_path(),
+                log_body,
+                Some(compact_session_state(&session_state, 6)),
+                execution_location,
+            ))
         }
     }
 }
 
+fn build_blocked_execution_response(
+    request: &ExecutionRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    message: &str,
+    log_path: Option<&Path>,
+    log_body: Option<&str>,
+) -> ExecutionResponse {
+    let boundary = ExecutionBoundary {
+        kind: ExecutionBoundaryKind::Host,
+        root: Some(request.session.workspace_root.clone()),
+        isolated: true,
+    };
+    let metadata = ExecutionMetadata {
+        backend: Some(adapter_type.to_string()),
+        routing_decision: request.routing_decision.clone(),
+        objective: request.objective.clone(),
+        plan: request.plan.clone(),
+        gate_evaluation: request.gate_evaluation.clone(),
+        status: Some(ExecutionEvidenceStatus::Failed.as_str().to_string()),
+        summary: Some(message.to_string()),
+        ..Default::default()
+    };
+    let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type,
+        mode,
+        run_id: request
+            .task_id
+            .as_deref()
+            .unwrap_or(request.session.id.as_str()),
+        status: ExecutionEvidenceStatus::Failed,
+        session_id: request.session.id.as_str(),
+        group_folder: Some(request.session.group_folder.as_str()),
+        workspace_root: Some(request.session.workspace_root.as_str()),
+        boundary: &boundary,
+        log_path: log_path.and_then(|path| path.to_str()),
+        log_body,
+        metadata: Some(&metadata),
+        provenance_id: None,
+        verification: vec![status_verification(
+            "blocked_before_execution",
+            None,
+            ExecutionEvidenceStatus::Failed,
+            Some(message.to_string()),
+        )],
+        blockers: vec![ExecutionBlockerRef {
+            kind: "unsupported_execution_lane".to_string(),
+            source: Some(adapter_type.to_string()),
+            message: message.to_string(),
+        }],
+    });
+
+    ExecutionResponse {
+        text: format!("Execution blocked: {message}"),
+        boundary,
+        session_id: request.session.id.clone(),
+        log_path: log_path.map(|path| path.display().to_string()),
+        log_body: log_body.map(str::to_string),
+        provenance: None,
+        metadata: Some(metadata),
+        evidence: Some(evidence),
+    }
+}
+
+fn build_blocked_worker_response(
+    request: &WorkerRequest,
+    backend: &WorkerBackend,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+) -> WorkerResponse {
+    let blocker_kind = if is_command_safety_policy_error(message) {
+        "command_safety_policy"
+    } else {
+        "adapter_error"
+    };
+    build_blocked_worker_response_with_context(
+        request,
+        backend.as_str(),
+        execution_mode_for_backend(backend, request.script.is_some()),
+        run_kind_for_backend(backend, request.script.is_some()),
+        blocker_kind,
+        message,
+        log_path,
+        log_body,
+        session_state,
+        execution_location,
+        ExecutionBoundaryKind::Host,
+    )
+}
+
+fn is_command_safety_policy_error(message: &str) -> bool {
+    message.contains("command safety policy")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_blocked_worker_response_with_context(
+    request: &WorkerRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    run_kind: ExecutionRunKind,
+    blocker_kind: &str,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> WorkerResponse {
+    build_blocked_worker_response_with_status(
+        request,
+        adapter_type,
+        mode,
+        run_kind,
+        blocker_kind,
+        message,
+        log_path,
+        log_body,
+        session_state,
+        execution_location,
+        boundary_kind,
+        ExecutionEvidenceStatus::Failed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_blocked_worker_response_with_status(
+    request: &WorkerRequest,
+    adapter_type: &str,
+    mode: ExecutionEvidenceMode,
+    run_kind: ExecutionRunKind,
+    blocker_kind: &str,
+    message: &str,
+    log_path: &Path,
+    log_body: String,
+    session_state: Option<SessionState>,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+    status: ExecutionEvidenceStatus,
+) -> WorkerResponse {
+    let completed_at = Utc::now().to_rfc3339();
+    let boundary = ExecutionBoundary {
+        kind: boundary_kind,
+        root: Some(request.session.workspace_root.clone()),
+        isolated: true,
+    };
+    let task_signature = request.task_signature.clone();
+    let boundary_claims = request.boundary_claims.clone();
+    let gate_evaluation = request.gate_evaluation.clone();
+    let assurance = task_signature.as_ref().map(|signature| {
+        derive_assurance(
+            adapter_type,
+            signature,
+            gate_evaluation.as_ref(),
+            request.script.is_some(),
+        )
+    });
+    let symbol_carriers =
+        derive_symbol_carriers(&request.invocation_id, &request.session, Some(log_path));
+    let provenance_edges =
+        derive_provenance_edges(&request.invocation_id, &symbol_carriers, &boundary_claims);
+    let provenance = build_execution_provenance_record(BuildExecutionProvenanceInput {
+        id: request.invocation_id.clone(),
+        run_kind,
+        group_folder: request.session.group_folder.clone(),
+        chat_jid: Some(request.group.jid.clone()),
+        execution_location,
+        request_plane: request.request_plane.clone(),
+        effective_capabilities: derive_capability_manifest(
+            &request.request_plane,
+            DeriveCapabilityManifestInput::default(),
+        ),
+        project_environment_id: None,
+        mount_summary: vec![ExecutionMountSummaryEntry {
+            host_path: Some(request.session.workspace_root.clone()),
+            container_path: None,
+            readonly: false,
+            kind: ExecutionMountKind::Project,
+        }],
+        secret_handles_used: Vec::new(),
+        fallback_reason: Some("execution_blocked".to_string()),
+        sync_scope: None,
+        task_signature,
+        boundary_claims,
+        gate_evaluation: gate_evaluation.clone(),
+        assurance: assurance.clone(),
+        symbol_carriers,
+        provenance_edges,
+        status: ExecutionStatus::Error,
+        created_at: request.requested_at.clone(),
+        updated_at: completed_at.clone(),
+        completed_at: Some(completed_at),
+    });
+    let metadata = ExecutionMetadata {
+        backend: Some(adapter_type.to_string()),
+        routing_decision: request.routing_decision.clone(),
+        objective: request.objective.clone(),
+        plan: request.plan.clone(),
+        session_state,
+        gate_evaluation,
+        assurance,
+        status: Some(status.as_str().to_string()),
+        summary: Some(message.to_string()),
+        ..Default::default()
+    };
+    let log_path_string = log_path.display().to_string();
+    let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type,
+        mode,
+        run_id: request.invocation_id.as_str(),
+        status,
+        session_id: request.session.id.as_str(),
+        group_folder: Some(request.session.group_folder.as_str()),
+        workspace_root: Some(request.session.workspace_root.as_str()),
+        boundary: &boundary,
+        log_path: Some(log_path_string.as_str()),
+        log_body: Some(log_body.as_str()),
+        metadata: Some(&metadata),
+        provenance_id: Some(provenance.id.as_str()),
+        verification: vec![status_verification(
+            "worker_blocked_before_execution",
+            None,
+            status,
+            Some(message.to_string()),
+        )],
+        blockers: vec![ExecutionBlockerRef {
+            kind: blocker_kind.to_string(),
+            source: Some(adapter_type.to_string()),
+            message: message.to_string(),
+        }],
+    });
+
+    let status_label = status.as_str().replace('_', " ");
+    WorkerResponse {
+        text: format!("Execution {status_label}: {message}"),
+        boundary,
+        session_id: request.session.id.clone(),
+        log_path: Some(log_path_string),
+        log_body: Some(log_body),
+        provenance: Some(provenance),
+        metadata: Some(metadata),
+        evidence: Some(evidence),
+    }
+}
+
+fn blocked_worker_response_into_execution_response(response: WorkerResponse) -> ExecutionResponse {
+    ExecutionResponse {
+        text: response.text,
+        boundary: response.boundary,
+        session_id: response.session_id,
+        log_path: response.log_path,
+        log_body: response.log_body,
+        provenance: response.provenance,
+        metadata: response.metadata,
+        evidence: response.evidence,
+    }
+}
+
 fn handle_daemon_connection(stream: &mut UnixStream) -> Result<()> {
-    let request: WorkerRequest = read_json(stream)?;
+    let request: WorkerRequest = read_single_json(stream)?;
     let outcome = match execute_worker_request(request) {
         Ok(response) => WorkerOutcome {
             response: Some(response),
@@ -1242,6 +2300,7 @@ fn build_worker_request(request: ExecutionRequest) -> WorkerRequest {
         omx: request.omx,
         assistant_name: request.assistant_name,
         request_plane: request.request_plane,
+        env: request.env,
         session: request.session,
         backend_override: request.backend_override,
         task_signature: request.task_signature,
@@ -1253,49 +2312,227 @@ fn build_worker_request(request: ExecutionRequest) -> WorkerRequest {
     }
 }
 
-fn decode_worker_outcome(outcome: WorkerOutcome) -> Result<ExecutionResponse> {
-    let response = match (outcome.response, outcome.error) {
-        (Some(response), None) => response,
-        (_, Some(error)) => bail!("worker execution failed: {}", error),
-        _ => bail!("worker returned an empty response"),
-    };
-
-    Ok(ExecutionResponse {
-        text: response.text,
-        boundary: response.boundary,
-        session_id: response.session_id,
-        log_path: response.log_path,
-        log_body: response.log_body,
-        provenance: response.provenance,
-        metadata: response.metadata,
-    })
+fn decode_worker_outcome_with_context(
+    outcome: WorkerOutcome,
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> ExecutionResponse {
+    match (outcome.response, outcome.error) {
+        (Some(response), None) => blocked_worker_response_into_execution_response(response),
+        (_, Some(error)) => {
+            let status = classify_worker_outcome_error_status(&error);
+            let blocker_kind = classify_worker_outcome_blocker_kind(&error, &status);
+            build_worker_transport_failure_response(
+                payload,
+                adapter_type,
+                blocker_kind,
+                &format!("worker execution failed before returning evidence: {error}"),
+                status,
+                "",
+                "",
+                execution_location,
+                boundary_kind,
+            )
+        }
+        _ => build_worker_transport_failure_response(
+            payload,
+            adapter_type,
+            "worker_empty_response",
+            "worker returned an empty response before producing execution evidence",
+            ExecutionEvidenceStatus::Failed,
+            "",
+            "",
+            execution_location,
+            boundary_kind,
+        ),
+    }
 }
 
 fn run_worker_command(command: &mut Command, payload: &WorkerRequest) -> Result<ExecutionResponse> {
     let stdin = serde_json::to_vec(payload).context("failed to encode worker request")?;
-    let output = command
+    let command_description = describe_command(command);
+    let output = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to spawn {}", describe_command(command)))?;
-    let output = write_and_wait_for_output(output, &stdin, command)?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(build_worker_process_failure_response(
+                payload,
+                "worker_process",
+                &command_description,
+                &format!("failed to spawn {command_description}: {error}"),
+                "",
+                "",
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
+            ));
+        }
+    };
+    let output = match write_and_wait_for_output(output, &stdin, command) {
+        Ok(output) => output,
+        Err(error) => {
+            return Ok(build_worker_process_failure_response(
+                payload,
+                "worker_process",
+                &command_description,
+                &error.to_string(),
+                "",
+                "",
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
+            ));
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "{} exited with status {}{}",
-            describe_command(command),
-            output.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok(build_worker_process_failure_response(
+            payload,
+            "worker_process",
+            &command_description,
+            &format!(
+                "{} exited with status {}{}",
+                command_description,
+                output.status,
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            ),
+            &stdout,
+            &stderr,
+            ExecutionLocation::LocalContainer,
+            ExecutionBoundaryKind::Container,
+        ));
     }
-    let outcome: WorkerOutcome =
-        serde_json::from_slice(&output.stdout).context("failed to parse worker outcome")?;
-    decode_worker_outcome(outcome)
+    let outcome: WorkerOutcome = match serde_json::from_slice(&output.stdout) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(build_worker_transport_failure_response(
+                payload,
+                "worker_process",
+                "worker_response_parse_error",
+                &format!("failed to parse worker outcome: {error}"),
+                ExecutionEvidenceStatus::Failed,
+                &stdout,
+                &stderr,
+                ExecutionLocation::LocalContainer,
+                ExecutionBoundaryKind::Container,
+            ));
+        }
+    };
+    Ok(decode_worker_outcome_with_context(
+        outcome,
+        payload,
+        "worker_process",
+        ExecutionLocation::LocalContainer,
+        ExecutionBoundaryKind::Container,
+    ))
+}
+
+fn build_worker_process_failure_response(
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    command_description: &str,
+    message: &str,
+    stdout: &str,
+    stderr: &str,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> ExecutionResponse {
+    build_worker_failure_response(
+        payload,
+        adapter_type,
+        "worker_process_error",
+        command_description,
+        message,
+        stdout,
+        stderr,
+        ExecutionEvidenceStatus::Failed,
+        execution_location,
+        boundary_kind,
+        "process",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_worker_transport_failure_response(
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    blocker_kind: &str,
+    message: &str,
+    status: ExecutionEvidenceStatus,
+    stdout: &str,
+    stderr: &str,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+) -> ExecutionResponse {
+    build_worker_failure_response(
+        payload,
+        adapter_type,
+        blocker_kind,
+        adapter_type,
+        message,
+        stdout,
+        stderr,
+        status,
+        execution_location,
+        boundary_kind,
+        "transport",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_worker_failure_response(
+    payload: &WorkerRequest,
+    adapter_type: &str,
+    blocker_kind: &str,
+    command_description: &str,
+    message: &str,
+    stdout: &str,
+    stderr: &str,
+    status: ExecutionEvidenceStatus,
+    execution_location: ExecutionLocation,
+    boundary_kind: ExecutionBoundaryKind,
+    log_suffix: &str,
+) -> ExecutionResponse {
+    let log_path = Path::new(&payload.session.logs_root)
+        .join(format!("{}.{}.log", payload.invocation_id, log_suffix));
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\nstatus=error\ncommand={}\nerror={}\nstdout={}\nstderr={}\n",
+        payload.invocation_id,
+        payload.session.id,
+        payload.session.workspace_root,
+        command_description,
+        message,
+        stdout,
+        stderr
+    );
+    let _ = fs::create_dir_all(Path::new(&payload.session.logs_root));
+    let _ = fs::write(&log_path, &log_body);
+    let response = build_blocked_worker_response_with_status(
+        payload,
+        adapter_type,
+        ExecutionEvidenceMode::Shell,
+        ExecutionRunKind::Custom(adapter_type.to_string()),
+        blocker_kind,
+        message,
+        log_path.as_path(),
+        log_body,
+        None,
+        execution_location,
+        boundary_kind,
+        status,
+    );
+    blocked_worker_response_into_execution_response(response)
 }
 
 fn write_and_wait_for_output(
@@ -1329,6 +2566,51 @@ fn describe_command(command: &Command) -> String {
     }
 }
 
+fn is_timeout_like_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            })
+    })
+}
+
+fn classify_worker_outcome_error_status(error: &str) -> ExecutionEvidenceStatus {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timed out") || normalized.contains("timeout") {
+        ExecutionEvidenceStatus::TimedOut
+    } else if normalized.contains("cancelled")
+        || normalized.contains("canceled")
+        || normalized.contains("cancel")
+    {
+        ExecutionEvidenceStatus::Cancelled
+    } else {
+        ExecutionEvidenceStatus::Failed
+    }
+}
+
+fn classify_worker_outcome_blocker_kind(
+    error: &str,
+    status: &ExecutionEvidenceStatus,
+) -> &'static str {
+    match status {
+        ExecutionEvidenceStatus::TimedOut => "worker_outcome_timeout",
+        ExecutionEvidenceStatus::Cancelled => "worker_outcome_cancelled",
+        ExecutionEvidenceStatus::Failed | ExecutionEvidenceStatus::Succeeded => {
+            let normalized = error.to_ascii_lowercase();
+            if normalized.contains("empty response") {
+                "worker_empty_response"
+            } else {
+                "worker_outcome_error"
+            }
+        }
+    }
+}
+
 fn build_execution_metadata(
     result: &BackendExecutionResult,
     routing_decision: Option<RoutingDecision>,
@@ -1358,7 +2640,31 @@ fn build_execution_metadata(
         team_name: None,
         summary: None,
         artifacts: Vec::new(),
-        external_run_id: None,
+        external_run_id: result.metadata.external_run_id.clone(),
+    }
+}
+
+fn execution_mode_for_backend(backend: &WorkerBackend, has_script: bool) -> ExecutionEvidenceMode {
+    if has_script {
+        return ExecutionEvidenceMode::Shell;
+    }
+    match backend {
+        WorkerBackend::Summary | WorkerBackend::WorkersAI => ExecutionEvidenceMode::Advisory,
+        WorkerBackend::Custom(_) => ExecutionEvidenceMode::Code,
+        WorkerBackend::Codex
+        | WorkerBackend::Claude
+        | WorkerBackend::Zai
+        | WorkerBackend::AzureOpenAI
+        | WorkerBackend::FoundryMaaS
+        | WorkerBackend::GithubCopilot => ExecutionEvidenceMode::Code,
+    }
+}
+
+fn omx_status_to_evidence_status(status: &super::omx::OmxSessionStatus) -> ExecutionEvidenceStatus {
+    match status {
+        super::omx::OmxSessionStatus::Failed => ExecutionEvidenceStatus::Failed,
+        super::omx::OmxSessionStatus::Stopped => ExecutionEvidenceStatus::Cancelled,
+        _ => ExecutionEvidenceStatus::Succeeded,
     }
 }
 
@@ -1529,6 +2835,1490 @@ fn default_codex_sandbox_for_request(request: &WorkerRequest) -> &'static str {
     }
 }
 
+fn is_codex_usage_limit_error(err_text: &str) -> bool {
+    let normalized = err_text.to_ascii_lowercase();
+    normalized.contains("usage limit")
+        || normalized.contains("usage_limit")
+        || normalized.contains("rate limit")
+        || normalized.contains("rate_limit")
+        || normalized.contains("quota exceeded")
+        || normalized.contains("insufficient_quota")
+        || normalized.contains("429 too many requests")
+        || normalized.contains("status 429")
+}
+
+fn detect_paperclip_control_plane_blocker(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let mentions_approval = normalized.contains("approval restriction")
+        || normalized.contains("requires approval")
+        || normalized.contains("approval is required")
+        || normalized.contains("without approval");
+    let mentions_control_plane = normalized.contains("paperclip.api")
+        || normalized.contains("paperclip api")
+        || normalized.contains("paperclip_api")
+        || normalized.contains("api call")
+        || normalized.contains("http request")
+        || normalized.contains("network call")
+        || normalized.contains("network request")
+        || normalized.contains("checkout issue")
+        || normalized.contains("checking out issue")
+        || normalized.contains("verifying identity");
+    let mentions_sandbox = normalized.contains("sandbox") || normalized.contains("permission");
+
+    if mentions_approval && mentions_control_plane && mentions_sandbox {
+        return Some(format!(
+            "paperclip control-plane approval blocker: {}",
+            summarize_for_chat(trimmed, 600)
+        ));
+    }
+
+    if normalized.contains("sandbox requires approval")
+        && (mentions_control_plane || normalized.contains("http"))
+    {
+        return Some(format!(
+            "paperclip sandbox approval blocker: {}",
+            summarize_for_chat(trimmed, 600)
+        ));
+    }
+
+    None
+}
+
+fn run_codex_usage_limit_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+    codex_error: String,
+) -> Result<BackendExecutionResult> {
+    let fallback = non_empty_env("NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND")
+        .or_else(|| non_empty_env("NANOCLAW_CODEX_LIMIT_FALLBACK_BACKEND"))
+        .unwrap_or_else(|| "zai".to_string())
+        .to_ascii_lowercase();
+    let fallback_reason = Some(format!("codex_usage_limit: {}", codex_error));
+
+    match fallback.as_str() {
+        "off" | "none" | "disabled" => {
+            bail!("codex usage limit reached and fallback is disabled: {codex_error}")
+        }
+        "workers-ai" | "workers_ai" | "workersai" => run_workers_ai_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            execution_location,
+            fallback_reason,
+        ),
+        "zai" | "z-ai" | "glm" | "zhipu" => run_zai_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            fallback_reason,
+        ),
+        "azure"
+        | "azure-openai"
+        | "azure_openai"
+        | "azureopenai"
+        | "azure-ai"
+        | "azure_ai"
+        | "azure-foundry"
+        | "azure_foundry" => run_azure_openai_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            fallback_reason,
+        ),
+        "foundry"
+        | "foundry-maas"
+        | "foundry_maas"
+        | "azure-maas"
+        | "azure_maas"
+        | "azure-model-inference"
+        | "azure_model_inference"
+        | "azure-ai-model-inference"
+        | "azure_ai_model_inference"
+        | "azure-foundry-maas"
+        | "azure_foundry_maas" => run_foundry_maas_request(
+            request,
+            workspace_root,
+            prior_turns,
+            instruction_hint,
+            session_state,
+            resolved_backend,
+            fallback_reason,
+        ),
+        other => bail!(
+            "unsupported NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND '{}'; expected zai, azure-openai, foundry-maas, workers-ai, or disabled",
+            other
+        ),
+    }
+}
+
+fn run_zai_request_with_codex_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+) -> Result<BackendExecutionResult> {
+    match run_zai_request(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        None,
+    ) {
+        Ok(result) => Ok(result),
+        Err(zai_error) => {
+            let zai_error_text = zai_error.to_string();
+            let fallback_reason = Some(format!(
+                "zai_unavailable: {}",
+                summarize_for_chat(&zai_error_text, 600)
+            ));
+            run_codex_request(
+                request,
+                workspace_root,
+                prior_turns,
+                instruction_hint,
+                session_state,
+                resolved_backend,
+                execution_location,
+                fallback_reason,
+            )
+            .with_context(|| {
+                format!(
+                    "ZAI backend failed and Codex fallback also failed; ZAI error: {}",
+                    summarize_for_chat(&zai_error_text, 600)
+                )
+            })
+        }
+    }
+}
+
+fn run_azure_openai_request_with_codex_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+) -> Result<BackendExecutionResult> {
+    match run_azure_openai_request(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        None,
+    ) {
+        Ok(result) => Ok(result),
+        Err(azure_error) => {
+            let azure_error_text = azure_error.to_string();
+            let fallback = azure_openai_fallback_backend();
+            match fallback.as_str() {
+                "off" | "none" | "disabled" => Err(azure_error),
+                "codex" | "codex-local" | "codex_local" | "openai" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_codex_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        execution_location,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and Codex fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
+                "zai" | "z-ai" | "glm" | "zhipu" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_zai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and ZAI fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
+                "workers-ai" | "workers_ai" | "workersai" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_workers_ai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        execution_location,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and Workers AI fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
+                "foundry"
+                | "foundry-maas"
+                | "foundry_maas"
+                | "azure-maas"
+                | "azure_maas"
+                | "azure-model-inference"
+                | "azure_model_inference"
+                | "azure-ai-model-inference"
+                | "azure_ai_model_inference"
+                | "azure-foundry-maas"
+                | "azure_foundry_maas" => {
+                    let fallback_reason = Some(format!(
+                        "azure_openai_unavailable: {}",
+                        summarize_for_chat(&azure_error_text, 600)
+                    ));
+                    run_foundry_maas_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Azure OpenAI backend failed and Foundry MaaS fallback also failed; Azure error: {}",
+                            summarize_for_chat(&azure_error_text, 600)
+                        )
+                    })
+                }
+                other => bail!(
+                    "unsupported NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND '{}'; expected codex, zai, foundry-maas, workers-ai, or disabled",
+                    other
+                ),
+            }
+        }
+    }
+}
+
+fn azure_openai_fallback_backend() -> String {
+    normalize_azure_openai_fallback_backend(
+        non_empty_env("NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND")
+            .or_else(|| non_empty_env("NANOCLAW_AZURE_FALLBACK_BACKEND")),
+    )
+}
+
+fn normalize_azure_openai_fallback_backend(value: Option<String>) -> String {
+    value
+        .unwrap_or_else(|| "codex".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn run_zai_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    fallback_reason: Option<String>,
+) -> Result<BackendExecutionResult> {
+    let token = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "ZAI_ANTHROPIC_AUTH_TOKEN",
+            "NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN",
+            "ZAI_API_KEY",
+            "NANOCLAW_ZAI_API_KEY",
+        ],
+    )
+    .ok_or_else(|| {
+        if fallback_reason.is_some() {
+            anyhow::anyhow!(
+                "codex usage limit reached and ZAI fallback is enabled, but no ZAI token is configured; set ZAI_ANTHROPIC_AUTH_TOKEN or ZAI_API_KEY"
+            )
+        } else {
+            anyhow::anyhow!(
+                "ZAI backend is enabled, but no ZAI token is configured; set ZAI_ANTHROPIC_AUTH_TOKEN or ZAI_API_KEY"
+            )
+        }
+    })?;
+    let base_url = first_non_empty_request_or_process_env(
+        request,
+        &["ZAI_ANTHROPIC_BASE_URL", "NANOCLAW_ZAI_ANTHROPIC_BASE_URL"],
+    )
+    .unwrap_or_else(|| "https://api.z.ai/api/anthropic".to_string());
+    let model = first_non_empty_request_or_process_env(
+        request,
+        &["NANOCLAW_ZAI_MODEL", "ZAI_ANTHROPIC_MODEL"],
+    )
+    .unwrap_or_else(|| "glm-4.7".to_string());
+
+    run_claude_request_with_options(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        ClaudeRequestOptions {
+            backend: Some(WorkerBackend::Zai),
+            provider: Some("zai".to_string()),
+            biller: Some("zai".to_string()),
+            billing_type: Some("api".to_string()),
+            model: Some(model),
+            env_overrides: vec![
+                ("ANTHROPIC_AUTH_TOKEN".to_string(), token.clone()),
+                ("ANTHROPIC_API_KEY".to_string(), token),
+                ("ANTHROPIC_BASE_URL".to_string(), base_url),
+            ],
+            fallback_reason,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AzureOpenAIChatTarget {
+    url: String,
+    include_model: bool,
+}
+
+fn run_azure_openai_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    _prior_turns: usize,
+    _instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    fallback_reason: Option<String>,
+) -> Result<BackendExecutionResult> {
+    if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
+        bail!(error);
+    }
+
+    let token = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_API_KEY",
+            "NANOCLAW_AZURE_OPENAI_API_KEY",
+            "AZURE_AI_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_KEY",
+            "AZURE_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_FOUNDRY_API_KEY",
+            "AZURE_AI_API_KEY",
+            "NANOCLAW_AZURE_AI_API_KEY",
+        ],
+    )
+    .ok_or_else(|| {
+        if fallback_reason.is_some() {
+            anyhow::anyhow!(
+                "codex usage limit reached and Azure OpenAI fallback is enabled, but no Azure key is configured; set AZURE_OPENAI_API_KEY"
+            )
+        } else {
+            anyhow::anyhow!(
+                "Azure OpenAI backend is enabled, but no Azure key is configured; set AZURE_OPENAI_API_KEY"
+            )
+        }
+    })?;
+    let endpoint = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_ENDPOINT",
+            "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+            "AZURE_AI_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT",
+            "AZURE_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_FOUNDRY_ENDPOINT",
+            "AZURE_OPENAI_BASE_URL",
+            "NANOCLAW_AZURE_OPENAI_BASE_URL",
+            "AZURE_AI_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_AI_FOUNDRY_BASE_URL",
+            "AZURE_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_FOUNDRY_BASE_URL",
+        ],
+    )
+    .context("Azure OpenAI backend requires AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_BASE_URL")?;
+    let deployment = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_DEPLOYMENT",
+            "NANOCLAW_AZURE_OPENAI_DEPLOYMENT",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "AZURE_FOUNDRY_DEPLOYMENT",
+            "NANOCLAW_AZURE_FOUNDRY_DEPLOYMENT",
+            "AZURE_OPENAI_MODEL",
+            "NANOCLAW_AZURE_OPENAI_MODEL",
+            "AZURE_AI_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_AI_FOUNDRY_MODEL",
+            "AZURE_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_FOUNDRY_MODEL",
+            "AZURE_OPENAI_DEPLOYMENT_NAME",
+            "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
+        ],
+    )
+    .context("Azure OpenAI backend requires AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_MODEL")?;
+    let api_version = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_API_VERSION",
+            "NANOCLAW_AZURE_OPENAI_API_VERSION",
+            "AZURE_AI_FOUNDRY_API_VERSION",
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION",
+            "AZURE_FOUNDRY_API_VERSION",
+            "NANOCLAW_AZURE_FOUNDRY_API_VERSION",
+        ],
+    )
+    .unwrap_or_else(|| "2024-10-21".to_string());
+    let target = build_azure_openai_chat_target(&endpoint, &deployment, &api_version)?;
+    let prompt = build_worker_prompt(request, workspace_root, session_state)?;
+    let temperature = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_TEMPERATURE",
+            "NANOCLAW_AZURE_OPENAI_TEMPERATURE",
+        ],
+    )
+    .and_then(|value| value.parse::<f64>().ok())
+    .unwrap_or(0.2);
+    let max_tokens = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_MAX_TOKENS",
+            "NANOCLAW_AZURE_OPENAI_MAX_TOKENS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(2048);
+    let timeout = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "AZURE_OPENAI_TIMEOUT_MS",
+            "NANOCLAW_AZURE_OPENAI_TIMEOUT_MS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value >= 1000)
+    .map(Duration::from_millis)
+    .unwrap_or_else(|| Duration::from_secs(120));
+
+    let mut payload = serde_json::Map::new();
+    if target.include_model {
+        payload.insert("model".to_string(), Value::String(deployment.clone()));
+    }
+    payload.insert(
+        "messages".to_string(),
+        Value::Array(vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "You are a NanoClaw provider backend. Return only the operator-facing message that should be written back through the existing OpenClaw/OMX/Paperclip evidence path. Do not claim code, shell, PR, or deploy execution unless the prompt includes concrete evidence."
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": prompt,
+            }),
+        ]),
+    );
+    if let Some(number) = serde_json::Number::from_f64(temperature) {
+        payload.insert("temperature".to_string(), Value::Number(number));
+    }
+    payload.insert(
+        "max_tokens".to_string(),
+        Value::Number(serde_json::Number::from(max_tokens)),
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build Azure OpenAI HTTP client")?;
+    let response = client
+        .post(&target.url)
+        .header("content-type", "application/json")
+        .header("api-key", &token)
+        .bearer_auth(&token)
+        .json(&Value::Object(payload))
+        .send()
+        .context("failed to send request to Azure OpenAI")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read Azure OpenAI response body")?;
+    if !status.is_success() {
+        bail!(
+            "Azure OpenAI execution failed with status {} for endpoint {}: {}",
+            status,
+            redact_azure_openai_url(&target.url),
+            summarize_workers_ai_body(&body)
+        );
+    }
+
+    let result: Value = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "failed to parse Azure OpenAI response: {}",
+            summarize_workers_ai_body(&body)
+        )
+    })?;
+    let text = extract_azure_openai_text(&result).unwrap_or_default();
+    if text.trim().is_empty() {
+        bail!("Azure OpenAI execution produced empty output");
+    }
+    if is_paperclip_gateway_request(request) {
+        if let Some(blocker) = detect_paperclip_control_plane_blocker(&text) {
+            bail!("azure-openai execution blocked: {blocker}");
+        }
+    }
+
+    let usage = parse_azure_openai_usage(&result);
+    let cost_usd = usage.as_ref().and_then(|usage| {
+        estimate_azure_openai_cost_usd_with_config(
+            &deployment,
+            usage,
+            read_azure_openai_cost_config(),
+        )
+    });
+    let capability_manifest = derive_capability_manifest(
+        &request.request_plane,
+        DeriveCapabilityManifestInput::default(),
+    );
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\nbackend=azure-openai\nprovider=azure_openai\nbiller=azure\nbilling_type=credits\nmodel={}\nfallback_reason={:?}\nendpoint={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nresponse=\n{}\n",
+        request.invocation_id,
+        request.session.id,
+        workspace_root.display(),
+        deployment,
+        fallback_reason,
+        redact_azure_openai_url(&target.url),
+        usage.as_ref().map(|value| value.input_tokens).unwrap_or(0),
+        usage.as_ref()
+            .map(|value| value.cached_input_tokens)
+            .unwrap_or(0),
+        usage.as_ref().map(|value| value.output_tokens).unwrap_or(0),
+        cost_usd
+            .map(|value| format!("{value:.8}"))
+            .unwrap_or_else(|| "-".to_string()),
+        request.request_plane.as_str(),
+        text
+    );
+
+    Ok(BackendExecutionResult {
+        text,
+        log_body,
+        metadata: BackendExecutionMetadata {
+            backend: WorkerBackend::AzureOpenAI,
+            provider: Some("azure_openai".to_string()),
+            biller: Some("azure".to_string()),
+            billing_type: Some("credits".to_string()),
+            model: Some(deployment),
+            usage,
+            cost_usd,
+            effective_capabilities: capability_manifest,
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
+            secret_handles: Vec::new(),
+            mount_summary: vec![ExecutionMountSummaryEntry {
+                host_path: Some(workspace_root.display().to_string()),
+                container_path: None,
+                readonly: false,
+                kind: ExecutionMountKind::Project,
+            }],
+            fallback_reason,
+            external_run_id: None,
+        },
+    })
+}
+
+fn run_foundry_maas_request_with_codex_fallback(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    execution_location: ExecutionLocation,
+) -> Result<BackendExecutionResult> {
+    match run_foundry_maas_request(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        None,
+    ) {
+        Ok(result) => Ok(result),
+        Err(foundry_error) => {
+            let foundry_error_text = foundry_error.to_string();
+            let fallback = foundry_maas_fallback_backend();
+            match fallback.as_str() {
+                "off" | "none" | "disabled" => Err(foundry_error),
+                "codex" | "codex-local" | "codex_local" | "openai" => {
+                    let fallback_reason = Some(format!(
+                        "foundry_maas_unavailable: {}",
+                        summarize_for_chat(&foundry_error_text, 600)
+                    ));
+                    run_codex_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        execution_location,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Foundry MaaS backend failed and Codex fallback also failed; Foundry error: {}",
+                            summarize_for_chat(&foundry_error_text, 600)
+                        )
+                    })
+                }
+                "zai" | "z-ai" | "glm" | "zhipu" => {
+                    let fallback_reason = Some(format!(
+                        "foundry_maas_unavailable: {}",
+                        summarize_for_chat(&foundry_error_text, 600)
+                    ));
+                    run_zai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Foundry MaaS backend failed and ZAI fallback also failed; Foundry error: {}",
+                            summarize_for_chat(&foundry_error_text, 600)
+                        )
+                    })
+                }
+                "azure"
+                | "azure-openai"
+                | "azure_openai"
+                | "azureopenai"
+                | "azure-ai"
+                | "azure_ai"
+                | "azure-foundry"
+                | "azure_foundry" => {
+                    let fallback_reason = Some(format!(
+                        "foundry_maas_unavailable: {}",
+                        summarize_for_chat(&foundry_error_text, 600)
+                    ));
+                    run_azure_openai_request(
+                        request,
+                        workspace_root,
+                        prior_turns,
+                        instruction_hint,
+                        session_state,
+                        resolved_backend,
+                        fallback_reason,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Foundry MaaS backend failed and Azure OpenAI fallback also failed; Foundry error: {}",
+                            summarize_for_chat(&foundry_error_text, 600)
+                        )
+                    })
+                }
+                other => bail!(
+                    "unsupported NANOCLAW_FOUNDRY_MAAS_FALLBACK_BACKEND '{}'; expected codex, azure-openai, zai, or disabled",
+                    other
+                ),
+            }
+        }
+    }
+}
+
+fn foundry_maas_fallback_backend() -> String {
+    non_empty_env("NANOCLAW_FOUNDRY_MAAS_FALLBACK_BACKEND")
+        .or_else(|| non_empty_env("NANOCLAW_AZURE_AI_FOUNDRY_FALLBACK_BACKEND"))
+        .or_else(|| non_empty_env("NANOCLAW_AZURE_FOUNDRY_FALLBACK_BACKEND"))
+        .unwrap_or_else(|| "codex".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn run_foundry_maas_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    _prior_turns: usize,
+    _instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    fallback_reason: Option<String>,
+) -> Result<BackendExecutionResult> {
+    if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
+        bail!(error);
+    }
+
+    let token = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_KEY",
+            "AZURE_AI_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_FOUNDRY_API_KEY",
+            "AZURE_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_API_KEY",
+            "AZURE_MODEL_INFERENCE_API_KEY",
+            "NANOCLAW_FOUNDRY_MAAS_API_KEY",
+            "FOUNDRY_MAAS_API_KEY",
+            "NANOCLAW_AZURE_AI_API_KEY",
+            "AZURE_AI_API_KEY",
+            "NANOCLAW_AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+        ],
+    )
+    .ok_or_else(|| {
+        if fallback_reason.is_some() {
+            anyhow::anyhow!(
+                "codex usage limit reached and Foundry MaaS fallback is enabled, but no Azure AI Foundry key is configured; set NANOCLAW_AZURE_AI_FOUNDRY_API_KEY"
+            )
+        } else {
+            anyhow::anyhow!(
+                "Foundry MaaS backend is enabled, but no Azure AI Foundry key is configured; set NANOCLAW_AZURE_AI_FOUNDRY_API_KEY"
+            )
+        }
+    })?;
+    let endpoint = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT",
+            "AZURE_AI_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_FOUNDRY_ENDPOINT",
+            "AZURE_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_ENDPOINT",
+            "AZURE_MODEL_INFERENCE_ENDPOINT",
+            "NANOCLAW_FOUNDRY_MAAS_ENDPOINT",
+            "FOUNDRY_MAAS_ENDPOINT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_BASE_URL",
+            "AZURE_AI_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_FOUNDRY_BASE_URL",
+            "AZURE_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+            "AZURE_OPENAI_ENDPOINT",
+            "NANOCLAW_AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_BASE_URL",
+        ],
+    )
+    .context("Foundry MaaS backend requires NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT")?;
+    let model = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_MODEL",
+            "AZURE_AI_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_FOUNDRY_MODEL",
+            "AZURE_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_MODEL",
+            "AZURE_MODEL_INFERENCE_MODEL",
+            "NANOCLAW_FOUNDRY_MAAS_MODEL",
+            "FOUNDRY_MAAS_MODEL",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
+        ],
+    )
+    .context("Foundry MaaS backend requires NANOCLAW_AZURE_AI_FOUNDRY_MODEL")?;
+    let api_version = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION",
+            "AZURE_AI_FOUNDRY_API_VERSION",
+            "NANOCLAW_AZURE_MODEL_INFERENCE_API_VERSION",
+            "AZURE_MODEL_INFERENCE_API_VERSION",
+            "NANOCLAW_FOUNDRY_MAAS_API_VERSION",
+            "FOUNDRY_MAAS_API_VERSION",
+        ],
+    )
+    .unwrap_or_else(|| "2024-05-01-preview".to_string());
+    let target = build_foundry_maas_chat_target(&endpoint, &model, &api_version)?;
+    let prompt = build_worker_prompt(request, workspace_root, session_state)?;
+    let temperature = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_FOUNDRY_MAAS_TEMPERATURE",
+            "FOUNDRY_MAAS_TEMPERATURE",
+            "NANOCLAW_AZURE_AI_FOUNDRY_TEMPERATURE",
+            "AZURE_AI_FOUNDRY_TEMPERATURE",
+        ],
+    )
+    .and_then(|value| value.parse::<f64>().ok())
+    .unwrap_or(0.2);
+    let max_tokens = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_FOUNDRY_MAAS_MAX_TOKENS",
+            "FOUNDRY_MAAS_MAX_TOKENS",
+            "NANOCLAW_AZURE_AI_FOUNDRY_MAX_TOKENS",
+            "AZURE_AI_FOUNDRY_MAX_TOKENS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(2048);
+    let timeout = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_FOUNDRY_MAAS_TIMEOUT_MS",
+            "FOUNDRY_MAAS_TIMEOUT_MS",
+            "NANOCLAW_AZURE_AI_FOUNDRY_TIMEOUT_MS",
+            "AZURE_AI_FOUNDRY_TIMEOUT_MS",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value >= 1000)
+    .map(Duration::from_millis)
+    .unwrap_or_else(|| Duration::from_secs(120));
+
+    let mut payload = serde_json::Map::new();
+    if target.include_model {
+        payload.insert("model".to_string(), Value::String(model.clone()));
+    }
+    payload.insert(
+        "messages".to_string(),
+        Value::Array(vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "You are a NanoClaw provider backend. Return only the operator-facing message that should be written back through the existing OpenClaw/OMX/Paperclip evidence path. Do not claim code, shell, PR, or deploy execution unless the prompt includes concrete evidence."
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": prompt,
+            }),
+        ]),
+    );
+    if let Some(number) = serde_json::Number::from_f64(temperature) {
+        payload.insert("temperature".to_string(), Value::Number(number));
+    }
+    payload.insert(
+        "max_tokens".to_string(),
+        Value::Number(serde_json::Number::from(max_tokens)),
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build Foundry MaaS HTTP client")?;
+    let response = client
+        .post(&target.url)
+        .header("content-type", "application/json")
+        .header("api-key", &token)
+        .bearer_auth(&token)
+        .json(&Value::Object(payload))
+        .send()
+        .context("failed to send request to Foundry MaaS")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read Foundry MaaS response body")?;
+    if !status.is_success() {
+        bail!(
+            "Foundry MaaS execution failed with status {} for endpoint {}: {}",
+            status,
+            redact_azure_openai_url(&target.url),
+            summarize_workers_ai_body(&body)
+        );
+    }
+
+    let result: Value = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "failed to parse Foundry MaaS response: {}",
+            summarize_workers_ai_body(&body)
+        )
+    })?;
+    let text = extract_azure_openai_text(&result).unwrap_or_default();
+    if text.trim().is_empty() {
+        bail!("Foundry MaaS execution produced empty output");
+    }
+    if is_paperclip_gateway_request(request) {
+        if let Some(blocker) = detect_paperclip_control_plane_blocker(&text) {
+            bail!("foundry-maas execution blocked: {blocker}");
+        }
+    }
+
+    let usage = parse_azure_openai_usage(&result);
+    let cost_usd = usage.as_ref().and_then(|usage| {
+        estimate_azure_openai_cost_usd_with_config(&model, usage, read_foundry_maas_cost_config())
+    });
+    let capability_manifest = derive_capability_manifest(
+        &request.request_plane,
+        DeriveCapabilityManifestInput::default(),
+    );
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\nbackend=foundry-maas\nprovider=azure_foundry_maas\nbiller=azure\nbilling_type=azure_credits\nmodel={}\nfallback_reason={:?}\nendpoint={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nresponse=\n{}\n",
+        request.invocation_id,
+        request.session.id,
+        workspace_root.display(),
+        model,
+        fallback_reason,
+        redact_azure_openai_url(&target.url),
+        usage.as_ref().map(|value| value.input_tokens).unwrap_or(0),
+        usage.as_ref()
+            .map(|value| value.cached_input_tokens)
+            .unwrap_or(0),
+        usage.as_ref().map(|value| value.output_tokens).unwrap_or(0),
+        cost_usd
+            .map(|value| format!("{value:.8}"))
+            .unwrap_or_else(|| "-".to_string()),
+        request.request_plane.as_str(),
+        text
+    );
+
+    Ok(BackendExecutionResult {
+        text,
+        log_body,
+        metadata: BackendExecutionMetadata {
+            backend: WorkerBackend::FoundryMaaS,
+            provider: Some("azure_foundry_maas".to_string()),
+            biller: Some("azure".to_string()),
+            billing_type: Some("azure_credits".to_string()),
+            model: Some(model),
+            usage,
+            cost_usd,
+            effective_capabilities: capability_manifest,
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
+            secret_handles: Vec::new(),
+            mount_summary: vec![ExecutionMountSummaryEntry {
+                host_path: Some(workspace_root.display().to_string()),
+                container_path: None,
+                readonly: false,
+                kind: ExecutionMountKind::Project,
+            }],
+            fallback_reason,
+            external_run_id: None,
+        },
+    })
+}
+
+fn build_azure_openai_chat_target(
+    endpoint: &str,
+    deployment: &str,
+    api_version: &str,
+) -> Result<AzureOpenAIChatTarget> {
+    let endpoint = endpoint.trim();
+    let deployment = deployment.trim();
+    let api_version = api_version.trim();
+    let mut parsed = reqwest::Url::parse(endpoint)
+        .context("AZURE_OPENAI_ENDPOINT must be a valid absolute URL")?;
+    let path = parsed.path().trim_end_matches('/').to_string();
+
+    if path.ends_with("/chat/completions") {
+        append_api_version_if_missing(&mut parsed, api_version);
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if path.ends_with("/models") || path.contains("/models/") {
+        let prefix = match path.find("/models") {
+            Some(index) => &path[..index + "/models".len()],
+            None => path.as_str(),
+        };
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        append_api_version_if_missing(&mut parsed, api_version);
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if path.contains("/api/projects/") && !path.contains("/openai/") {
+        parsed.set_path(&format!("{path}/openai/v1/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if let Some(index) = path.find("/openai/v1") {
+        let prefix = &path[..index + "/openai/v1".len()];
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if deployment.is_empty() {
+        bail!("Azure OpenAI deployment/model is required for deployment-scoped endpoints");
+    }
+    if api_version.is_empty() {
+        bail!("Azure OpenAI API version is required for deployment-scoped endpoints");
+    }
+    parsed.set_query(None);
+    {
+        let mut segments = parsed
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("AZURE_OPENAI_ENDPOINT cannot be a base-only URL"))?;
+        segments.clear();
+        segments
+            .push("openai")
+            .push("deployments")
+            .push(deployment)
+            .push("chat")
+            .push("completions");
+    }
+    parsed
+        .query_pairs_mut()
+        .append_pair("api-version", api_version);
+    Ok(AzureOpenAIChatTarget {
+        url: parsed.to_string(),
+        include_model: false,
+    })
+}
+
+fn build_foundry_maas_chat_target(
+    endpoint: &str,
+    model: &str,
+    api_version: &str,
+) -> Result<AzureOpenAIChatTarget> {
+    let endpoint = endpoint.trim();
+    let model = model.trim();
+    let api_version = api_version.trim();
+    if model.is_empty() {
+        bail!("Foundry MaaS model is required");
+    }
+
+    let mut parsed = reqwest::Url::parse(endpoint)
+        .context("NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT must be a valid absolute URL")?;
+    let path = parsed.path().trim_end_matches('/').to_string();
+
+    if path.ends_with("/chat/completions") {
+        if path.contains("/models/") || path.ends_with("/models/chat/completions") {
+            append_api_version_if_missing(&mut parsed, api_version);
+        }
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if let Some(index) = path.find("/openai/v1") {
+        let prefix = &path[..index + "/openai/v1".len()];
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if path.contains("/api/projects/") && !path.contains("/openai/") {
+        parsed.set_path(&format!("{path}/openai/v1/chat/completions"));
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if path.ends_with("/models") || path.contains("/models/") {
+        let prefix = match path.find("/models") {
+            Some(index) => &path[..index + "/models".len()],
+            None => path.as_str(),
+        };
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        append_api_version_if_missing(&mut parsed, api_version);
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if parsed
+        .host_str()
+        .map(|host| host.ends_with(".openai.azure.com"))
+        .unwrap_or(false)
+    {
+        parsed.set_path("/openai/v1/chat/completions");
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    parsed.set_path("/models/chat/completions");
+    append_api_version_if_missing(&mut parsed, api_version);
+    Ok(AzureOpenAIChatTarget {
+        url: parsed.to_string(),
+        include_model: true,
+    })
+}
+
+fn append_api_version_if_missing(parsed: &mut reqwest::Url, api_version: &str) {
+    let api_version = api_version.trim();
+    if api_version.is_empty() {
+        return;
+    }
+    if parsed.query_pairs().any(|(key, _)| key == "api-version") {
+        return;
+    }
+    parsed
+        .query_pairs_mut()
+        .append_pair("api-version", api_version);
+}
+
+fn extract_azure_openai_text(result: &Value) -> Option<String> {
+    result
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| result.pointer("/choices/0/text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_azure_openai_usage(result: &Value) -> Option<ExecutionUsageSummary> {
+    let usage = result.get("usage")?.as_object()?;
+    let summary = ExecutionUsageSummary {
+        input_tokens: parse_json_usize_field(
+            usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens")),
+        )
+        .unwrap_or_default(),
+        cached_input_tokens: parse_json_usize_field(
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .or_else(|| usage.get("cached_input_tokens")),
+        )
+        .unwrap_or_default(),
+        output_tokens: parse_json_usize_field(
+            usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens")),
+        )
+        .unwrap_or_default(),
+    };
+    (!summary.is_empty()).then_some(summary)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AzureOpenAICostRates {
+    input_usd_per_1m: f64,
+    cached_input_usd_per_1m: f64,
+    output_usd_per_1m: f64,
+}
+
+const DEFAULT_AZURE_OPENAI_GPT_4_1_MINI_RATES: AzureOpenAICostRates = AzureOpenAICostRates {
+    input_usd_per_1m: 0.44,
+    cached_input_usd_per_1m: 0.11,
+    output_usd_per_1m: 1.76,
+};
+
+fn estimate_azure_openai_cost_usd_with_config(
+    deployment_or_model: &str,
+    usage: &ExecutionUsageSummary,
+    config: AzureOpenAICostConfig,
+) -> Option<f64> {
+    let rates = resolve_azure_openai_cost_rates_with_config(deployment_or_model, config)?;
+    Some(estimate_azure_openai_cost_usd_with_rates(usage, rates))
+}
+
+#[cfg(test)]
+fn estimate_azure_openai_cost_usd_with_overrides(
+    deployment_or_model: &str,
+    usage: &ExecutionUsageSummary,
+    override_rates: AzureOpenAICostRateOverrides,
+) -> Option<f64> {
+    let rates =
+        resolve_azure_openai_cost_rates_with_overrides(deployment_or_model, override_rates)?;
+    Some(estimate_azure_openai_cost_usd_with_rates(usage, rates))
+}
+
+fn estimate_azure_openai_cost_usd_with_rates(
+    usage: &ExecutionUsageSummary,
+    rates: AzureOpenAICostRates,
+) -> f64 {
+    let uncached_input_tokens = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+    let cost = ((uncached_input_tokens as f64) * rates.input_usd_per_1m
+        + (usage.cached_input_tokens as f64) * rates.cached_input_usd_per_1m
+        + (usage.output_tokens as f64) * rates.output_usd_per_1m)
+        / 1_000_000.0;
+    round_cost_usd(cost)
+}
+
+#[cfg(test)]
+fn resolve_azure_openai_cost_rates_with_overrides(
+    deployment_or_model: &str,
+    override_rates: AzureOpenAICostRateOverrides,
+) -> Option<AzureOpenAICostRates> {
+    resolve_azure_openai_cost_rates_with_config(
+        deployment_or_model,
+        AzureOpenAICostConfig {
+            overrides: override_rates,
+            rate_card: BTreeMap::new(),
+        },
+    )
+}
+
+fn resolve_azure_openai_cost_rates_with_config(
+    deployment_or_model: &str,
+    config: AzureOpenAICostConfig,
+) -> Option<AzureOpenAICostRates> {
+    let AzureOpenAICostConfig {
+        overrides: override_rates,
+        rate_card,
+    } = config;
+    if override_rates.is_complete() {
+        return override_rates.into_rates();
+    }
+
+    let normalized = normalize_azure_openai_rate_model_name(deployment_or_model);
+    if let Some(rates) = rate_card.get(&normalized).copied() {
+        return Some(override_rates.overlay(rates));
+    }
+    let compact_normalized = normalized.replace('.', "");
+    if let Some(rates) = rate_card
+        .iter()
+        .find_map(|(model, rates)| (model.replace('.', "") == compact_normalized).then_some(*rates))
+    {
+        return Some(override_rates.overlay(rates));
+    }
+
+    if normalized.contains("gpt41mini")
+        || normalized.contains("gpt4.1mini")
+        || normalized.contains("gpt4-1mini")
+    {
+        return Some(override_rates.overlay(DEFAULT_AZURE_OPENAI_GPT_4_1_MINI_RATES));
+    }
+
+    None
+}
+
+fn normalize_azure_openai_rate_model_name(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric() || *value == '.')
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AzureOpenAICostRateOverrides {
+    input_usd_per_1m: Option<f64>,
+    cached_input_usd_per_1m: Option<f64>,
+    output_usd_per_1m: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AzureOpenAICostConfig {
+    overrides: AzureOpenAICostRateOverrides,
+    rate_card: BTreeMap<String, AzureOpenAICostRates>,
+}
+
+impl AzureOpenAICostRateOverrides {
+    fn is_complete(&self) -> bool {
+        self.input_usd_per_1m.is_some()
+            && self.cached_input_usd_per_1m.is_some()
+            && self.output_usd_per_1m.is_some()
+    }
+
+    fn into_rates(self) -> Option<AzureOpenAICostRates> {
+        Some(AzureOpenAICostRates {
+            input_usd_per_1m: self.input_usd_per_1m?,
+            cached_input_usd_per_1m: self.cached_input_usd_per_1m?,
+            output_usd_per_1m: self.output_usd_per_1m?,
+        })
+    }
+
+    fn overlay(self, defaults: AzureOpenAICostRates) -> AzureOpenAICostRates {
+        AzureOpenAICostRates {
+            input_usd_per_1m: self.input_usd_per_1m.unwrap_or(defaults.input_usd_per_1m),
+            cached_input_usd_per_1m: self
+                .cached_input_usd_per_1m
+                .unwrap_or(defaults.cached_input_usd_per_1m),
+            output_usd_per_1m: self.output_usd_per_1m.unwrap_or(defaults.output_usd_per_1m),
+        }
+    }
+}
+
+fn read_azure_openai_cost_rate_overrides() -> AzureOpenAICostRateOverrides {
+    AzureOpenAICostRateOverrides {
+        input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_AZURE_OPENAI_INPUT_USD_PER_1M",
+            "AZURE_OPENAI_INPUT_USD_PER_1M",
+        ]),
+        cached_input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_AZURE_OPENAI_CACHED_INPUT_USD_PER_1M",
+            "AZURE_OPENAI_CACHED_INPUT_USD_PER_1M",
+        ]),
+        output_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_AZURE_OPENAI_OUTPUT_USD_PER_1M",
+            "AZURE_OPENAI_OUTPUT_USD_PER_1M",
+        ]),
+    }
+}
+
+fn read_azure_openai_cost_config() -> AzureOpenAICostConfig {
+    AzureOpenAICostConfig {
+        overrides: read_azure_openai_cost_rate_overrides(),
+        rate_card: read_azure_openai_cost_rate_card(),
+    }
+}
+
+fn read_foundry_maas_cost_config() -> AzureOpenAICostConfig {
+    AzureOpenAICostConfig {
+        overrides: read_foundry_maas_cost_rate_overrides(),
+        rate_card: read_azure_openai_cost_rate_card(),
+    }
+}
+
+fn read_foundry_maas_cost_rate_overrides() -> AzureOpenAICostRateOverrides {
+    AzureOpenAICostRateOverrides {
+        input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_FOUNDRY_MAAS_INPUT_USD_PER_1M",
+            "FOUNDRY_MAAS_INPUT_USD_PER_1M",
+            "NANOCLAW_AZURE_AI_FOUNDRY_INPUT_USD_PER_1M",
+            "AZURE_AI_FOUNDRY_INPUT_USD_PER_1M",
+        ]),
+        cached_input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M",
+            "FOUNDRY_MAAS_CACHED_INPUT_USD_PER_1M",
+            "NANOCLAW_AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M",
+            "AZURE_AI_FOUNDRY_CACHED_INPUT_USD_PER_1M",
+        ]),
+        output_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_FOUNDRY_MAAS_OUTPUT_USD_PER_1M",
+            "FOUNDRY_MAAS_OUTPUT_USD_PER_1M",
+            "NANOCLAW_AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M",
+            "AZURE_AI_FOUNDRY_OUTPUT_USD_PER_1M",
+        ]),
+    }
+}
+
+fn read_azure_openai_cost_rate_card() -> BTreeMap<String, AzureOpenAICostRates> {
+    let Some(raw) = [
+        "NANOCLAW_AZURE_OPENAI_RATE_CARD_JSON",
+        "AZURE_OPENAI_RATE_CARD_JSON",
+        "NANOCLAW_AZURE_AI_FOUNDRY_RATE_CARD_JSON",
+        "AZURE_AI_FOUNDRY_RATE_CARD_JSON",
+        "NANOCLAW_AZURE_FOUNDRY_RATE_CARD_JSON",
+        "AZURE_FOUNDRY_RATE_CARD_JSON",
+    ]
+    .iter()
+    .find_map(|key| non_empty_env(key)) else {
+        return BTreeMap::new();
+    };
+
+    parse_azure_openai_cost_rate_card(&raw)
+}
+
+fn parse_azure_openai_cost_rate_card(raw: &str) -> BTreeMap<String, AzureOpenAICostRates> {
+    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(raw) else {
+        return BTreeMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|(model, value)| {
+            parse_azure_openai_rate_card_entry(&value)
+                .map(|rates| (normalize_azure_openai_rate_model_name(&model), rates))
+        })
+        .collect()
+}
+
+fn parse_azure_openai_rate_card_entry(value: &Value) -> Option<AzureOpenAICostRates> {
+    let object = value.as_object()?;
+    let input_usd_per_1m = parse_json_f64_field(
+        object
+            .get("input_usd_per_1m")
+            .or_else(|| object.get("inputUsdPer1M"))
+            .or_else(|| object.get("input")),
+    )?;
+    let cached_input_usd_per_1m = parse_json_f64_field(
+        object
+            .get("cached_input_usd_per_1m")
+            .or_else(|| object.get("cachedInputUsdPer1M"))
+            .or_else(|| object.get("cached_input"))
+            .or_else(|| object.get("cachedInput")),
+    )
+    .unwrap_or(input_usd_per_1m);
+    let output_usd_per_1m = parse_json_f64_field(
+        object
+            .get("output_usd_per_1m")
+            .or_else(|| object.get("outputUsdPer1M"))
+            .or_else(|| object.get("output")),
+    )?;
+    Some(AzureOpenAICostRates {
+        input_usd_per_1m,
+        cached_input_usd_per_1m,
+        output_usd_per_1m,
+    })
+}
+
+fn parse_rate_env(keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| non_empty_env(key).and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn round_cost_usd(value: f64) -> f64 {
+    (value * 100_000_000.0).round() / 100_000_000.0
+}
+
+fn redact_azure_openai_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
 fn should_use_container_lane(container_groups: &[String], group: &Group) -> bool {
     container_groups.iter().any(|value| {
         matches!(value.trim(), "*" | "all") || value == &group.folder || value == &group.jid
@@ -1586,6 +4376,7 @@ fn remoteize_request(remote_worker_root: &str, request: ExecutionRequest) -> Exe
         script: request.script,
         assistant_name: request.assistant_name,
         request_plane: request.request_plane,
+        env: request.env,
         backend_override: request.backend_override,
         task_signature: request.task_signature,
         routing_decision: request.routing_decision,
@@ -1625,6 +4416,11 @@ fn read_json<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
         .read_to_end(&mut bytes)
         .context("failed to read worker payload")?;
     serde_json::from_slice(&bytes).context("failed to parse worker payload")
+}
+
+fn read_single_json<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    T::deserialize(&mut deserializer).context("failed to parse worker payload")
 }
 
 fn build_message_response(
@@ -1691,6 +4487,7 @@ fn build_message_response(
                 kind: ExecutionMountKind::Project,
             }],
             fallback_reason: None,
+            external_run_id: None,
         },
     }
 }
@@ -1703,6 +4500,13 @@ fn run_script_request(
     instruction_hint: &str,
     execution_location: ExecutionLocation,
 ) -> Result<BackendExecutionResult> {
+    if let Some(violation) = first_blocking_command_safety_violation(script) {
+        bail!(
+            "script command blocked by command safety policy: {}",
+            violation.message
+        );
+    }
+
     let output = Command::new("/bin/sh")
         .arg("-lc")
         .arg(script)
@@ -1795,6 +4599,7 @@ fn run_script_request(
                 kind: ExecutionMountKind::Project,
             }],
             fallback_reason: Some("script".to_string()),
+            external_run_id: None,
         },
     })
 }
@@ -1807,6 +4612,7 @@ fn run_codex_request(
     session_state: &SessionState,
     resolved_backend: &ResolvedWorkerBackend,
     _execution_location: ExecutionLocation,
+    fallback_reason: Option<String>,
 ) -> Result<BackendExecutionResult> {
     if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
         bail!(error);
@@ -1901,6 +4707,9 @@ fn run_codex_request(
     for key in unset_keys {
         command.env_remove(key);
     }
+    for (key, value) in &request.env {
+        command.env(key, value);
+    }
     if let Some(project_environment) = project_environment.as_ref() {
         command.env(
             "NANOCLAW_PROJECT_ENVIRONMENT_ID",
@@ -1979,7 +4788,7 @@ fn run_codex_request(
 
     let usage = parsed.usage.clone().unwrap_or_default();
     let log_body = format!(
-        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=codex\nprovider=openai\nbiller={}\nbilling_type={}\nmodel={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
+        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=codex\nprovider=openai\nbiller={}\nbilling_type={}\nmodel={}\nfallback_reason={:?}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
         request.invocation_id,
         request.session.id,
         workspace_root.display(),
@@ -1990,6 +4799,7 @@ fn run_codex_request(
         resolve_codex_biller(),
         resolve_codex_billing_type(),
         resolved_model.as_deref().unwrap_or("-"),
+        fallback_reason,
         usage.input_tokens,
         usage.cached_input_tokens,
         usage.output_tokens,
@@ -2040,7 +4850,8 @@ fn run_codex_request(
                 .map(|state| state.secret_handles.clone())
                 .unwrap_or_default(),
             mount_summary: build_host_mount_summary(workspace_root, &cwd, &add_dirs, &sandbox),
-            fallback_reason: None,
+            fallback_reason,
+            external_run_id: None,
         },
     })
 }
@@ -2053,6 +4864,37 @@ fn run_claude_request(
     session_state: &SessionState,
     resolved_backend: &ResolvedWorkerBackend,
     _execution_location: ExecutionLocation,
+) -> Result<BackendExecutionResult> {
+    run_claude_request_with_options(
+        request,
+        workspace_root,
+        prior_turns,
+        instruction_hint,
+        session_state,
+        resolved_backend,
+        ClaudeRequestOptions::default(),
+    )
+}
+
+#[derive(Debug, Default)]
+struct ClaudeRequestOptions {
+    backend: Option<WorkerBackend>,
+    provider: Option<String>,
+    biller: Option<String>,
+    billing_type: Option<String>,
+    model: Option<String>,
+    env_overrides: Vec<(String, String)>,
+    fallback_reason: Option<String>,
+}
+
+fn run_claude_request_with_options(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+    options: ClaudeRequestOptions,
 ) -> Result<BackendExecutionResult> {
     if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
         bail!(error);
@@ -2080,7 +4922,11 @@ fn run_claude_request(
         .arg(&prompt)
         .arg("--output-format")
         .arg("text");
-    if let Some(model) = non_empty_env("NANOCLAW_CLAUDE_MODEL") {
+    let selected_model = options
+        .model
+        .clone()
+        .or_else(|| non_empty_env("NANOCLAW_CLAUDE_MODEL"));
+    if let Some(model) = selected_model.as_deref() {
         command.arg("--model").arg(model);
     }
     if let Some(permission_mode) = non_empty_env("NANOCLAW_CLAUDE_PERMISSION_MODE") {
@@ -2101,6 +4947,12 @@ fn run_claude_request(
     for key in &resolved_backend.unset_keys {
         command.env_remove(key);
     }
+    for (key, value) in &request.env {
+        command.env(key, value);
+    }
+    for (key, value) in &options.env_overrides {
+        command.env(key, value);
+    }
     if let Some(project_environment) = project_environment {
         command.env(
             "NANOCLAW_PROJECT_ENVIRONMENT_ID",
@@ -2112,6 +4964,8 @@ fn run_claude_request(
         );
     }
 
+    let metadata_backend = options.backend.clone().unwrap_or(WorkerBackend::Claude);
+    let backend_label = metadata_backend.as_str();
     let output = command
         .output()
         .with_context(|| format!("failed to execute {}", describe_command(&command)))?;
@@ -2120,13 +4974,20 @@ fn run_claude_request(
     let text = stdout.trim().to_string();
 
     if !output.status.success() {
+        let mut details = Vec::new();
+        if !stderr.trim().is_empty() {
+            details.push(format!("stderr: {}", summarize_for_chat(&stderr, 600)));
+        }
+        if !stdout.trim().is_empty() {
+            details.push(format!("stdout: {}", summarize_for_chat(&stdout, 600)));
+        }
         bail!(
             "claude execution failed with status {}{}",
             output.status,
-            if stderr.trim().is_empty() {
+            if details.is_empty() {
                 String::new()
             } else {
-                format!(": {}", summarize_for_chat(&stderr, 600))
+                format!(": {}", details.join("; "))
             }
         );
     }
@@ -2135,8 +4996,14 @@ fn run_claude_request(
         bail!("claude execution produced empty output");
     }
 
+    if is_paperclip_gateway_request(request) {
+        if let Some(blocker) = detect_paperclip_control_plane_blocker(&text) {
+            bail!("{backend_label} execution blocked: {blocker}");
+        }
+    }
+
     let log_body = format!(
-        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=claude\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
+        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend={}\nprovider={}\nbiller={}\nbilling_type={}\nmodel={}\nfallback_reason={:?}\nrequest_plane={}\nproject_environment_id={}\nproject_environment_match={}\napplied_env_keys={}\nblocked_secret_env_keys={}\nsecret_handles={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
         request.invocation_id,
         request.session.id,
         workspace_root.display(),
@@ -2144,6 +5011,12 @@ fn run_claude_request(
         prior_turns + 1,
         instruction_hint,
         prompt.len(),
+        backend_label,
+        options.provider.as_deref().unwrap_or("-"),
+        options.biller.as_deref().unwrap_or("-"),
+        options.billing_type.as_deref().unwrap_or("-"),
+        selected_model.as_deref().unwrap_or("-"),
+        options.fallback_reason,
         request.request_plane.as_str(),
         project_environment
             .map(|resolved| resolved.project.id.as_str())
@@ -2169,11 +5042,11 @@ fn run_claude_request(
         text,
         log_body,
         metadata: BackendExecutionMetadata {
-            backend: WorkerBackend::Claude,
-            provider: None,
-            biller: None,
-            billing_type: None,
-            model: None,
+            backend: metadata_backend,
+            provider: options.provider,
+            biller: options.biller,
+            billing_type: options.billing_type,
+            model: selected_model,
             usage: None,
             cost_usd: None,
             effective_capabilities: capability_manifest,
@@ -2182,11 +5055,358 @@ fn run_claude_request(
                 .map(|state| state.secret_handles.clone())
                 .unwrap_or_default(),
             mount_summary: build_host_mount_summary(workspace_root, &cwd, &[], "workspace-write"),
-            fallback_reason: None,
+            fallback_reason: options.fallback_reason,
+            external_run_id: None,
         },
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubCopilotTaskConfig {
+    gh_bin: String,
+    repo: String,
+    base: Option<String>,
+    custom_agent: Option<String>,
+    follow: bool,
+    cwd: PathBuf,
+}
+
+fn run_github_copilot_request(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    prior_turns: usize,
+    instruction_hint: &str,
+    session_state: &SessionState,
+    resolved_backend: &ResolvedWorkerBackend,
+) -> Result<BackendExecutionResult> {
+    if let Some(error) = get_request_plane_text_error(&request.prompt, &request.request_plane) {
+        bail!(error);
+    }
+
+    let config = resolve_github_copilot_task_config(request, workspace_root)?;
+    let prompt = build_github_copilot_task_prompt(request, workspace_root, session_state)?;
+    let capability_manifest = derive_capability_manifest(
+        &request.request_plane,
+        DeriveCapabilityManifestInput {
+            allow_host_command: true,
+            ..Default::default()
+        },
+    );
+    let mut command = build_github_copilot_command(&config);
+    remove_remote_unneeded_secret_env(&mut command);
+    let output = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", describe_command(&command)))?;
+    let output = write_and_wait_for_output(output, prompt.as_bytes(), &command)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        bail!(
+            "GitHub Copilot task delegation failed with status {}{}{}",
+            output.status,
+            if stderr.is_empty() { "" } else { ": " },
+            if stderr.is_empty() {
+                summarize_for_chat(&stdout, 600)
+            } else {
+                summarize_for_chat(&stderr, 600)
+            }
+        );
+    }
+
+    let external_run_id = extract_first_url(&stdout).or_else(|| extract_first_url(&stderr));
+    let text =
+        render_github_copilot_delegation_result(&config, external_run_id.as_deref(), &stdout);
+    let log_body = format!(
+        "invocation_id={}\nsession_id={}\nworkspace={}\ncwd={}\nsession_turn={}\ninstruction_hint={}\nprompt_bytes={}\nbackend=github-copilot\nprovider=github\nrepo={}\nbase={}\ncustom_agent={}\nfollow={}\nexternal_run_id={}\nstatus={}\nstdout=\n{}\nstderr=\n{}\nresponse=\n{}\n",
+        request.invocation_id,
+        request.session.id,
+        workspace_root.display(),
+        config.cwd.display(),
+        prior_turns + 1,
+        instruction_hint,
+        prompt.len(),
+        config.repo,
+        config.base.as_deref().unwrap_or("-"),
+        config.custom_agent.as_deref().unwrap_or("-"),
+        config.follow,
+        external_run_id.as_deref().unwrap_or("-"),
+        output.status,
+        stdout,
+        stderr,
+        text
+    );
+
+    Ok(BackendExecutionResult {
+        text,
+        log_body,
+        metadata: BackendExecutionMetadata {
+            backend: WorkerBackend::GithubCopilot,
+            provider: Some("github".to_string()),
+            biller: Some("github-copilot".to_string()),
+            billing_type: Some("copilot-cloud-agent".to_string()),
+            model: None,
+            usage: None,
+            cost_usd: None,
+            effective_capabilities: capability_manifest,
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
+            secret_handles: Vec::new(),
+            mount_summary: build_host_mount_summary(
+                workspace_root,
+                &config.cwd,
+                &[],
+                "github-copilot",
+            ),
+            fallback_reason: None,
+            external_run_id,
+        },
+    })
+}
+
+fn resolve_github_copilot_task_config(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+) -> Result<GithubCopilotTaskConfig> {
+    let gh_bin = first_non_empty_request_or_process_env(
+        request,
+        &["NANOCLAW_GITHUB_COPILOT_GH_BIN", "NANOCLAW_GH_BIN"],
+    )
+    .unwrap_or_else(|| "gh".to_string());
+    let repo = resolve_github_copilot_repo(request, workspace_root)?;
+    let base = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_GITHUB_COPILOT_BASE",
+            "GITHUB_COPILOT_BASE",
+            "NANOCLAW_GITHUB_BASE",
+        ],
+    )
+    .and_then(|value| normalize_branch_name(&value));
+    let custom_agent = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_GITHUB_COPILOT_CUSTOM_AGENT",
+            "GITHUB_COPILOT_CUSTOM_AGENT",
+        ],
+    );
+    let follow = first_bool_request_or_process_env(
+        request,
+        &["NANOCLAW_GITHUB_COPILOT_FOLLOW", "GITHUB_COPILOT_FOLLOW"],
+    )
+    .unwrap_or(false);
+    let cwd = first_non_empty_request_or_process_env(
+        request,
+        &["NANOCLAW_GITHUB_COPILOT_CWD", "GITHUB_COPILOT_CWD"],
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| workspace_root.to_path_buf());
+    if !cwd.is_dir() {
+        bail!("GitHub Copilot cwd is not a directory: {}", cwd.display());
+    }
+
+    Ok(GithubCopilotTaskConfig {
+        gh_bin,
+        repo,
+        base,
+        custom_agent,
+        follow,
+        cwd,
+    })
+}
+
+fn build_github_copilot_command(config: &GithubCopilotTaskConfig) -> Command {
+    let mut command = Command::new(&config.gh_bin);
+    command
+        .current_dir(&config.cwd)
+        .arg("agent-task")
+        .arg("create")
+        .arg("-F")
+        .arg("-")
+        .arg("--repo")
+        .arg(&config.repo);
+    if let Some(base) = config.base.as_deref() {
+        command.arg("--base").arg(base);
+    }
+    if let Some(custom_agent) = config.custom_agent.as_deref() {
+        command.arg("--custom-agent").arg(custom_agent);
+    }
+    if config.follow {
+        command.arg("--follow");
+    }
+    command
+}
+
+fn remove_remote_unneeded_secret_env(command: &mut Command) {
+    for key in [
+        "PAPERCLIP_API_KEY",
+        "PAPERCLIP_API_URL",
+        "ZAI_ANTHROPIC_AUTH_TOKEN",
+        "NANOCLAW_ZAI_ANTHROPIC_AUTH_TOKEN",
+        "ZAI_API_KEY",
+        "NANOCLAW_ZAI_API_KEY",
+        "ZAI_ANTHROPIC_BASE_URL",
+        "NANOCLAW_ZAI_ANTHROPIC_BASE_URL",
+        "ZAI_ANTHROPIC_MODEL",
+        "NANOCLAW_ZAI_MODEL",
+        "AZURE_OPENAI_API_KEY",
+        "NANOCLAW_AZURE_OPENAI_API_KEY",
+        "AZURE_AI_API_KEY",
+        "NANOCLAW_AZURE_AI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_BASE_URL",
+        "NANOCLAW_AZURE_OPENAI_BASE_URL",
+        "AZURE_OPENAI_DEPLOYMENT",
+        "NANOCLAW_AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_OPENAI_MODEL",
+        "NANOCLAW_AZURE_OPENAI_MODEL",
+        "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
+        "AZURE_OPENAI_API_VERSION",
+        "NANOCLAW_AZURE_OPENAI_API_VERSION",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+fn build_github_copilot_task_prompt(
+    request: &WorkerRequest,
+    workspace_root: &Path,
+    session_state: &SessionState,
+) -> Result<String> {
+    let worker_prompt = build_worker_prompt(request, workspace_root, session_state)?;
+    Ok(format!(
+        "Paperclip delegated repo task for GitHub Copilot cloud agent.\n\n\
+         Work only in the target GitHub repository. Open one pull request for the requested change. \
+         Keep the PR focused, include verification evidence, and do not claim local Paperclip completion. \
+         Paperclip/NEX remains the control plane and will track your PR externally.\n\n{}",
+        worker_prompt
+    ))
+}
+
+fn resolve_github_copilot_repo(request: &WorkerRequest, workspace_root: &Path) -> Result<String> {
+    if let Some(repo) = first_non_empty_request_or_process_env(
+        request,
+        &[
+            "NANOCLAW_GITHUB_COPILOT_REPO",
+            "GITHUB_COPILOT_REPO",
+            "GITHUB_REPOSITORY",
+        ],
+    )
+    .and_then(|value| normalize_github_repo_ref(&value))
+    {
+        return Ok(repo);
+    }
+
+    if let Some(repo) =
+        git_origin_repo(workspace_root).and_then(|value| normalize_github_repo_ref(&value))
+    {
+        return Ok(repo);
+    }
+
+    bail!(
+        "GitHub Copilot backend requires a GitHub repository; set NANOCLAW_GITHUB_COPILOT_REPO or run from a checkout with a GitHub origin"
+    )
+}
+
+fn git_origin_repo(workspace_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn normalize_github_repo_ref(raw: &str) -> Option<String> {
+    let mut value = raw
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix("git@github.com:") {
+        value = rest.to_string();
+    } else if let Some(index) = value.find("github.com/") {
+        value = value[index + "github.com/".len()..].to_string();
+    }
+    let parts = value
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(format!("{}/{}", parts[0], parts[1]))
+}
+
+fn normalize_branch_name(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() || value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(value.trim_start_matches("refs/heads/").trim().to_string())
+}
+
+fn first_bool_request_or_process_env(request: &WorkerRequest, keys: &[&str]) -> Option<bool> {
+    first_non_empty_request_or_process_env(request, keys).map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn extract_first_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|part| part.starts_with("https://") || part.starts_with("http://"))
+        .map(|part| {
+            part.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | ']' | ',' | '.' | ';'))
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn render_github_copilot_delegation_result(
+    config: &GithubCopilotTaskConfig,
+    external_run_id: Option<&str>,
+    stdout: &str,
+) -> String {
+    let mut lines = vec![format!(
+        "Delegated to GitHub Copilot cloud agent for `{}`.",
+        config.repo
+    )];
+    if let Some(base) = config.base.as_deref() {
+        lines.push(format!("Base branch: `{base}`."));
+    }
+    if let Some(custom_agent) = config.custom_agent.as_deref() {
+        lines.push(format!("Custom agent: `{custom_agent}`."));
+    }
+    if let Some(url) = external_run_id {
+        lines.push(format!("GitHub session/PR: {url}"));
+    }
+    if !stdout.trim().is_empty() {
+        lines.push(format!(
+            "\nGitHub CLI output:\n{}",
+            summarize_for_chat(stdout, 1200)
+        ));
+    }
+    lines.join("\n")
+}
 
 fn run_workers_ai_request(
     request: &WorkerRequest,
@@ -2203,8 +5423,11 @@ fn run_workers_ai_request(
     }
 
     let proxy_url = std::env::var("PAPERCLIP_WORKERS_AI_PROXY_URL")
-        .unwrap_or_else(|_| "http://paperclip.ai/tasks".to_string());
-    let proxy_token = std::env::var("PAPERCLIP_AI_PROXY_TOKEN").ok();
+        .unwrap_or_else(|_| DEFAULT_WORKERS_AI_PROXY_URL.to_string());
+    let proxy_url = normalize_workers_ai_proxy_url(&proxy_url)?;
+    let proxy_token = std::env::var("PAPERCLIP_AI_PROXY_TOKEN")
+        .or_else(|_| std::env::var("PAPERCLIP_WORKERS_AI_PROXY_TOKEN"))
+        .ok();
     let model = std::env::var("NANOCLAW_WORKERS_AI_MODEL")
         .unwrap_or_else(|_| "@cf/meta/llama-3-8b-instruct".to_string());
 
@@ -2214,31 +5437,47 @@ fn run_workers_ai_request(
         .timeout(Duration::from_secs(60))
         .build()
         .context("failed to build reqwest client")?;
-    
-    let mut rb = client.post(&proxy_url)
-        .json(&serde_json::json!({
-            "taskType": "lightweight_planning",
-            "input": prompt,
-            "model": model,
-            "correlationId": request.invocation_id
-        }));
-    
+
+    let mut rb = client.post(&proxy_url).json(&serde_json::json!({
+        "taskType": "lightweight_planning",
+        "input": prompt,
+        "model": model,
+        "correlationId": request.invocation_id
+    }));
+
     if let Some(token) = proxy_token {
         rb = rb.header("x-paperclip-ai-proxy-token", token);
     }
 
-    let response = rb.send().context("failed to send request to Workers AI proxy")?;
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_body = response.text().unwrap_or_default();
-        bail!("Workers AI execution failed with status {}: {}", status, error_body);
+    let response = rb
+        .send()
+        .context("failed to send request to Workers AI proxy")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read Workers AI response body")?;
+
+    if !status.is_success() {
+        bail!(
+            "Workers AI execution failed with status {} for proxy URL {}: {}",
+            status,
+            proxy_url,
+            summarize_workers_ai_body(&body)
+        );
     }
 
-    let result: serde_json::Value = response.json().context("failed to parse Workers AI response")?;
+    let result: serde_json::Value = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "failed to parse Workers AI response: {}",
+            summarize_workers_ai_body(&body)
+        )
+    })?;
     if !result["ok"].as_bool().unwrap_or(false) {
         let error_msg = result["error"].as_str().unwrap_or("unknown error");
-        bail!("Workers AI proxy returned unsuccessful result: {}", error_msg);
+        bail!(
+            "Workers AI proxy returned unsuccessful result: {}",
+            error_msg
+        );
     }
 
     let text = result["text"].as_str().unwrap_or_default().to_string();
@@ -2273,10 +5512,14 @@ fn run_workers_ai_request(
             usage: None,
             cost_usd: None,
             effective_capabilities: capability_manifest,
-            project_environment_id: resolved_backend.project_environment.as_ref().map(|resolved| resolved.project.id.clone()),
+            project_environment_id: resolved_backend
+                .project_environment
+                .as_ref()
+                .map(|resolved| resolved.project.id.clone()),
             secret_handles: Vec::new(),
             mount_summary: Vec::new(),
             fallback_reason,
+            external_run_id: None,
         },
     })
 }
@@ -2286,6 +5529,22 @@ fn non_empty_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn non_empty_request_env(request: &WorkerRequest, key: &str) -> Option<String> {
+    request
+        .env
+        .get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn first_non_empty_request_or_process_env(
+    request: &WorkerRequest,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| non_empty_request_env(request, key).or_else(|| non_empty_env(key)))
 }
 
 fn resolve_openai_compatible_biller() -> String {
@@ -2365,6 +5624,10 @@ fn run_kind_for_backend(backend: &WorkerBackend, is_script: bool) -> ExecutionRu
         WorkerBackend::Summary => ExecutionRunKind::Summary,
         WorkerBackend::Codex => ExecutionRunKind::Codex,
         WorkerBackend::Claude => ExecutionRunKind::Claude,
+        WorkerBackend::Zai => ExecutionRunKind::Custom("zai".to_string()),
+        WorkerBackend::AzureOpenAI => ExecutionRunKind::Custom("azure-openai".to_string()),
+        WorkerBackend::FoundryMaaS => ExecutionRunKind::Custom("foundry-maas".to_string()),
+        WorkerBackend::GithubCopilot => ExecutionRunKind::Custom("github-copilot".to_string()),
         WorkerBackend::WorkersAI => ExecutionRunKind::WorkersAI,
         WorkerBackend::Custom(value) => ExecutionRunKind::Custom(value.clone()),
     }
@@ -2726,39 +5989,802 @@ fn derive_request_session_turn(
 }
 
 fn compact_session_state(state: &SessionState, max_turns: usize) -> SessionState {
-    let mut compact = state.clone();
-    if compact.turns.len() > max_turns {
-        compact.turns = compact.turns[compact.turns.len() - max_turns..].to_vec();
-    }
-    compact
+    state.compact_with_summary(max_turns, 600)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::net::Shutdown;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::thread;
     use std::time::Duration;
 
     use tempfile::tempdir;
 
     use crate::foundation::CapabilityManifest;
-    use crate::foundation::{ExecutionLane, MessageRecord, RemoteWorkerMode, RequestPlane};
+    use crate::foundation::{
+        ExecutionBoundary, ExecutionBoundaryKind, ExecutionLane, ExecutionLocation,
+        ExecutionStatus, Group, MessageRecord, RemoteWorkerMode, RequestPlane,
+    };
     use crate::nanoclaw::config::NanoclawConfig;
     use crate::nanoclaw::model_router::WorkerBackend;
 
     use super::{
-        build_execution_metadata, build_execution_session, connect_to_worker_socket,
-        default_codex_sandbox_for_request, parse_codex_jsonl, read_json,
+        build_azure_openai_chat_target, build_execution_evidence, build_execution_metadata,
+        build_execution_session, build_foundry_maas_chat_target, build_github_copilot_command,
+        build_worker_process_failure_response, build_worker_transport_failure_response,
+        collect_git_evidence, connect_to_worker_socket, decode_worker_outcome_with_context,
+        default_codex_sandbox_for_request, detect_paperclip_control_plane_blocker,
+        estimate_azure_openai_cost_usd_with_config, estimate_azure_openai_cost_usd_with_overrides,
+        execute_worker_request, extract_azure_openai_text, is_codex_usage_limit_error,
+        normalize_azure_openai_fallback_backend, normalize_azure_openai_rate_model_name,
+        normalize_branch_name, normalize_github_repo_ref, parse_azure_openai_cost_rate_card,
+        parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
+        parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
         run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
-        should_use_remote_lane, wait_for_worker_socket, write_json, BackendExecutionMetadata,
-        BackendExecutionResult, ContainerExecutor, DigitalOceanDevEnvironment, ExecutionLaneRouter,
-        ExecutionRequest, ExecutionSession, ExecutionUsageSummary, ExecutorBoundary,
-        InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor, RustSubprocessExecutor,
-        WorkerOutcome, WorkerRequest, WorkerResponse,
+        should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
+        write_json, AzureOpenAICostConfig, AzureOpenAICostRateOverrides, BackendExecutionMetadata,
+        BackendExecutionResult, BuildExecutionEvidenceInput, ContainerExecutor,
+        DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
+        ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
+        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutionVerificationRef,
+        ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor,
+        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
+        EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
+
+    #[test]
+    fn normalizes_workers_ai_proxy_url_to_tasks_suffix() {
+        let cases = [
+            (
+                "https://lab.bybuddha.dev/paperclip.ai",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks/",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks/tasks",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            (
+                "https://lab.bybuddha.dev/paperclip.ai/tasks/tasks/tasks",
+                "https://lab.bybuddha.dev/paperclip.ai/tasks",
+            ),
+            ("http://paperclip.ai", "http://paperclip.ai/tasks"),
+            ("https://lab.bybuddha.dev", "https://lab.bybuddha.dev/tasks"),
+            (
+                "https://lab.bybuddha.dev/",
+                "https://lab.bybuddha.dev/tasks",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let output = super::normalize_workers_ai_proxy_url(input).expect("should normalize");
+            assert_eq!(
+                output, expected,
+                "input {input} should normalize to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_git_evidence_helpers() {
+        let changes =
+            parse_git_status_porcelain(" M src/main.rs\nR  old.rs -> new.rs\n?? note.md\n");
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].status, "M");
+        assert_eq!(changes[0].path, "src/main.rs");
+        assert_eq!(changes[1].status, "R");
+        assert_eq!(changes[1].path, "new.rs");
+        assert_eq!(changes[2].status, "??");
+        assert_eq!(changes[2].path, "note.md");
+
+        let commits = parse_git_log_refs("abc123\u{1f}first commit\ndef456\u{1f}second commit\n");
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "abc123");
+        assert_eq!(commits[0].subject.as_deref(), Some("first commit"));
+    }
+
+    #[test]
+    fn collect_git_evidence_preserves_leading_porcelain_status_space() {
+        let temp = tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        fs::write(temp.path().join("README.md"), "initial").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=NanoClaw Test",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        fs::write(temp.path().join("README.md"), "changed").unwrap();
+
+        let evidence = collect_git_evidence(temp.path().to_str());
+        assert!(evidence.is_repo);
+        assert_eq!(evidence.changed_files[0].status, "M");
+        assert_eq!(evidence.changed_files[0].path, "README.md");
+    }
+
+    #[test]
+    fn builds_structured_execution_evidence() {
+        let temp = tempdir().unwrap();
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some(temp.path().display().to_string()),
+            isolated: true,
+        };
+        let metadata = ExecutionMetadata {
+            backend: Some("codex".to_string()),
+            provider: Some("openai".to_string()),
+            summary: Some("completed".to_string()),
+            ..Default::default()
+        };
+
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-1",
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: "session-1",
+            group_folder: Some("main"),
+            workspace_root: temp.path().to_str(),
+            boundary: &boundary,
+            log_path: Some("/tmp/exec.log"),
+            log_body: Some("status=ok"),
+            metadata: Some(&metadata),
+            provenance_id: Some("exec-1"),
+            verification: vec![ExecutionVerificationRef {
+                kind: "test_verification".to_string(),
+                command: None,
+                status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+                summary: Some("test verification supplied".to_string()),
+            }],
+            blockers: Vec::new(),
+        });
+
+        assert_eq!(evidence.schema_version, EXECUTION_EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(evidence.adapter_type, "codex");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Code);
+        assert_eq!(evidence.workspace.group_folder.as_deref(), Some("main"));
+        assert!(evidence.workspace.exists);
+        assert_eq!(evidence.verification[0].kind, "test_verification");
+        assert_eq!(evidence.verification[0].status, "succeeded");
+        assert_eq!(
+            evidence.artifacts[0].location.as_deref(),
+            Some("/tmp/exec.log")
+        );
+    }
+
+    #[test]
+    fn execution_evidence_redacts_sensitive_log_bodies() {
+        let temp = tempdir().unwrap();
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some(temp.path().display().to_string()),
+            isolated: true,
+        };
+
+        let evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-redaction",
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: "session-redaction",
+            group_folder: Some("main"),
+            workspace_root: temp.path().to_str(),
+            boundary: &boundary,
+            log_path: Some("/tmp/redaction.log"),
+            log_body: Some(
+                "stdout=ok\nsecret=abcdefghijkl\nAuthorization: Bearer zyxwvutsrqponmlk\n",
+            ),
+            metadata: None,
+            provenance_id: None,
+            verification: vec![ExecutionVerificationRef {
+                kind: "test_verification".to_string(),
+                command: None,
+                status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+                summary: Some("test verification supplied".to_string()),
+            }],
+            blockers: Vec::new(),
+        });
+
+        let combined_body = evidence
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.body.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!combined_body.contains("abcdefghijkl"));
+        assert!(!combined_body.contains("zyxwvutsrqponmlk"));
+        assert!(combined_body.contains("[redacted:secret_assignment]"));
+        assert!(combined_body.contains("[redacted:authorization_bearer]"));
+        assert!(evidence
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "output_safety_report"));
+    }
+
+    #[test]
+    fn validates_required_execution_evidence_contract() {
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some("/tmp/workspace".to_string()),
+            isolated: true,
+        };
+        let mut response = ExecutionResponse {
+            text: "ok".to_string(),
+            boundary: boundary.clone(),
+            session_id: "session-1".to_string(),
+            log_path: None,
+            log_body: None,
+            provenance: None,
+            metadata: None,
+            evidence: None,
+        };
+        assert!(validate_execution_response_evidence(&response).is_err());
+
+        let mut evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-1",
+            status: ExecutionEvidenceStatus::Succeeded,
+            session_id: "session-1",
+            group_folder: Some("main"),
+            workspace_root: Some("/tmp/workspace"),
+            boundary: &boundary,
+            log_path: None,
+            log_body: None,
+            metadata: None,
+            provenance_id: None,
+            verification: Vec::new(),
+            blockers: Vec::new(),
+        });
+        response.evidence = Some(evidence.clone());
+        assert!(validate_execution_response_evidence(&response).is_err());
+
+        evidence.artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: "log".to_string(),
+            location: Some("/tmp/exec.log".to_string()),
+            body: None,
+        });
+        evidence.verification.push(ExecutionVerificationRef {
+            kind: "test_verification".to_string(),
+            command: None,
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("test verification supplied".to_string()),
+        });
+        response.evidence = Some(evidence);
+        validate_execution_response_evidence(&response).unwrap();
+    }
+
+    #[test]
+    fn container_image_honors_group_runtime_override() {
+        let mut env = BTreeMap::new();
+        assert_eq!(
+            resolve_container_image("rust:1.75-slim", &env),
+            "rust:1.75-slim"
+        );
+        env.insert(
+            "NANOCLAW_CONTAINER_IMAGE_TAG".to_string(),
+            "ghcr.io/nexus/nanoclaw:runtime".to_string(),
+        );
+        assert_eq!(
+            resolve_container_image("rust:1.75-slim", &env),
+            "ghcr.io/nexus/nanoclaw:runtime"
+        );
+        env.insert(
+            "NANOCLAW_CONTAINER_IMAGE".to_string(),
+            "ghcr.io/nexus/nanoclaw:operator".to_string(),
+        );
+        assert_eq!(
+            resolve_container_image("rust:1.75-slim", &env),
+            "ghcr.io/nexus/nanoclaw:operator"
+        );
+    }
+
+    #[test]
+    fn builds_azure_openai_v1_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.openai.azure.com/openai/v1/",
+            "gpt-4.1",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.openai.azure.com/openai/v1/chat/completions"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_azure_openai_deployment_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.openai.azure.com",
+            "cto-deployment",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.openai.azure.com/openai/deployments/cto-deployment/chat/completions?api-version=2024-10-21"
+        );
+        assert!(!target.include_model);
+    }
+
+    #[test]
+    fn builds_azure_foundry_models_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.services.ai.azure.com/models",
+            "DeepSeek-V3.1",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_foundry_maas_models_chat_target() {
+        let target = build_foundry_maas_chat_target(
+            "https://example.services.ai.azure.com/models",
+            "DeepSeek-V3.2",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_foundry_maas_openai_v1_chat_target() {
+        let target = build_foundry_maas_chat_target(
+            "https://example.services.ai.azure.com/openai/v1/",
+            "Kimi-K2-Thinking",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/openai/v1/chat/completions"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_foundry_maas_base_services_chat_target() {
+        let target = build_foundry_maas_chat_target(
+            "https://example.services.ai.azure.com",
+            "Mistral-Large-3",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn preserves_existing_azure_foundry_models_api_version() {
+        let target = build_azure_openai_chat_target(
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview",
+            "DeepSeek-V3.1",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn builds_azure_foundry_project_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.services.ai.azure.com/api/projects/proj-default",
+            "DeepSeek-V3.1",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/api/projects/proj-default/openai/v1/chat/completions"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn parses_azure_openai_text_and_usage() {
+        let payload = serde_json::json!({
+            "choices": [
+                { "message": { "content": "Azure response" } }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "prompt_tokens_details": { "cached_tokens": 25 },
+                "completion_tokens": 50
+            }
+        });
+
+        assert_eq!(
+            extract_azure_openai_text(&payload).as_deref(),
+            Some("Azure response")
+        );
+        assert_eq!(
+            parse_azure_openai_usage(&payload),
+            Some(ExecutionUsageSummary {
+                input_tokens: 100,
+                cached_input_tokens: 25,
+                output_tokens: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn estimates_azure_openai_cost_for_gpt_4_1_mini_usage() {
+        let usage = ExecutionUsageSummary {
+            input_tokens: 1_000,
+            cached_input_tokens: 100,
+            output_tokens: 500,
+        };
+
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_overrides(
+                "nanoclaw-gpt-4-1-mini",
+                &usage,
+                AzureOpenAICostRateOverrides::default()
+            ),
+            Some(0.001287)
+        );
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_overrides(
+                "gpt-4.1-mini-2025-04-14",
+                &usage,
+                AzureOpenAICostRateOverrides::default()
+            ),
+            Some(0.001287)
+        );
+    }
+
+    #[test]
+    fn estimates_azure_cost_from_foundry_rate_card() {
+        let usage = ExecutionUsageSummary {
+            input_tokens: 1_000,
+            cached_input_tokens: 100,
+            output_tokens: 500,
+        };
+        let rate_card = parse_azure_openai_cost_rate_card(
+            r#"{
+                "DeepSeek-V3.1": {
+                    "input_usd_per_1m": 0.27,
+                    "cached_input_usd_per_1m": 0.07,
+                    "output_usd_per_1m": 1.10
+                }
+            }"#,
+        );
+
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_config(
+                "deepseek-v3-1",
+                &usage,
+                AzureOpenAICostConfig {
+                    overrides: AzureOpenAICostRateOverrides::default(),
+                    rate_card,
+                }
+            ),
+            Some(0.0008)
+        );
+    }
+
+    #[test]
+    fn skips_azure_openai_cost_estimate_for_unknown_model_without_overrides() {
+        let usage = ExecutionUsageSummary {
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 500,
+        };
+
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_overrides(
+                "custom-enterprise-deployment",
+                &usage,
+                AzureOpenAICostRateOverrides::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn normalizes_azure_openai_rate_model_names() {
+        assert_eq!(
+            normalize_azure_openai_rate_model_name(" NanoClaw GPT-4.1 Mini "),
+            "nanoclawgpt4.1mini"
+        );
+        assert_eq!(
+            normalize_azure_openai_rate_model_name("gpt-4-1-mini-2025-04-14"),
+            "gpt41mini20250414"
+        );
+    }
+
+    #[test]
+    fn azure_openai_fallback_defaults_to_codex() {
+        assert_eq!(normalize_azure_openai_fallback_backend(None), "codex");
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some(" CODEX ".to_string())),
+            "codex"
+        );
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some(" ZAI ".to_string())),
+            "zai"
+        );
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some(" workers-ai ".to_string())),
+            "workers-ai"
+        );
+        assert_eq!(
+            normalize_azure_openai_fallback_backend(Some("disabled".to_string())),
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn foundry_maas_backend_aliases_parse() {
+        assert_eq!(
+            WorkerBackend::parse("foundry-maas"),
+            WorkerBackend::FoundryMaaS
+        );
+        assert_eq!(
+            WorkerBackend::parse("azure-model-inference"),
+            WorkerBackend::FoundryMaaS
+        );
+        assert_eq!(WorkerBackend::FoundryMaaS.as_str(), "foundry-maas");
+    }
+
+    #[test]
+    fn github_copilot_backend_aliases_parse() {
+        assert_eq!(
+            WorkerBackend::parse("github-copilot"),
+            WorkerBackend::GithubCopilot
+        );
+        assert_eq!(
+            WorkerBackend::parse("github_copilot"),
+            WorkerBackend::GithubCopilot
+        );
+        assert_eq!(
+            WorkerBackend::parse("copilot"),
+            WorkerBackend::GithubCopilot
+        );
+        assert_eq!(WorkerBackend::GithubCopilot.as_str(), "github-copilot");
+    }
+
+    #[test]
+    fn normalizes_github_copilot_repo_refs() {
+        assert_eq!(
+            normalize_github_repo_ref(
+                "https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare.git"
+            )
+            .as_deref(),
+            Some("Nexus-Integrated-Technologies/paperclip-cloudflare")
+        );
+        assert_eq!(
+            normalize_github_repo_ref(
+                "git@github.com:Nexus-Integrated-Technologies/paperclip-cloudflare.git"
+            )
+            .as_deref(),
+            Some("Nexus-Integrated-Technologies/paperclip-cloudflare")
+        );
+        assert_eq!(
+            normalize_github_repo_ref("Nexus-Integrated-Technologies/paperclip-cloudflare")
+                .as_deref(),
+            Some("Nexus-Integrated-Technologies/paperclip-cloudflare")
+        );
+        assert_eq!(normalize_github_repo_ref("not-enough"), None);
+    }
+
+    #[test]
+    fn github_copilot_command_uses_stdin_and_repo_flags() {
+        let cwd = tempdir().unwrap();
+        let config = GithubCopilotTaskConfig {
+            gh_bin: "gh".to_string(),
+            repo: "Nexus-Integrated-Technologies/paperclip-cloudflare".to_string(),
+            base: Some("main".to_string()),
+            custom_agent: Some("cto".to_string()),
+            follow: true,
+            cwd: cwd.path().to_path_buf(),
+        };
+        let command = build_github_copilot_command(&config);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "agent-task",
+                "create",
+                "-F",
+                "-",
+                "--repo",
+                "Nexus-Integrated-Technologies/paperclip-cloudflare",
+                "--base",
+                "main",
+                "--custom-agent",
+                "cto",
+                "--follow",
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(cwd.path()));
+    }
+
+    #[test]
+    fn github_copilot_ignores_sha_like_base_refs() {
+        assert_eq!(
+            normalize_branch_name("refs/heads/main").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            normalize_branch_name("0123456789abcdef0123456789abcdef01234567"),
+            None
+        );
+    }
+
+    #[test]
+    fn github_copilot_backend_delegates_with_fake_gh() {
+        let root = tempdir().unwrap();
+        let fake_gh = root.path().join("fake-gh");
+        let stdin_path = root.path().join("fake-gh-stdin.txt");
+        let stdin_path_quoted = stdin_path.display().to_string().replace('\'', "'\\''");
+        fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' 'Created task https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare/pull/123'\n",
+                stdin_path_quoted
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_gh, perms).unwrap();
+
+        let session = build_execution_session(root.path(), "copilot", "session-1", root.path());
+        let request = WorkerRequest {
+            invocation_id: "invoke-1".to_string(),
+            requested_at: "2026-05-07T00:00:00Z".to_string(),
+            group: Group {
+                jid: "copilot".to_string(),
+                name: "Copilot".to_string(),
+                folder: "copilot".to_string(),
+                trigger: "@copilot".to_string(),
+                added_at: "2026-05-07T00:00:00Z".to_string(),
+                requires_trigger: false,
+                is_main: false,
+            },
+            prompt: "Add one focused test for the gateway adapter.".to_string(),
+            paperclip_overlay_context: Some(
+                "Paperclip issue packet:\n- issue: NEX-1 Test".to_string(),
+            ),
+            messages: vec![MessageRecord {
+                id: "m1".to_string(),
+                chat_jid: "copilot".to_string(),
+                sender: "paperclip".to_string(),
+                sender_name: Some("Paperclip".to_string()),
+                content: "Add one focused test for the gateway adapter.".to_string(),
+                timestamp: "2026-05-07T00:00:00Z".to_string(),
+                is_from_me: false,
+                is_bot_message: true,
+            }],
+            task_id: None,
+            script: None,
+            omx: None,
+            assistant_name: "NanoClaw".to_string(),
+            request_plane: RequestPlane::Web,
+            env: BTreeMap::from([
+                (
+                    "NANOCLAW_GITHUB_COPILOT_GH_BIN".to_string(),
+                    fake_gh.display().to_string(),
+                ),
+                (
+                    "NANOCLAW_GITHUB_COPILOT_REPO".to_string(),
+                    "Nexus-Integrated-Technologies/paperclip-cloudflare".to_string(),
+                ),
+            ]),
+            session,
+            backend_override: Some(WorkerBackend::GithubCopilot),
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = execute_worker_request(request).unwrap();
+        let metadata = response.metadata.unwrap();
+
+        assert!(response
+            .text
+            .contains("Delegated to GitHub Copilot cloud agent"));
+        assert_eq!(
+            metadata.external_run_id.as_deref(),
+            Some("https://github.com/Nexus-Integrated-Technologies/paperclip-cloudflare/pull/123")
+        );
+        let delegated_prompt = fs::read_to_string(stdin_path).unwrap();
+        assert!(delegated_prompt.contains("Open one pull request"));
+        assert!(delegated_prompt.contains("Paperclip issue packet"));
+    }
+
+    #[test]
+    fn codex_fallback_only_accepts_usage_limit_errors() {
+        assert!(is_codex_usage_limit_error("Codex usage limit reached"));
+        assert!(is_codex_usage_limit_error("usage_limit exceeded"));
+        assert!(is_codex_usage_limit_error("status 429 rate limit"));
+        assert!(is_codex_usage_limit_error("insufficient_quota"));
+        assert!(!is_codex_usage_limit_error(
+            "codex execution failed with exit status: 1"
+        ));
+    }
+
+    #[test]
+    fn paperclip_control_plane_blockers_are_detected_without_flagging_issue_blockers() {
+        assert!(detect_paperclip_control_plane_blocker(
+            "I'm encountering an approval restriction for network calls. The sandbox requires approval for HTTP requests to http://paperclip.api, which prevents verifying identity and checking out issue work.",
+        )
+        .is_some());
+
+        assert!(detect_paperclip_control_plane_blocker(
+            "Work is blocked because the issue mentions multiple projects. I left a comment with the required split.",
+        )
+        .is_none());
+    }
 
     #[test]
     fn echo_executor_returns_summary() {
@@ -2786,6 +6812,7 @@ mod tests {
                 omx: None,
                 assistant_name: "Andy".to_string(),
                 request_plane: RequestPlane::Web,
+                env: Default::default(),
                 session,
                 backend_override: None,
                 task_signature: None,
@@ -2823,6 +6850,7 @@ mod tests {
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session: session.clone(),
             backend_override: None,
             task_signature: None,
@@ -2841,6 +6869,328 @@ mod tests {
         assert_eq!(response.session_id, "session-1");
         assert!(response.text.contains("hello from script"));
         assert!(Path::new(response.log_path.as_deref().unwrap()).exists());
+        let evidence = response.evidence.as_ref().expect("worker emits evidence");
+        assert_eq!(evidence.adapter_type, "summary");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Succeeded);
+        assert_eq!(evidence.provenance_id.as_deref(), Some("exec-1"));
+    }
+
+    #[test]
+    fn worker_blocks_destructive_script_before_shell_execution() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("CLAUDE.md"), "# Andy\n").unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+
+        let marker_path = workspace_root.join("SHOULD_NOT_EXIST");
+        let request = WorkerRequest {
+            invocation_id: "exec-safety-blocked".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: Some("rm -rf ./*; printf should-not-run > SHOULD_NOT_EXIST".to_string()),
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = execute_worker_request(request).unwrap();
+        assert!(
+            !marker_path.exists(),
+            "blocked script must not run after the safety violation"
+        );
+        assert!(response
+            .text
+            .contains("script command blocked by command safety policy"));
+        let evidence = response.evidence.as_ref().expect("worker emits evidence");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "command_safety_policy");
+        assert!(evidence.blockers[0]
+            .message
+            .contains("recursive forced removal"));
+    }
+
+    #[test]
+    fn worker_backend_errors_return_structured_failed_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("CLAUDE.md"), "# Andy\n").unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+
+        let request = WorkerRequest {
+            invocation_id: "exec-blocked".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: Some(WorkerBackend::Custom("missing-adapter".to_string())),
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = execute_worker_request(request).unwrap();
+        assert!(response
+            .text
+            .contains("unsupported worker backend 'missing-adapter'"));
+        let evidence = response.evidence.as_ref().expect("worker emits evidence");
+        assert_eq!(evidence.adapter_type, "missing-adapter");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Code);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.run_id, "exec-blocked");
+        assert_eq!(evidence.blockers[0].kind, "adapter_error");
+        assert!(Path::new(response.log_path.as_deref().unwrap()).exists());
+        assert!(response
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| matches!(provenance.status, ExecutionStatus::Error)));
+    }
+
+    #[test]
+    fn worker_process_failures_return_structured_failed_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-process-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null; printf stdout; printf stderr >&2; exit 42");
+
+        let response = run_worker_command(&mut command, &payload).unwrap();
+        let evidence = response.evidence.as_ref().expect("process emits evidence");
+        assert_eq!(response.boundary.kind, ExecutionBoundaryKind::Container);
+        assert_eq!(evidence.boundary.kind, ExecutionBoundaryKind::Container);
+        assert_eq!(evidence.adapter_type, "worker_process");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "worker_process_error");
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stdout=stdout"));
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stderr=stderr"));
+    }
+
+    #[test]
+    fn remote_worker_process_failures_return_remote_structured_evidence() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-remote-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session,
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let response = build_worker_process_failure_response(
+            &payload,
+            "remote_worker_process",
+            "remote command",
+            "failed to parse remote worker response",
+            "not json",
+            "",
+            ExecutionLocation::RemoteWorker,
+            ExecutionBoundaryKind::RemoteWorker,
+        );
+        let evidence = response.evidence.as_ref().expect("remote process evidence");
+        assert_eq!(response.boundary.kind, ExecutionBoundaryKind::RemoteWorker);
+        assert_eq!(evidence.boundary.kind, ExecutionBoundaryKind::RemoteWorker);
+        assert_eq!(evidence.adapter_type, "remote_worker_process");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(
+            evidence.blockers[0].source.as_deref(),
+            Some("remote_worker_process")
+        );
+        assert!(response
+            .log_body
+            .as_deref()
+            .unwrap()
+            .contains("stdout=not json"));
+    }
+
+    #[test]
+    fn worker_transport_failures_return_structured_evidence_before_worker_outcome() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let executor =
+            RustSubprocessExecutor::with_worker_binary(temp.path().join("missing-nanoclaw-worker"));
+
+        let response = executor
+            .execute(ExecutionRequest {
+                group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+                prompt: "<task />".to_string(),
+                paperclip_overlay_context: None,
+                messages: Vec::new(),
+                task_id: Some("task-1".to_string()),
+                script: None,
+                omx: None,
+                assistant_name: "Andy".to_string(),
+                request_plane: RequestPlane::Web,
+                env: Default::default(),
+                session,
+                backend_override: None,
+                task_signature: None,
+                routing_decision: None,
+                objective: None,
+                plan: None,
+                boundary_claims: Vec::new(),
+                gate_evaluation: None,
+            })
+            .unwrap();
+
+        let evidence = response.evidence.as_ref().expect("transport evidence");
+        assert_eq!(evidence.adapter_type, "worker_transport");
+        assert_eq!(evidence.mode, ExecutionEvidenceMode::Shell);
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "worker_daemon_start_error");
+        assert!(Path::new(response.log_path.as_deref().unwrap()).exists());
+    }
+
+    #[test]
+    fn worker_outcome_errors_preserve_timeout_and_cancellation_status() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+        let payload = WorkerRequest {
+            invocation_id: "exec-transport-failed".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<task />".to_string(),
+            paperclip_overlay_context: None,
+            messages: Vec::new(),
+            task_id: Some("task-1".to_string()),
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session,
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        let timed_out = build_worker_transport_failure_response(
+            &payload,
+            "worker_transport",
+            "worker_request_timeout",
+            "worker did not return a payload before timeout",
+            ExecutionEvidenceStatus::TimedOut,
+            "",
+            "",
+            ExecutionLocation::Host,
+            ExecutionBoundaryKind::Host,
+        );
+        let timeout_evidence = timed_out.evidence.as_ref().expect("timeout evidence");
+        assert_eq!(timeout_evidence.status, ExecutionEvidenceStatus::TimedOut);
+        assert_eq!(timeout_evidence.blockers[0].kind, "worker_request_timeout");
+
+        let cancelled = decode_worker_outcome_with_context(
+            WorkerOutcome {
+                response: None,
+                error: Some("operation canceled by operator".to_string()),
+            },
+            &payload,
+            "worker_transport",
+            ExecutionLocation::Host,
+            ExecutionBoundaryKind::Host,
+        );
+        let cancelled_evidence = cancelled.evidence.as_ref().expect("cancel evidence");
+        assert_eq!(
+            cancelled_evidence.status,
+            ExecutionEvidenceStatus::Cancelled
+        );
+        assert_eq!(
+            cancelled_evidence.blockers[0].kind,
+            "worker_outcome_cancelled"
+        );
     }
 
     #[test]
@@ -2854,7 +7204,8 @@ mod tests {
 
         let session_root = PathBuf::from(&session.session_root);
         let daemon = thread::spawn(move || {
-            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(150)).unwrap();
+            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(1000))
+                .unwrap();
         });
 
         let send_request = |session: &ExecutionSession, invocation_id: &str, content: &str| {
@@ -2884,6 +7235,7 @@ mod tests {
                 omx: None,
                 assistant_name: "Andy".to_string(),
                 request_plane: RequestPlane::Web,
+                env: Default::default(),
                 session: session.clone(),
                 backend_override: None,
                 task_signature: None,
@@ -2907,10 +7259,66 @@ mod tests {
         let second = send_request(&session, "exec-2", "second");
         assert!(second.text.contains("Session turn: 2"));
 
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(1200));
         daemon.join().unwrap();
         assert!(!session.socket_path().exists());
         assert!(!session.pid_path().exists());
+    }
+
+    #[test]
+    fn worker_daemon_parses_one_json_request_without_client_eof() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("CLAUDE.md"), "# Andy\n").unwrap();
+        let session = build_execution_session(temp.path(), "main", "session-1", &workspace_root);
+        session.ensure_layout().unwrap();
+
+        let session_root = PathBuf::from(&session.session_root);
+        let daemon = thread::spawn(move || {
+            run_worker_daemon_with_idle_timeout(&session_root, Duration::from_millis(150)).unwrap();
+        });
+
+        let mut stream = wait_for_worker_socket(&session).unwrap();
+        let request = WorkerRequest {
+            invocation_id: "exec-no-eof".to_string(),
+            requested_at: "2026-04-05T00:00:00Z".to_string(),
+            group: crate::foundation::Group::main("Andy", "2026-04-05T00:00:00Z"),
+            prompt: "<messages />".to_string(),
+            paperclip_overlay_context: None,
+            messages: vec![MessageRecord {
+                id: "m1".to_string(),
+                chat_jid: "main".to_string(),
+                sender: "user".to_string(),
+                sender_name: Some("User".to_string()),
+                content: "without eof".to_string(),
+                timestamp: "2026-04-05T00:00:00Z".to_string(),
+                is_from_me: false,
+                is_bot_message: false,
+            }],
+            task_id: None,
+            script: None,
+            omx: None,
+            assistant_name: "Andy".to_string(),
+            request_plane: RequestPlane::Web,
+            env: Default::default(),
+            session: session.clone(),
+            backend_override: None,
+            task_signature: None,
+            routing_decision: None,
+            objective: None,
+            plan: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+        };
+
+        write_json(&mut stream, &request).unwrap();
+        let outcome: WorkerOutcome = read_json(&mut stream).unwrap();
+        let response = outcome.response.unwrap();
+        assert!(response.text.contains("Session turn: 1"));
+
+        thread::sleep(Duration::from_millis(250));
+        daemon.join().unwrap();
     }
 
     #[test]
@@ -2990,11 +7398,14 @@ mod tests {
                     omx_poll_interval_ms: 5_000,
                     openclaw_gateway_bind_host: "127.0.0.1".to_string(),
                     openclaw_gateway_public_host: "127.0.0.1".to_string(),
+                    openclaw_gateway_public_ws_url: None,
+                    openclaw_gateway_public_health_url: None,
                     openclaw_gateway_port: 0,
                     openclaw_gateway_token: String::new(),
                     openclaw_gateway_execution_lane: ExecutionLane::Host,
                     slack_env_file: None,
                     slack_poll_interval_ms: 500,
+                    linear_legacy_enabled: false,
                     linear_webhook_port: 0,
                     linear_webhook_secret: String::new(),
                     github_webhook_secret: String::new(),
@@ -3097,11 +7508,14 @@ mod tests {
                     omx_poll_interval_ms: 5_000,
                     openclaw_gateway_bind_host: "127.0.0.1".to_string(),
                     openclaw_gateway_public_host: "127.0.0.1".to_string(),
+                    openclaw_gateway_public_ws_url: None,
+                    openclaw_gateway_public_health_url: None,
                     openclaw_gateway_port: 0,
                     openclaw_gateway_token: String::new(),
                     openclaw_gateway_execution_lane: ExecutionLane::Host,
                     slack_env_file: None,
                     slack_poll_interval_ms: 500,
+                    linear_legacy_enabled: false,
                     linear_webhook_port: 0,
                     linear_webhook_secret: String::new(),
                     github_webhook_secret: String::new(),
@@ -3159,6 +7573,7 @@ mod tests {
             omx: Some(crate::nanoclaw::omx::OmxExecutionOptions::default()),
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session,
             backend_override: None,
             task_signature: None,
@@ -3210,6 +7625,7 @@ mod tests {
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session,
             backend_override: None,
             task_signature: None,
@@ -3270,6 +7686,7 @@ mod tests {
             omx: None,
             assistant_name: "Andy".to_string(),
             request_plane: RequestPlane::Web,
+            env: Default::default(),
             session,
             backend_override: None,
             task_signature: None,
@@ -3332,6 +7749,7 @@ mod tests {
                     secret_handles: Vec::new(),
                     mount_summary: Vec::new(),
                     fallback_reason: None,
+                    external_run_id: None,
                 },
             },
             None,

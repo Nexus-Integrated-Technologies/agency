@@ -1,7 +1,10 @@
 # NanoClaw Rust Migration
 
-This repository is being cut down from the existing `agency` workspace into a
-pure-Rust implementation that mirrors NanoClaw's product surface.
+This repository is adopting the existing `agency` harness into a pure-Rust
+NanoClaw-shaped runtime. NanoClaw is the claw-behavior reference model; Agency
+is the Rust implementation substrate. The migration should clean-room useful
+Agency capabilities into the foundation and NanoClaw runtime instead of treating
+all old Agency/holonic material as disposable residue.
 
 ## Target Shape
 
@@ -21,8 +24,9 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
 
 - A standalone `nanoclaw` Rust bootstrap binary that does not depend on the
   current `agency` runtime.
-- The default runtime entrypoints (`cargo run`, `src/main.rs`) now route to the
-  NanoClaw CLI surface instead of the legacy Agency runtime.
+- The default runtime entrypoint is the explicit `nanoclaw` binary in
+  `src/bin/nanoclaw.rs`; old root-level Rust entrypoints are parked under
+  `graveyard/agency-harness/src-root/`.
 - A canonical domain base now lives in `src/foundation/`, with `nanoclaw` as
   the first runtime descendant rather than a separate ontology.
 - The DigitalOcean VM dev environment is now modeled as a first-class
@@ -35,7 +39,7 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
 - A Rust scheduled-task surface with persisted task CRUD, due-task selection,
   next-run computation for `once`, `interval`, and `cron`, plus CLI commands for
   `task add`, `task list`, `task due`, `task pause`, `task resume`, `task delete`,
-  and `task complete`.
+  and explicit manual completion via `task complete --manual-override`.
 - A first real Rust harness slice for local operation:
   `local send` writes inbound envelopes, `local run` processes them through the
   Rust queue/router/executor path, and `local outbox` reads outbound envelopes.
@@ -54,8 +58,63 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
   CLI overrides for `local run --lane ...` and `task run-due --lane ...`.
 - A `graveyard/holonic/` policy and initial relocation of governance-only docs.
 
+## Clean-Room Upstream Baseline
+
+The current clean-room upstream reference is official NanoClaw `v2.0.64`
+(`0683c6e`). Keep this as a source-of-truth checkpoint for parity work: inspect
+the upstream behavior, port the smallest equivalent Rust contract, and validate
+through Rust tests rather than copying TypeScript implementation details.
+
+The first `v2.0.64` slice ported into Rust is destination-aware message routing:
+
+- inbound messages can carry a deterministic source destination when their chat
+  maps to a registered group;
+- system prompts now describe the available destinations and the required
+  `<message to="...">...</message>` response shape;
+- local and Slack runtimes split outbound model text into target-specific
+  deliveries;
+- plain text output still falls back to the current group so existing local
+  harness behavior remains compatible.
+
+The second `v2.0.64` slice ported into Rust is DB-backed per-group runtime
+configuration:
+
+- registered groups persist a JSON runtime config in SQLite, matching the
+  upstream direction of group-specific provider/model behavior without copying
+  the TypeScript implementation;
+- `nanoclaw group-runtime show|set` gives operators a narrow CLI for provider,
+  backend, model, effort, assistant-name, and prompt-window overrides;
+- local and Slack execution paths resolve these overrides before building
+  prompts, execution env, and backend overrides;
+- Azure, ZAI, Codex, Claude, Workers AI, GitHub Copilot, and custom backend
+  selection still flow through the existing executor/provider contract.
+
+The remaining `v2.0.64` clean-room parity slices now have Rust equivalents:
+
+- per-session sidecar storage creates upstream-shaped `inbound.db` and
+  `outbound.db` files under each execution session while the central SQLite DB
+  remains the source of truth for control-plane state;
+- session sidecars store `on_wake` rows for fresh sessions and explicit
+  operator wake events so missing wake handlers degrade into durable records
+  instead of startup failures;
+- per-group runtime config now carries container image and CLI-scope overrides
+  alongside provider/model/effort, and the container lane resolves the image
+  from that config before falling back to the instance default;
+- destination projections are refreshed into the session sidecar on each
+  runtime session use and invalidated centrally after group registration or
+  approval resolution.
+
+## Remaining Upstream Parity Ledger
+
+- Preserve provider routing through the existing OpenClaw/OMX/Nexus contracts;
+  Azure can be the active inference lane, but provider calls should not bypass
+  the runtime evidence and adapter boundaries.
+
 ## Prune Rules
 
+- Classify Agency subsystems as adoption candidates before pruning them. Useful
+  harness concepts should be distilled into smaller `foundation` or `nanoclaw`
+  contracts.
 - If a subsystem is holonic, FPF-specific, or governance-specific and no longer
   needed for NanoClaw parity, move it into `graveyard/holonic/`.
 - If a subsystem is merely out of scope but not holonic, evaluate it
@@ -65,8 +124,18 @@ NanoClaw parity means the Rust version should converge on these core surfaces:
 
 ## Near-Term Next Cuts
 
+- The current collapse audit and ordered backlog live in
+  `docs/nanoclaw-rs-collapse-audit.md`.
+- The Agency capability adoption ledger lives in
+  `docs/agency-capability-adoption-ledger.md`.
+- Inactive old Agency bins and tests are parked under
+  `graveyard/agency-harness/` as clean-room reference material.
+- Old Agency service launch scripts and the old speaker compose stack are also
+  parked under `graveyard/agency-harness/`; the root `start_agency.sh` is a
+  compatibility guard only.
 - Strip `src/fpf/` and governance-dependent orchestration modules after their
-  remaining call sites are removed or replaced.
+  useful primitives are clean-roomed or their remaining call sites are removed
+  or replaced.
 - Collapse the workspace toward the small, operator-oriented NanoClaw surface:
   orchestrator, queue, DB, runtime, scheduler, channels, and group memory.
 - Extend the subprocess executor into stronger isolation modes, especially

@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1-bookworm AS build
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+
+# Prime Cargo's registry/git caches before copying application source. BuildKit
+# target cache in the release build step keeps compiled artifacts across rebuilds.
+RUN --mount=type=cache,id=nanoclaw-gateway-cargo-registry-amd64,target=/usr/local/cargo/registry,sharing=locked \
+  --mount=type=cache,id=nanoclaw-gateway-cargo-git-amd64,target=/usr/local/cargo/git,sharing=locked \
+  mkdir -p src/bin \
+  && printf 'pub fn placeholder() {}\n' > src/lib.rs \
+  && printf 'fn main() {}\n' > src/bin/nanoclaw.rs \
+  && cargo fetch --locked \
+  && rm -rf src
+
+COPY src ./src
+
+RUN --mount=type=cache,id=nanoclaw-gateway-cargo-registry-amd64,target=/usr/local/cargo/registry,sharing=locked \
+  --mount=type=cache,id=nanoclaw-gateway-cargo-git-amd64,target=/usr/local/cargo/git,sharing=locked \
+  --mount=type=cache,id=nanoclaw-gateway-target-amd64,target=/src/target,sharing=locked \
+  cargo build --release --bin nanoclaw --locked \
+  && mkdir -p /out \
+  && cp /src/target/release/nanoclaw /out/nanoclaw
+
+FROM node:lts-trixie-slim AS runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    bash \
+    python3 \
+    procps \
+    jq \
+    ripgrep \
+    tmux \
+  && rm -rf /var/lib/apt/lists/* \
+  && npm install --global --omit=dev @openai/codex@latest @anthropic-ai/claude-code@latest oh-my-codex@0.18.0
+
+ENV HOME=/nanoclaw
+ENV NANOCLAW_HOME=/nanoclaw
+ENV CODEX_HOME=/nanoclaw/.codex
+ENV NANOCLAW_OPENCLAW_GATEWAY_BIND_HOST=0.0.0.0
+ENV NANOCLAW_OPENCLAW_GATEWAY_PORT=18789
+ENV NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL=wss://nexus-openclaw-gateway.onrender.com/openclaw
+ENV NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL=https://nexus-openclaw-gateway.onrender.com/openclaw/health
+ENV NANOCLAW_OPENCLAW_GATEWAY_EXECUTION_LANE=omx
+ENV NANOCLAW_EXECUTION_LANE=omx
+ENV NANOCLAW_FORCE_WORKER_BACKEND=azure-openai
+ENV NANOCLAW_WORKER_BACKEND=azure-openai
+ENV NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND=codex
+ENV NANOCLAW_CODEX_BIN=codex
+ENV NANOCLAW_CODEX_SANDBOX=danger-full-access
+ENV NANOCLAW_CLAUDE_BIN=claude
+ENV NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND=azure-openai
+ENV AZURE_OPENAI_ENDPOINT=https://nis-openai-c5e29800.openai.azure.com/
+ENV AZURE_OPENAI_DEPLOYMENT=nanoclaw-gpt-4-1-mini
+ENV AZURE_OPENAI_API_VERSION=2024-10-21
+ENV NANOCLAW_ZAI_ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
+ENV NANOCLAW_ZAI_MODEL=glm-4.7
+ENV NANOCLAW_OMX_RUNNER_LOCATION=local
+ENV NANOCLAW_OMX_RUNNER_MODE=local
+ENV NANOCLAW_OMX_RUNNER_PATH=/usr/local/bin/omx-paperclip-runner
+ENV NANOCLAW_OMX_STATE_ROOT=/nanoclaw/.nanoclaw-omx
+ENV NANOCLAW_OMX_CALLBACK_URL=""
+
+COPY --from=build /out/nanoclaw /usr/local/bin/nanoclaw
+COPY docker/start-openclaw-gateway.sh /usr/local/bin/start-openclaw-gateway.sh
+COPY docker/omx-paperclip-runner.mjs /usr/local/bin/omx-paperclip-runner
+
+RUN chmod +x /usr/local/bin/nanoclaw /usr/local/bin/start-openclaw-gateway.sh /usr/local/bin/omx-paperclip-runner \
+  && mkdir -p /nanoclaw/.codex /nanoclaw/.nanoclaw-omx /nanoclaw/data /nanoclaw/groups /nanoclaw/store
+
+WORKDIR /nanoclaw
+EXPOSE 18789
+
+CMD ["/usr/local/bin/start-openclaw-gateway.sh"]

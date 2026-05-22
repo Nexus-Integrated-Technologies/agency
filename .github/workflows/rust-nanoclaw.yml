@@ -1,0 +1,97 @@
+name: Rust NanoClaw
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/rust-nanoclaw.yml"
+      - ".gitignore"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Makefile"
+      - "scripts/check-legacy-source-gates.sh"
+      - "build.rs"
+      - "src/**"
+      - "docs/nanoclaw-rs-*.md"
+      - "docs/agency-capability-adoption-ledger.md"
+  push:
+    branches:
+      - master
+      - "buddha/**"
+    paths:
+      - ".github/workflows/rust-nanoclaw.yml"
+      - ".gitignore"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Makefile"
+      - "scripts/check-legacy-source-gates.sh"
+      - "build.rs"
+      - "src/**"
+      - "docs/nanoclaw-rs-*.md"
+      - "docs/agency-capability-adoption-ledger.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-nanoclaw-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  active-runtime-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify active target graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --format-version 1 > /tmp/cargo-metadata.json
+          python3 - <<'PY'
+          import json
+          with open("/tmp/cargo-metadata.json", "r", encoding="utf-8") as f:
+              package = json.load(f)["packages"][0]
+          targets = sorted((tuple(t["kind"]), t["name"]) for t in package["targets"])
+          expected = sorted([
+              (("bin",), "nanoclaw"),
+              (("custom-build",), "build-script-build"),
+              (("lib",), "rust_agency"),
+          ])
+          if targets != expected:
+              raise SystemExit(f"unexpected active targets: {targets}")
+          print("active targets ok:", targets)
+          PY
+
+      - name: Check
+        run: cargo check --all-targets
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Show config
+        run: cargo run --quiet --bin nanoclaw -- show-config
+
+      - name: Runtime status
+        run: cargo run --quiet --bin nanoclaw -- runtime status
+
+      - name: Runtime state
+        run: cargo run --quiet --bin nanoclaw -- runtime state --limit 5
+
+      - name: Source disposition
+        run: cargo run --quiet --bin nanoclaw -- runtime source-disposition --limit 5
+
+      - name: Runtime inspect
+        run: cargo run --quiet --bin nanoclaw -- runtime inspect --limit 5
+
+      - name: Legacy source gates
+        run: ./scripts/check-legacy-source-gates.sh
+
+      - name: Diff hygiene
+        run: git diff --check

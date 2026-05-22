@@ -138,6 +138,18 @@ fn route_request(
         .unwrap_or(request.url())
         .to_string();
 
+    if path == "/webhook/linear" && !config.linear_legacy_enabled {
+        return Ok((
+            410,
+            json!({
+                "ok": false,
+                "endpoint": "linear-webhook",
+                "status": "discontinued",
+                "error": "Linear integration is discontinued for this Nexus runtime",
+            }),
+        ));
+    }
+
     match (request.method(), path.as_str()) {
         (&Method::Get, "/health") => Ok((200, json!({ "status": "ok" }))),
         (&Method::Get, "/webhook/linear") => Ok((
@@ -145,7 +157,7 @@ fn route_request(
             json!({
                 "ok": true,
                 "endpoint": "linear-webhook",
-                "status": "ready",
+                "status": "legacy-ready",
                 "method": "POST",
                 "signatureRequired": !config.linear_webhook_secret.trim().is_empty(),
                 "hint": "Send a signed POST request to this endpoint from Linear."
@@ -159,6 +171,7 @@ fn route_request(
                 "status": "ready",
                 "method": "POST",
                 "signatureRequired": !config.github_webhook_secret.trim().is_empty(),
+                "linearSyncEnabled": config.linear_legacy_enabled,
                 "hint": "Send a signed GitHub webhook POST request to this endpoint."
             }),
         )),

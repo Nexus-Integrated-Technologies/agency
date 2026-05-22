@@ -9,16 +9,20 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::foundation::{
-    classify_boundary_text, Group, RequestPlane, RoleAlgebra, SwarmRequestedLane,
-    SwarmResolvedLane, SwarmRun, SwarmRunStatus, SwarmTask, SwarmTaskDependency, SwarmTaskStatus,
-    TaskSignature,
+    classify_boundary_text, ExecutionBoundary, ExecutionBoundaryKind, Group, RequestPlane,
+    RoleAlgebra, SwarmRequestedLane, SwarmResolvedLane, SwarmRun, SwarmRunStatus, SwarmTask,
+    SwarmTaskDependency, SwarmTaskStatus, TaskSignature,
 };
 
 use super::app::NanoclawApp;
+use super::command_safety::first_blocking_command_safety_violation;
 use super::db::NanoclawDb;
 use super::dev_environment::DigitalOceanDevEnvironment;
 use super::executor::{
-    build_execution_session, ExecutionRequest, ExecutionResponse, ExecutorBoundary,
+    build_execution_evidence, build_execution_session, validate_execution_evidence,
+    BuildExecutionEvidenceInput, ExecutionBlockerRef, ExecutionEvidence, ExecutionEvidenceMode,
+    ExecutionEvidenceStatus, ExecutionRequest, ExecutionResponse, ExecutionVerificationRef,
+    ExecutorBoundary,
 };
 use super::fpf_bridge::{
     build_boundary_claims, derive_task_signature, evaluate_execution_gate,
@@ -104,6 +108,7 @@ struct SwarmTaskExecutionResult {
     output: Option<String>,
     error: Option<String>,
     metadata: Option<Value>,
+    evidence: Option<ExecutionEvidence>,
     non_retryable: bool,
 }
 
@@ -774,7 +779,7 @@ fn execute_swarm_task<E: ExecutorBoundary>(
     executor: &E,
     runnable: RunnableSwarmTask,
 ) -> Result<SwarmTaskExecutionResult> {
-    let result = match match runnable.resolved_lane {
+    let mut result = match match runnable.resolved_lane {
         SwarmResolvedLane::Agent => run_swarm_agent_lane(app, executor, &runnable),
         SwarmResolvedLane::Codex => run_swarm_codex_lane(app, executor, &runnable),
         SwarmResolvedLane::Host => run_swarm_host_lane(app, executor, &runnable),
@@ -786,6 +791,7 @@ fn execute_swarm_task<E: ExecutorBoundary>(
             output: None,
             error: Some(format!("Unsupported swarm lane: {value}")),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         }),
     } {
@@ -796,9 +802,19 @@ fn execute_swarm_task<E: ExecutorBoundary>(
             output: None,
             error: Some(error.to_string()),
             metadata: None,
+            evidence: None,
             non_retryable: false,
         },
     };
+    if result.ok {
+        if let Err(error) = validate_swarm_completion_evidence(&runnable.resolved_lane, &result) {
+            let message = format!("swarm execution evidence contract failed: {error}");
+            result.ok = false;
+            result.summary = message.clone();
+            result.error = Some(message);
+            result.non_retryable = true;
+        }
+    }
 
     let Some(mut stored_task) = app.db.get_swarm_task(&runnable.task.id)? else {
         bail!(
@@ -809,9 +825,10 @@ fn execute_swarm_task<E: ExecutorBoundary>(
     let completed_at = Utc::now().to_rfc3339();
     stored_task.resolved_lane = Some(runnable.resolved_lane.clone());
     stored_task.result = Some(json!({
-        "summary": result.summary,
-        "output": result.output,
-        "metadata": result.metadata,
+        "summary": result.summary.clone(),
+        "output": result.output.clone(),
+        "metadata": result.metadata.clone(),
+        "execution_evidence": result.evidence.clone(),
     }));
     stored_task.error = result.error.clone();
     stored_task.gate_decision = stored_task
@@ -840,6 +857,37 @@ fn execute_swarm_task<E: ExecutorBoundary>(
     Ok(result)
 }
 
+fn validate_swarm_completion_evidence(
+    lane: &SwarmResolvedLane,
+    result: &SwarmTaskExecutionResult,
+) -> Result<()> {
+    if !swarm_lane_requires_execution_evidence(lane) {
+        return Ok(());
+    }
+    let Some(evidence) = result.evidence.as_ref() else {
+        bail!("missing execution evidence for {} lane", lane.as_str());
+    };
+    if evidence.status != ExecutionEvidenceStatus::Succeeded {
+        bail!(
+            "execution evidence did not succeed for {} lane: {}",
+            lane.as_str(),
+            evidence.status.as_str()
+        );
+    }
+    validate_execution_evidence(evidence, Some(evidence.workspace.session_id.as_str()))
+}
+
+fn swarm_lane_requires_execution_evidence(lane: &SwarmResolvedLane) -> bool {
+    matches!(
+        lane,
+        SwarmResolvedLane::Agent
+            | SwarmResolvedLane::Codex
+            | SwarmResolvedLane::Host
+            | SwarmResolvedLane::RepoMirror
+            | SwarmResolvedLane::Symphony
+    )
+}
+
 fn run_swarm_agent_lane<E: ExecutorBoundary>(
     app: &mut NanoclawApp,
     executor: &E,
@@ -857,6 +905,7 @@ fn run_swarm_agent_lane<E: ExecutorBoundary>(
             output: None,
             error: Some(error),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         });
     }
@@ -890,6 +939,7 @@ fn run_swarm_codex_lane<E: ExecutorBoundary>(
             output: None,
             error: Some(error),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         });
     }
@@ -918,6 +968,7 @@ fn run_swarm_host_lane<E: ExecutorBoundary>(
             output: None,
             error: Some("Host lane requires a command.".to_string()),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         });
     };
@@ -938,6 +989,7 @@ fn run_swarm_host_lane<E: ExecutorBoundary>(
             output: None,
             error: Some(error.to_string()),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         });
     }
@@ -956,6 +1008,115 @@ fn run_swarm_host_lane<E: ExecutorBoundary>(
     Ok(execution_response_to_task_result(response))
 }
 
+struct DirectSwarmEvidenceInput<'a> {
+    adapter_type: &'a str,
+    run: &'a SwarmRun,
+    task: &'a SwarmTask,
+    command: &'a str,
+    remote_cwd: &'a str,
+    remote_target: Option<&'a str>,
+    stdout: Option<&'a str>,
+    error: Option<&'a str>,
+    status: ExecutionEvidenceStatus,
+    blocker_kind: Option<&'a str>,
+}
+
+fn build_direct_swarm_execution_evidence(input: DirectSwarmEvidenceInput<'_>) -> ExecutionEvidence {
+    let run_id = format!("swarm:{}:{}", input.run.id, input.task.id);
+    let session_id = format!("swarm-session-{}", input.task.id);
+    let status = input.status.clone();
+    let status_label = input.status.as_str().to_string();
+    let boundary = ExecutionBoundary {
+        kind: ExecutionBoundaryKind::RemoteWorker,
+        root: Some(input.remote_cwd.to_string()),
+        isolated: true,
+    };
+    let log_body = format!(
+        "adapter={}\nrun_id={}\ntask_id={}\nremote_target={}\nremote_cwd={}\ncommand={}\nstatus={}\nstdout=\n{}\nerror=\n{}\n",
+        input.adapter_type,
+        input.run.id,
+        input.task.id,
+        input.remote_target.unwrap_or("-"),
+        input.remote_cwd,
+        input.command,
+        status_label,
+        input.stdout.unwrap_or(""),
+        input.error.unwrap_or("")
+    );
+    let blockers = input.error.map(|message| {
+        vec![ExecutionBlockerRef {
+            kind: input
+                .blocker_kind
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}_command_failed", input.adapter_type)),
+            source: Some(input.adapter_type.to_string()),
+            message: message.to_string(),
+        }]
+    });
+    let blockers = blockers.unwrap_or_default();
+    build_execution_evidence(BuildExecutionEvidenceInput {
+        adapter_type: input.adapter_type,
+        mode: ExecutionEvidenceMode::Shell,
+        run_id: run_id.as_str(),
+        status,
+        session_id: session_id.as_str(),
+        group_folder: Some(input.task.target_group_folder.as_str()),
+        workspace_root: Some(input.remote_cwd),
+        boundary: &boundary,
+        log_path: None,
+        log_body: Some(log_body.as_str()),
+        metadata: None,
+        provenance_id: None,
+        verification: vec![ExecutionVerificationRef {
+            kind: "command".to_string(),
+            command: Some(input.command.to_string()),
+            status: status_label,
+            summary: input
+                .error
+                .map(str::to_string)
+                .or_else(|| input.stdout.map(summarize_text)),
+        }],
+        blockers,
+    })
+}
+
+fn blocked_direct_swarm_command_result(
+    adapter_type: &str,
+    run: &SwarmRun,
+    task: &SwarmTask,
+    command: &str,
+    remote_cwd: &str,
+    violation_message: &str,
+) -> SwarmTaskExecutionResult {
+    let message = format!("swarm command blocked by command safety policy: {violation_message}");
+    let evidence = build_direct_swarm_execution_evidence(DirectSwarmEvidenceInput {
+        adapter_type,
+        run,
+        task,
+        command,
+        remote_cwd,
+        remote_target: None,
+        stdout: None,
+        error: Some(message.as_str()),
+        status: ExecutionEvidenceStatus::Failed,
+        blocker_kind: Some("command_safety_policy"),
+    });
+
+    SwarmTaskExecutionResult {
+        ok: false,
+        summary: message.clone(),
+        output: None,
+        error: Some(message),
+        metadata: Some(json!({
+            "remote_repo_path": remote_cwd,
+            "mode": adapter_type,
+            "execution_evidence": evidence.clone(),
+        })),
+        evidence: Some(evidence),
+        non_retryable: true,
+    }
+}
+
 fn run_swarm_repo_mirror_lane(
     app: &mut NanoclawApp,
     runnable: &RunnableSwarmTask,
@@ -967,6 +1128,7 @@ fn run_swarm_repo_mirror_lane(
             output: None,
             error: Some("Repo mirror lane requires a command.".to_string()),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         });
     };
@@ -979,51 +1141,99 @@ fn run_swarm_repo_mirror_lane(
             output: None,
             error: Some(error.to_string()),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         });
     }
     let environment = DigitalOceanDevEnvironment::from_config(&app.config);
-    let remote_root = if runnable.task.sync {
-        let _ = environment.sync_project()?;
-        environment.remote_repo_path()?
-    } else if let Some(repo) = runnable
+    let repo = runnable
         .task
         .repo
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let remote_root = build_remote_repo_mirror_path(&app.config.droplet_repo_root, repo)?;
-        ensure_remote_repo_mirror(&environment, repo, &remote_root)?;
-        remote_root
+        .filter(|value| !value.trim().is_empty());
+    let remote_root_for_safety = if runnable.task.sync {
+        environment.remote_repo_path()?
+    } else if let Some(repo) = repo {
+        build_remote_repo_mirror_path(&app.config.droplet_repo_root, repo)?
     } else {
         environment.remote_repo_path()?
     };
-    let remote_cwd = resolve_remote_cwd(&remote_root, runnable.task.repo_path.as_deref());
-    let result = environment.exec(&format!("cd {} && {}", shell_quote(&remote_cwd), command));
+    let remote_cwd =
+        resolve_remote_cwd(&remote_root_for_safety, runnable.task.repo_path.as_deref());
+    let remote_command = format!("cd {} && {}", shell_quote(&remote_cwd), command);
+    if let Some(violation) = first_blocking_command_safety_violation(command) {
+        return Ok(blocked_direct_swarm_command_result(
+            "repo_mirror",
+            &runnable.run,
+            &runnable.task,
+            remote_command.as_str(),
+            remote_cwd.as_str(),
+            violation.message.as_str(),
+        ));
+    }
+    if runnable.task.sync {
+        let _ = environment.sync_project()?;
+    } else if let Some(repo) = repo {
+        ensure_remote_repo_mirror(&environment, repo, &remote_root_for_safety)?;
+    }
+    let result = environment.exec(&remote_command);
     match result {
-        Ok(exec) => Ok(SwarmTaskExecutionResult {
-            ok: true,
-            summary: summarize_text(&exec.stdout),
-            output: trim_output(&exec.stdout),
-            error: None,
-            metadata: Some(json!({
-                "remote_target": exec.remote_target,
-                "remote_repo_path": remote_cwd,
-                "mode": "repo_mirror",
-            })),
-            non_retryable: false,
-        }),
-        Err(error) => Ok(SwarmTaskExecutionResult {
-            ok: false,
-            summary: error.to_string(),
-            output: None,
-            error: Some(error.to_string()),
-            metadata: Some(json!({
-                "remote_repo_path": remote_cwd,
-                "mode": "repo_mirror",
-            })),
-            non_retryable: false,
-        }),
+        Ok(exec) => {
+            let evidence = build_direct_swarm_execution_evidence(DirectSwarmEvidenceInput {
+                adapter_type: "repo_mirror",
+                run: &runnable.run,
+                task: &runnable.task,
+                command: remote_command.as_str(),
+                remote_cwd: remote_cwd.as_str(),
+                remote_target: Some(exec.remote_target.as_str()),
+                stdout: Some(exec.stdout.as_str()),
+                error: None,
+                status: ExecutionEvidenceStatus::Succeeded,
+                blocker_kind: None,
+            });
+            Ok(SwarmTaskExecutionResult {
+                ok: true,
+                summary: summarize_text(&exec.stdout),
+                output: trim_output(&exec.stdout),
+                error: None,
+                metadata: Some(json!({
+                    "remote_target": exec.remote_target,
+                    "remote_repo_path": remote_cwd,
+                    "mode": "repo_mirror",
+                    "execution_evidence": evidence.clone(),
+                })),
+                evidence: Some(evidence),
+                non_retryable: false,
+            })
+        }
+        Err(error) => {
+            let error_message = error.to_string();
+            let evidence = build_direct_swarm_execution_evidence(DirectSwarmEvidenceInput {
+                adapter_type: "repo_mirror",
+                run: &runnable.run,
+                task: &runnable.task,
+                command: remote_command.as_str(),
+                remote_cwd: remote_cwd.as_str(),
+                remote_target: None,
+                stdout: None,
+                error: Some(error_message.as_str()),
+                status: ExecutionEvidenceStatus::Failed,
+                blocker_kind: None,
+            });
+            Ok(SwarmTaskExecutionResult {
+                ok: false,
+                summary: error_message.clone(),
+                output: None,
+                error: Some(error_message),
+                metadata: Some(json!({
+                    "remote_repo_path": remote_cwd,
+                    "mode": "repo_mirror",
+                    "execution_evidence": evidence.clone(),
+                })),
+                evidence: Some(evidence),
+                non_retryable: false,
+            })
+        }
     }
 }
 
@@ -1038,37 +1248,82 @@ fn run_swarm_symphony_lane(
             output: None,
             error: Some("Symphony lane requires a command.".to_string()),
             metadata: None,
+            evidence: None,
             non_retryable: true,
         });
     };
     let environment = DigitalOceanDevEnvironment::from_config(&app.config);
     let remote_root = environment.remote_repo_path()?;
     let remote_cwd = resolve_remote_cwd(&remote_root, runnable.task.cwd.as_deref());
-    let result = environment.exec(&format!("cd {} && {}", shell_quote(&remote_cwd), command));
+    let remote_command = format!("cd {} && {}", shell_quote(&remote_cwd), command);
+    if let Some(violation) = first_blocking_command_safety_violation(command) {
+        return Ok(blocked_direct_swarm_command_result(
+            "symphony",
+            &runnable.run,
+            &runnable.task,
+            remote_command.as_str(),
+            remote_cwd.as_str(),
+            violation.message.as_str(),
+        ));
+    }
+    let result = environment.exec(&remote_command);
     match result {
-        Ok(exec) => Ok(SwarmTaskExecutionResult {
-            ok: true,
-            summary: summarize_text(&exec.stdout),
-            output: trim_output(&exec.stdout),
-            error: None,
-            metadata: Some(json!({
-                "remote_target": exec.remote_target,
-                "remote_repo_path": remote_cwd,
-                "mode": "symphony",
-            })),
-            non_retryable: false,
-        }),
-        Err(error) => Ok(SwarmTaskExecutionResult {
-            ok: false,
-            summary: error.to_string(),
-            output: None,
-            error: Some(error.to_string()),
-            metadata: Some(json!({
-                "remote_repo_path": remote_cwd,
-                "mode": "symphony",
-            })),
-            non_retryable: false,
-        }),
+        Ok(exec) => {
+            let evidence = build_direct_swarm_execution_evidence(DirectSwarmEvidenceInput {
+                adapter_type: "symphony",
+                run: &runnable.run,
+                task: &runnable.task,
+                command: remote_command.as_str(),
+                remote_cwd: remote_cwd.as_str(),
+                remote_target: Some(exec.remote_target.as_str()),
+                stdout: Some(exec.stdout.as_str()),
+                error: None,
+                status: ExecutionEvidenceStatus::Succeeded,
+                blocker_kind: None,
+            });
+            Ok(SwarmTaskExecutionResult {
+                ok: true,
+                summary: summarize_text(&exec.stdout),
+                output: trim_output(&exec.stdout),
+                error: None,
+                metadata: Some(json!({
+                    "remote_target": exec.remote_target,
+                    "remote_repo_path": remote_cwd,
+                    "mode": "symphony",
+                    "execution_evidence": evidence.clone(),
+                })),
+                evidence: Some(evidence),
+                non_retryable: false,
+            })
+        }
+        Err(error) => {
+            let error_message = error.to_string();
+            let evidence = build_direct_swarm_execution_evidence(DirectSwarmEvidenceInput {
+                adapter_type: "symphony",
+                run: &runnable.run,
+                task: &runnable.task,
+                command: remote_command.as_str(),
+                remote_cwd: remote_cwd.as_str(),
+                remote_target: None,
+                stdout: None,
+                error: Some(error_message.as_str()),
+                status: ExecutionEvidenceStatus::Failed,
+                blocker_kind: None,
+            });
+            Ok(SwarmTaskExecutionResult {
+                ok: false,
+                summary: error_message.clone(),
+                output: None,
+                error: Some(error_message),
+                metadata: Some(json!({
+                    "remote_repo_path": remote_cwd,
+                    "mode": "symphony",
+                    "execution_evidence": evidence.clone(),
+                })),
+                evidence: Some(evidence),
+                non_retryable: false,
+            })
+        }
     }
 }
 
@@ -1123,12 +1378,14 @@ fn execute_swarm_prompt<E: ExecutorBoundary>(
     executor.execute(ExecutionRequest {
         group: group.clone(),
         prompt: prompt.to_string(),
+        paperclip_overlay_context: None,
         messages: Vec::new(),
         task_id: Some(task.id.clone()),
         script: None,
         omx: None,
         assistant_name: app.config.assistant_name.clone(),
         request_plane,
+        env: Default::default(),
         session,
         backend_override,
         task_signature: Some(task_signature),
@@ -1178,12 +1435,14 @@ fn execute_swarm_script<E: ExecutorBoundary>(
     executor.execute(ExecutionRequest {
         group: group.clone(),
         prompt,
+        paperclip_overlay_context: None,
         messages: Vec::new(),
         task_id: Some(task.id.clone()),
         script: Some(script.to_string()),
         omx: None,
         assistant_name: app.config.assistant_name.clone(),
         request_plane,
+        env: Default::default(),
         session,
         backend_override: None,
         task_signature: Some(task_signature),
@@ -1196,6 +1455,7 @@ fn execute_swarm_script<E: ExecutorBoundary>(
 }
 
 fn execution_response_to_task_result(response: ExecutionResponse) -> SwarmTaskExecutionResult {
+    let evidence = response.evidence;
     SwarmTaskExecutionResult {
         ok: true,
         summary: summarize_text(&response.text),
@@ -1206,7 +1466,9 @@ fn execution_response_to_task_result(response: ExecutionResponse) -> SwarmTaskEx
             "boundary": format!("{:?}", response.boundary.kind),
             "log_path": response.log_path,
             "provenance_id": response.provenance.as_ref().map(|value| value.id.clone()),
+            "execution_evidence": evidence.clone(),
         })),
+        evidence,
         non_retryable: false,
     }
 }
@@ -1840,13 +2102,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        build_default_swarm_plan, create_swarm_objective_run, get_swarm_run_details,
-        pump_swarm_once, CreateSwarmObjectiveRunInput,
+        build_default_swarm_plan, build_direct_swarm_execution_evidence,
+        create_swarm_objective_run, get_swarm_run_details, pump_swarm_once,
+        validate_swarm_completion_evidence, CreateSwarmObjectiveRunInput, DirectSwarmEvidenceInput,
+        SwarmTaskExecutionResult,
     };
-    use crate::foundation::{DevelopmentEnvironment, DevelopmentEnvironmentKind, RemoteWorkerMode};
+    use crate::foundation::{
+        DevelopmentEnvironment, DevelopmentEnvironmentKind, RemoteWorkerMode, SwarmResolvedLane,
+        SwarmTaskStatus,
+    };
     use crate::nanoclaw::app::NanoclawApp;
     use crate::nanoclaw::config::NanoclawConfig;
-    use crate::nanoclaw::executor::InProcessEchoExecutor;
+    use crate::nanoclaw::executor::{ExecutionEvidenceStatus, InProcessEchoExecutor};
 
     fn test_config(project_root: &Path) -> NanoclawConfig {
         NanoclawConfig {
@@ -1882,11 +2149,14 @@ mod tests {
             omx_poll_interval_ms: 5_000,
             openclaw_gateway_bind_host: "127.0.0.1".to_string(),
             openclaw_gateway_public_host: "127.0.0.1".to_string(),
+            openclaw_gateway_public_ws_url: None,
+            openclaw_gateway_public_health_url: None,
             openclaw_gateway_port: 0,
             openclaw_gateway_token: String::new(),
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),
@@ -1966,9 +2236,135 @@ mod tests {
         assert!(!details.tasks.is_empty());
         assert!(details.tasks.iter().any(|task| matches!(
             task.status,
-            crate::foundation::SwarmTaskStatus::Completed
-                | crate::foundation::SwarmTaskStatus::Ready
+            SwarmTaskStatus::Completed | SwarmTaskStatus::Ready
         )));
+        let completed = details
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, SwarmTaskStatus::Completed))
+            .collect::<Vec<_>>();
+        assert!(!completed.is_empty());
+        assert!(completed.iter().all(|task| {
+            task.result
+                .as_ref()
+                .and_then(|result| result.get("execution_evidence"))
+                .is_some()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validates_swarm_completion_requires_execution_evidence() {
+        let result = SwarmTaskExecutionResult {
+            ok: true,
+            summary: "completed".to_string(),
+            output: Some("ok".to_string()),
+            error: None,
+            metadata: None,
+            evidence: None,
+            non_retryable: false,
+        };
+        let error = validate_swarm_completion_evidence(&SwarmResolvedLane::RepoMirror, &result)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing execution evidence"));
+    }
+
+    #[test]
+    fn direct_swarm_lanes_emit_structured_execution_evidence() -> Result<()> {
+        let dir = tempdir()?;
+        let mut app = NanoclawApp::open(test_config(dir.path()))?;
+        let created = create_swarm_objective_run(
+            &mut app,
+            CreateSwarmObjectiveRunInput {
+                objective: "Mirror repo and verify status".to_string(),
+                group_folder: "main".to_string(),
+                chat_jid: "main".to_string(),
+                created_by: "tester".to_string(),
+                requested_lane: None,
+                tasks: Vec::new(),
+                max_concurrency: Some(1),
+            },
+        )?;
+        let task = created.tasks.first().unwrap();
+        let evidence = build_direct_swarm_execution_evidence(DirectSwarmEvidenceInput {
+            adapter_type: "repo_mirror",
+            run: &created.run,
+            task,
+            command: "git status --short",
+            remote_cwd: "/srv/code-mirror/example",
+            remote_target: Some("root@example"),
+            stdout: Some("clean"),
+            error: None,
+            status: ExecutionEvidenceStatus::Succeeded,
+            blocker_kind: None,
+        });
+        assert_eq!(evidence.adapter_type, "repo_mirror");
+        assert_eq!(evidence.mode.as_str(), "shell");
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Succeeded);
+        assert_eq!(
+            evidence.verification[0].command.as_deref(),
+            Some("git status --short")
+        );
+        assert!(!evidence.artifacts.is_empty());
+        validate_swarm_completion_evidence(
+            &SwarmResolvedLane::RepoMirror,
+            &SwarmTaskExecutionResult {
+                ok: true,
+                summary: "completed".to_string(),
+                output: Some("clean".to_string()),
+                error: None,
+                metadata: None,
+                evidence: Some(evidence),
+                non_retryable: false,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn direct_swarm_command_safety_blocks_with_structured_evidence() -> Result<()> {
+        let dir = tempdir()?;
+        let mut app = NanoclawApp::open(test_config(dir.path()))?;
+        let created = create_swarm_objective_run(
+            &mut app,
+            CreateSwarmObjectiveRunInput {
+                objective: "Mirror repo and verify status".to_string(),
+                group_folder: "main".to_string(),
+                chat_jid: "main".to_string(),
+                created_by: "tester".to_string(),
+                requested_lane: None,
+                tasks: Vec::new(),
+                max_concurrency: Some(1),
+            },
+        )?;
+        let task = created.tasks.first().unwrap();
+        let result = super::blocked_direct_swarm_command_result(
+            "repo_mirror",
+            &created.run,
+            task,
+            "cd /srv/code-mirror/example && rm -rf ./*",
+            "/srv/code-mirror/example",
+            "blocked recursive forced removal of high-risk target `./*`",
+        );
+
+        assert!(!result.ok);
+        assert!(result.non_retryable);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("command safety policy"));
+        let evidence = result
+            .evidence
+            .as_ref()
+            .expect("blocked result emits evidence");
+        assert_eq!(evidence.status, ExecutionEvidenceStatus::Failed);
+        assert_eq!(evidence.blockers[0].kind, "command_safety_policy");
+        assert_eq!(
+            evidence.verification[0].command.as_deref(),
+            Some("cd /srv/code-mirror/example && rm -rf ./*")
+        );
         Ok(())
     }
 }

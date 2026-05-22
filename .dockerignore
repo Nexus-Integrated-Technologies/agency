@@ -1,0 +1,12 @@
+target
+.git
+.fastembed_cache
+artifacts
+crates
+data
+docs
+graveyard
+groups
+src-tauri
+store
+tests

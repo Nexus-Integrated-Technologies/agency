@@ -1,18 +1,22 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::foundation::{
     ArtifactKind, ArtifactRecord, ArtifactStore, EventLog, ExecutionBoundary,
-    ExecutionBoundaryKind, ExecutionContext, FoundationEvent, FoundationStore, Group,
-    ScheduledTask, TaskStatus,
+    ExecutionBoundaryKind, ExecutionContext, ExecutionStatus, FoundationEvent, FoundationStore,
+    Group, ScheduledTask, TaskStatus,
 };
 
 use super::config::NanoclawConfig;
 use super::db::{NanoclawDb, NanoclawDbCounts};
 use super::dev_environment::DigitalOceanDevEnvironment;
+use super::executor::{
+    validate_execution_response_evidence, ExecutionEvidenceStatus, ExecutionResponse,
+};
+use super::group_runtime_config::GroupRuntimeConfig;
 use super::queue::GroupQueue;
 use super::scheduler::{build_run_log, build_scheduled_task, compute_next_run, TaskScheduleInput};
 
@@ -161,6 +165,11 @@ impl NanoclawApp {
     }
 
     pub fn set_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
+        if matches!(status, TaskStatus::Completed) {
+            bail!(
+                "task {task_id} cannot be marked completed through set_task_status; use execution evidence or a manual completion override"
+            );
+        }
         self.db.set_task_status(task_id, status)
     }
 
@@ -168,7 +177,7 @@ impl NanoclawApp {
         self.db.delete_task(task_id)
     }
 
-    pub fn complete_task_run(
+    fn complete_task_run(
         &mut self,
         task_id: &str,
         duration_ms: i64,
@@ -192,6 +201,49 @@ impl NanoclawApp {
         self.db.get_task_by_id(task_id)
     }
 
+    pub fn complete_task_run_from_execution(
+        &mut self,
+        task_id: &str,
+        duration_ms: i64,
+        result: Option<String>,
+        execution: &ExecutionResponse,
+    ) -> Result<Option<ScheduledTask>> {
+        validate_task_execution_completion_evidence(task_id, execution)?;
+        self.complete_task_run(task_id, duration_ms, result, None)
+    }
+
+    pub fn complete_task_run_manual_override(
+        &mut self,
+        task_id: &str,
+        result: Option<String>,
+    ) -> Result<Option<ScheduledTask>> {
+        let result = result
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("Manual completion override: {value}"))
+            .unwrap_or_else(|| "Manual completion override.".to_string());
+        self.complete_task_run(task_id, 0, Some(result), None)
+    }
+
+    pub fn record_failed_task_run(
+        &mut self,
+        task_id: &str,
+        duration_ms: i64,
+        error: String,
+    ) -> Result<Option<ScheduledTask>> {
+        let Some(task) = self.db.get_task_by_id(task_id)? else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let next_run = compute_next_run(&task, &self.config.timezone, now)?;
+        let summary = format!("Error: {error}");
+        let log = build_run_log(task_id, duration_ms, None, Some(error), now);
+        self.db.log_task_run(&log)?;
+        self.db
+            .update_task_after_failed_run(task_id, next_run.as_deref(), &summary)?;
+        self.db.get_task_by_id(task_id)
+    }
+
     pub fn task(&self, task_id: &str) -> Result<Option<ScheduledTask>> {
         self.db.get_task_by_id(task_id)
     }
@@ -200,8 +252,21 @@ impl NanoclawApp {
         self.db.list_groups()
     }
 
+    pub fn group_runtime_config(&self, group_folder: &str) -> Result<GroupRuntimeConfig> {
+        self.db.group_runtime_config(group_folder)
+    }
+
+    pub fn set_group_runtime_config(
+        &self,
+        group_folder: &str,
+        config: &GroupRuntimeConfig,
+    ) -> Result<()> {
+        self.db.set_group_runtime_config(group_folder, config)
+    }
+
     pub fn register_group(&mut self, group: Group) -> Result<Group> {
         self.db.upsert_group(&group)?;
+        self.db.touch_destination_projection("group_registered")?;
         ensure_group_folder(&self.config, &group.folder, &self.config.assistant_name)?;
         self.record_event(FoundationEvent::GroupRegistered {
             group: group.clone(),
@@ -262,6 +327,44 @@ impl NanoclawApp {
     pub fn events(&self) -> &[FoundationEvent] {
         &self.events
     }
+}
+
+pub fn validate_task_execution_completion_evidence(
+    task_id: &str,
+    execution: &ExecutionResponse,
+) -> Result<()> {
+    validate_execution_response_evidence(execution)?;
+    let Some(evidence) = execution.evidence.as_ref() else {
+        bail!("task completion evidence missing for task {}", task_id);
+    };
+    if !matches!(evidence.status, ExecutionEvidenceStatus::Succeeded) {
+        bail!(
+            "task {} cannot complete from execution evidence with status {}",
+            task_id,
+            evidence.status.as_str()
+        );
+    }
+    if let Some(provenance) = execution.provenance.as_ref() {
+        if !matches!(provenance.status, ExecutionStatus::Success) {
+            bail!(
+                "task {} cannot complete from provenance status {}",
+                task_id,
+                provenance.status.as_str()
+            );
+        }
+        let claimed_task_ids = provenance
+            .boundary_claims
+            .iter()
+            .filter_map(|claim| claim.task_id.as_deref())
+            .collect::<Vec<_>>();
+        if !claimed_task_ids.is_empty() && !claimed_task_ids.iter().any(|claim| *claim == task_id) {
+            bail!(
+                "task {} cannot complete from execution evidence tied to another task",
+                task_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ensure_runtime_layout(config: &NanoclawConfig) -> Result<()> {
@@ -387,12 +490,77 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::NanoclawApp;
+    use super::{validate_task_execution_completion_evidence, NanoclawApp};
     use crate::foundation::{
-        ArtifactKind, FoundationEvent, TaskContextMode, TaskScheduleType, TaskStatus,
+        ArtifactKind, ExecutionBoundary, ExecutionBoundaryKind, FoundationEvent, TaskContextMode,
+        TaskScheduleType, TaskStatus,
     };
     use crate::nanoclaw::config::NanoclawConfig;
+    use crate::nanoclaw::executor::{
+        build_execution_evidence, BuildExecutionEvidenceInput, ExecutionArtifactRef,
+        ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionResponse,
+        ExecutionVerificationRef,
+    };
     use crate::nanoclaw::scheduler::TaskScheduleInput;
+
+    #[test]
+    fn task_completion_requires_successful_execution_evidence() -> Result<()> {
+        let boundary = ExecutionBoundary {
+            kind: ExecutionBoundaryKind::Host,
+            root: Some("/tmp/workspace".to_string()),
+            isolated: true,
+        };
+        let mut response = ExecutionResponse {
+            text: "ok".to_string(),
+            boundary: boundary.clone(),
+            session_id: "session-1".to_string(),
+            log_path: None,
+            log_body: None,
+            provenance: None,
+            metadata: None,
+            evidence: None,
+        };
+        assert!(validate_task_execution_completion_evidence("task-1", &response).is_err());
+
+        let mut evidence = build_execution_evidence(BuildExecutionEvidenceInput {
+            adapter_type: "codex",
+            mode: ExecutionEvidenceMode::Code,
+            run_id: "exec-1",
+            status: ExecutionEvidenceStatus::Failed,
+            session_id: "session-1",
+            group_folder: Some("main"),
+            workspace_root: Some("/tmp/workspace"),
+            boundary: &boundary,
+            log_path: None,
+            log_body: None,
+            metadata: None,
+            provenance_id: None,
+            verification: Vec::new(),
+            blockers: Vec::new(),
+        });
+        response.evidence = Some(evidence.clone());
+        assert!(validate_task_execution_completion_evidence("task-1", &response).is_err());
+
+        evidence.status = ExecutionEvidenceStatus::Succeeded;
+        response.evidence = Some(evidence.clone());
+        assert!(validate_task_execution_completion_evidence("task-1", &response).is_err());
+
+        evidence.artifacts.push(ExecutionArtifactRef {
+            kind: "execution_log".to_string(),
+            title: "log".to_string(),
+            location: Some("/tmp/exec.log".to_string()),
+            body: None,
+        });
+        evidence.verification.push(ExecutionVerificationRef {
+            kind: "test_verification".to_string(),
+            command: None,
+            status: ExecutionEvidenceStatus::Succeeded.as_str().to_string(),
+            summary: Some("test verification supplied".to_string()),
+        });
+        response.evidence = Some(evidence);
+        validate_task_execution_completion_evidence("task-1", &response)?;
+        Ok(())
+    }
 
     #[test]
     fn bootstrap_creates_foundation_lineage() -> Result<()> {
@@ -431,11 +599,14 @@ mod tests {
             omx_poll_interval_ms: 5_000,
             openclaw_gateway_bind_host: "127.0.0.1".to_string(),
             openclaw_gateway_public_host: "127.0.0.1".to_string(),
+            openclaw_gateway_public_ws_url: None,
+            openclaw_gateway_public_health_url: None,
             openclaw_gateway_port: 0,
             openclaw_gateway_token: String::new(),
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),
@@ -541,11 +712,14 @@ mod tests {
             omx_poll_interval_ms: 5_000,
             openclaw_gateway_bind_host: "127.0.0.1".to_string(),
             openclaw_gateway_public_host: "127.0.0.1".to_string(),
+            openclaw_gateway_public_ws_url: None,
+            openclaw_gateway_public_health_url: None,
             openclaw_gateway_port: 0,
             openclaw_gateway_token: String::new(),
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),
@@ -605,6 +779,22 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, FoundationEvent::TaskScheduled { .. })));
+        let completion_error = app
+            .set_task_status(&task.id, TaskStatus::Completed)
+            .expect_err("raw status update should not bypass completion evidence");
+        assert!(completion_error
+            .to_string()
+            .contains("cannot be marked completed through set_task_status"));
+        let guarded = app.task(&task.id)?.expect("task should still exist");
+        assert_eq!(guarded.status, TaskStatus::Active);
+        let failed = app
+            .record_failed_task_run(&task.id, 12, "missing execution evidence".to_string())?
+            .expect("task should still exist");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            failed.last_result.as_deref(),
+            Some("Error: missing execution evidence")
+        );
         Ok(())
     }
 
@@ -645,11 +835,14 @@ mod tests {
             omx_poll_interval_ms: 5_000,
             openclaw_gateway_bind_host: "127.0.0.1".to_string(),
             openclaw_gateway_public_host: "127.0.0.1".to_string(),
+            openclaw_gateway_public_ws_url: None,
+            openclaw_gateway_public_health_url: None,
             openclaw_gateway_port: 0,
             openclaw_gateway_token: String::new(),
             openclaw_gateway_execution_lane: crate::foundation::ExecutionLane::Host,
             slack_env_file: None,
             slack_poll_interval_ms: 500,
+            linear_legacy_enabled: false,
             linear_webhook_port: 0,
             linear_webhook_secret: String::new(),
             github_webhook_secret: String::new(),

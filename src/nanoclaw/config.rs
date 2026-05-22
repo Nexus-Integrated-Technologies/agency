@@ -40,11 +40,14 @@ pub struct NanoclawConfig {
     pub omx_poll_interval_ms: u64,
     pub openclaw_gateway_bind_host: String,
     pub openclaw_gateway_public_host: String,
+    pub openclaw_gateway_public_ws_url: Option<String>,
+    pub openclaw_gateway_public_health_url: Option<String>,
     pub openclaw_gateway_port: u16,
     pub openclaw_gateway_token: String,
     pub openclaw_gateway_execution_lane: ExecutionLane,
     pub slack_env_file: Option<PathBuf>,
     pub slack_poll_interval_ms: u64,
+    pub linear_legacy_enabled: bool,
     pub linear_webhook_port: u16,
     pub linear_webhook_secret: String,
     pub github_webhook_secret: String,
@@ -166,6 +169,15 @@ impl NanoclawConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| droplet_ssh_host.clone());
+        let openclaw_gateway_public_ws_url = env::var("NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_WS_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let openclaw_gateway_public_health_url =
+            env::var("NANOCLAW_OPENCLAW_GATEWAY_PUBLIC_HEALTH_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
         let openclaw_gateway_port = env::var("NANOCLAW_OPENCLAW_GATEWAY_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -194,6 +206,7 @@ impl NanoclawConfig {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value >= 100)
             .unwrap_or(500);
+        let linear_legacy_enabled = env_bool("NANOCLAW_LINEAR_LEGACY_ENABLED").unwrap_or(false);
         let linear_webhook_port = env::var("LINEAR_WEBHOOK_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -352,11 +365,14 @@ impl NanoclawConfig {
             omx_poll_interval_ms,
             openclaw_gateway_bind_host,
             openclaw_gateway_public_host,
+            openclaw_gateway_public_ws_url,
+            openclaw_gateway_public_health_url,
             openclaw_gateway_port,
             openclaw_gateway_token,
             openclaw_gateway_execution_lane,
             slack_env_file,
             slack_poll_interval_ms,
+            linear_legacy_enabled,
             linear_webhook_port,
             linear_webhook_secret,
             github_webhook_secret,
@@ -385,6 +401,9 @@ impl NanoclawConfig {
     }
 
     pub fn openclaw_gateway_public_ws_url(&self) -> Option<String> {
+        if self.openclaw_gateway_public_ws_url.is_some() {
+            return self.openclaw_gateway_public_ws_url.clone();
+        }
         if self.openclaw_gateway_port == 0 || self.openclaw_gateway_public_host.trim().is_empty() {
             return None;
         }
@@ -395,6 +414,9 @@ impl NanoclawConfig {
     }
 
     pub fn openclaw_gateway_public_health_url(&self) -> Option<String> {
+        if self.openclaw_gateway_public_health_url.is_some() {
+            return self.openclaw_gateway_public_health_url.clone();
+        }
         if self.openclaw_gateway_port == 0 || self.openclaw_gateway_public_host.trim().is_empty() {
             return None;
         }
@@ -403,4 +425,19 @@ impl NanoclawConfig {
             self.openclaw_gateway_public_host, self.openclaw_gateway_port
         ))
     }
+
+    pub fn tool_adapter_manifest_path(&self) -> PathBuf {
+        env::var("NANOCLAW_TOOL_ADAPTERS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.project_root.join("tool-adapters.json"))
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name)
+        .ok()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            _ => false,
+        })
 }

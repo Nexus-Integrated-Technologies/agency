@@ -45,11 +45,10 @@ const EMAIL_REQUEST_DETECTION_PATTERNS: &[&str] = &[
     r"\bemail\b",
     r"\bgmail\b",
     r"\binbox\b",
-    r"\breply\b",
-    r"\bdraft\b",
-    r"\bforward\b",
     r"\bmailbox\b",
     r"\boutbox\b",
+    r"\b(?:reply|respond|draft|write|compose|forward|send)\b[^\n.!?]{0,80}\b(?:email|gmail|mail|mailbox|inbox|message|thread)\b",
+    r"\b(?:email|gmail|mail|mailbox|inbox|message|thread)\b[^\n.!?]{0,80}\b(?:reply|respond|draft|write|compose|forward|send)\b",
     r"\bsend\b.+\bemail\b",
     r"\bmessage\b.+\bemail\b",
     r"\bimap\b",
@@ -199,6 +198,21 @@ mod tests {
             &RequestPlane::Web,
         );
         assert!(error.unwrap().contains("web-scoped"));
+    }
+
+    #[test]
+    fn allows_non_email_reply_and_draft_language_in_web_plane() {
+        let smoke_error = get_request_plane_text_error(
+            "Azure authentication smoke test. Reply exactly: OK.",
+            &RequestPlane::Web,
+        );
+        assert!(smoke_error.is_none());
+
+        let release_notes_error = get_request_plane_text_error(
+            "Draft weekly release notes from merged PRs.",
+            &RequestPlane::Web,
+        );
+        assert!(release_notes_error.is_none());
     }
 
     #[test]

@@ -16,6 +16,10 @@ pub enum WorkerBackend {
     Summary,
     Codex,
     Claude,
+    Zai,
+    AzureOpenAI,
+    FoundryMaaS,
+    GithubCopilot,
     WorkersAI,
     Custom(String),
 }
@@ -26,6 +30,23 @@ impl WorkerBackend {
             "" | "summary" => Self::Summary,
             "codex" => Self::Codex,
             "claude" => Self::Claude,
+            "zai" | "z-ai" | "glm" | "zhipu" => Self::Zai,
+            "azure" | "azure-openai" | "azure_openai" | "azureopenai" | "azure-ai" | "azure_ai"
+            | "azure-foundry" | "azure_foundry" => Self::AzureOpenAI,
+            "foundry"
+            | "foundry-maas"
+            | "foundry_maas"
+            | "azure-maas"
+            | "azure_maas"
+            | "azure-model-inference"
+            | "azure_model_inference"
+            | "azure-ai-model-inference"
+            | "azure_ai_model_inference"
+            | "azure-foundry-maas"
+            | "azure_foundry_maas" => Self::FoundryMaaS,
+            "github-copilot" | "github_copilot" | "copilot" | "copilot-cloud-agent" => {
+                Self::GithubCopilot
+            }
             "workers-ai" | "workers_ai" | "workersai" => Self::WorkersAI,
             other => Self::Custom(other.to_string()),
         }
@@ -36,6 +57,10 @@ impl WorkerBackend {
             Self::Summary => "summary",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Zai => "zai",
+            Self::AzureOpenAI => "azure-openai",
+            Self::FoundryMaaS => "foundry-maas",
+            Self::GithubCopilot => "github-copilot",
             Self::WorkersAI => "workers-ai",
             Self::Custom(value) => value.as_str(),
         }
@@ -44,8 +69,13 @@ impl WorkerBackend {
     pub fn project_runtime(&self) -> Option<ProjectRuntime> {
         match self {
             Self::Codex => Some(ProjectRuntime::Codex),
-            Self::Claude => Some(ProjectRuntime::Claude),
-            Self::WorkersAI | Self::Summary | Self::Custom(_) => None,
+            Self::Claude | Self::Zai => Some(ProjectRuntime::Claude),
+            Self::AzureOpenAI
+            | Self::FoundryMaaS
+            | Self::GithubCopilot
+            | Self::WorkersAI
+            | Self::Summary
+            | Self::Custom(_) => None,
         }
     }
 }
@@ -147,6 +177,24 @@ mod tests {
     fn parses_worker_backends() {
         assert_eq!(WorkerBackend::parse("codex"), WorkerBackend::Codex);
         assert_eq!(WorkerBackend::parse("claude"), WorkerBackend::Claude);
+        assert_eq!(WorkerBackend::parse("zai"), WorkerBackend::Zai);
+        assert_eq!(
+            WorkerBackend::parse("azure-openai"),
+            WorkerBackend::AzureOpenAI
+        );
+        assert_eq!(
+            WorkerBackend::parse("azure_foundry"),
+            WorkerBackend::AzureOpenAI
+        );
+        assert_eq!(
+            WorkerBackend::parse("foundry-maas"),
+            WorkerBackend::FoundryMaaS
+        );
+        assert_eq!(
+            WorkerBackend::parse("azure_model_inference"),
+            WorkerBackend::FoundryMaaS
+        );
+        assert_eq!(WorkerBackend::FoundryMaaS.as_str(), "foundry-maas");
         assert_eq!(WorkerBackend::parse("workers-ai"), WorkerBackend::WorkersAI);
         assert_eq!(WorkerBackend::parse(""), WorkerBackend::Summary);
     }

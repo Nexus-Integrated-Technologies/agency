@@ -1,45 +1,57 @@
-# Contributing to Agency
+# Contributing to the Nexus Rust NanoClaw Runtime
 
-Thank you for your interest in contributing to **agency**! We welcome contributions from everyone. By participating in this project, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md) (if applicable) and the terms of our [CLA](../CLA.md).
+Thank you for contributing. This repository is in an active collapse from the
+older Agency harness toward the Nexus Rust NanoClaw runtime.
 
-## 📋 Legal Requirement
+## Legal Requirement
 
-**All contributors must sign the Contributor License Agreement (CLA).**
-When you open a Pull Request, a bot will check if you have signed. If not, you will need to post a comment saying:
-> "I have read and agree to the CLA"
+All contributors must sign the Contributor License Agreement. When you open a
+pull request, the CLA check may require you to post:
 
-## 🛠 Development Setup
-
-This project uses **Rust**. Ensure you have the latest stable toolchain installed.
-
-1.  **Fork and Clone** the repository.
-2.  **Install Dependencies & Setup**:
-    ```bash
-    make setup
-    ```
-    This command builds the project and sets up necessary ONNX runtimes.
-
-## 🧪 Running Tests
-
-We prioritize quality and stability. Please run the full test suite before submitting:
-
-```bash
-make test
+```text
+I have read and agree to the CLA
 ```
 
-This runs:
-- Comprehensive Feature Tests
-- Architecture Tests
-- Unit Tests
+## Development Setup
 
-## 🚀 Pull Request Process
+Install the stable Rust toolchain, then use the active runtime gates:
 
-1.  Create a new branch for your feature (`git checkout -b feature/amazing-feature`).
-2.  Commit your changes (`git commit -m 'feat: add amazing feature'`).
-3.  Push to the branch (`git push origin feature/amazing-feature`).
-4.  Open a Pull Request.
-5.  **Ensure all CI checks pass**, including the CLA check.
+```bash
+cargo check --all-targets
+cargo test --all-targets
+cargo run --quiet --bin nanoclaw -- show-config
+git diff --check
+```
 
-## 🐛 Reporting Bugs
+Or run:
 
-Please use the [Bug Report Template](../.github/ISSUE_TEMPLATE/bug_report.md) when reporting issues. Include logs, reproduction steps, and environment details.
+```bash
+make verify
+```
+
+## Runtime Scope
+
+The active runtime is:
+
+- `src/foundation/`
+- `src/nanoclaw/`
+- `src/bin/nanoclaw.rs`
+
+Parked Agency harness code under `graveyard/agency-harness/` is reference
+material only. Do not make the old Agency binaries, integration tests, or
+microservice launcher active again unless the useful behavior has been
+clean-roomed into a smaller NanoClaw contract.
+
+## Pull Request Process
+
+1. Create a branch.
+2. Keep changes narrow and traceable.
+3. Update the capability adoption ledger when moving or reintroducing old
+   Agency concepts.
+4. Run `make verify`.
+5. Include validation evidence in the PR description.
+
+## Reporting Bugs
+
+Use the bug report template and include concrete reproduction steps, logs, the
+branch/commit, and the validation command that failed.

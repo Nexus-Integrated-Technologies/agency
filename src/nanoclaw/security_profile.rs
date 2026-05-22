@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::foundation::{
-    CapabilityManifest, CapabilityManifestPolicy, ExecutionLocation, ExecutionProvenanceRecord,
-    ExecutionRunKind, ExecutionStatus, ExecutionSyncScope, ExecutionTrustLevel, RequestPlane,
+    AssuranceTuple, BoundaryClaim, CapabilityManifest, CapabilityManifestPolicy, ExecutionLocation,
+    ExecutionProvenanceRecord, ExecutionRunKind, ExecutionStatus, ExecutionSyncScope,
+    ExecutionTrustLevel, GateEvaluation, ProvenanceEdge, RequestPlane, SymbolCarrier,
+    TaskSignature,
 };
 
 pub const CAPABILITY_MANIFEST_ENV_KEY: &str = "NANOCLAW_CAPABILITY_MANIFEST";
@@ -31,6 +33,12 @@ pub struct BuildExecutionProvenanceInput {
     pub secret_handles_used: Vec<String>,
     pub fallback_reason: Option<String>,
     pub sync_scope: Option<ExecutionSyncScope>,
+    pub task_signature: Option<TaskSignature>,
+    pub boundary_claims: Vec<BoundaryClaim>,
+    pub gate_evaluation: Option<GateEvaluation>,
+    pub assurance: Option<AssuranceTuple>,
+    pub symbol_carriers: Vec<SymbolCarrier>,
+    pub provenance_edges: Vec<ProvenanceEdge>,
     pub status: ExecutionStatus,
     pub created_at: String,
     pub updated_at: String,
@@ -115,6 +123,16 @@ pub fn build_execution_provenance_record(
         secret_handles_used: dedupe_sort(input.secret_handles_used),
         fallback_reason: input.fallback_reason,
         sync_scope: input.sync_scope,
+        gate_decision: input
+            .gate_evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.decision),
+        task_signature: input.task_signature,
+        boundary_claims: input.boundary_claims,
+        gate_evaluation: input.gate_evaluation,
+        assurance: input.assurance,
+        symbol_carriers: input.symbol_carriers,
+        provenance_edges: input.provenance_edges,
         status: input.status,
         created_at: input.created_at,
         updated_at: input.updated_at,
@@ -216,6 +234,12 @@ mod tests {
             secret_handles_used: vec!["env-key:OPENAI_API_KEY".to_string()],
             fallback_reason: None,
             sync_scope: None,
+            task_signature: None,
+            boundary_claims: Vec::new(),
+            gate_evaluation: None,
+            assurance: None,
+            symbol_carriers: Vec::new(),
+            provenance_edges: Vec::new(),
             status: ExecutionStatus::Started,
             created_at: "2026-04-06T00:00:00Z".to_string(),
             updated_at: "2026-04-06T00:00:00Z".to_string(),

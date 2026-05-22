@@ -123,6 +123,17 @@ pub fn handle_github_webhook(
     payload: &GithubWebhookPayload,
     event_type: &str,
 ) -> GithubWebhookResult {
+    if !config.linear_legacy_enabled {
+        return GithubWebhookResult {
+            ok: true,
+            ignored: true,
+            reason: Some("linear-integration-discontinued".to_string()),
+            handled_identifiers: Vec::new(),
+            notifications: Vec::new(),
+            errors: Vec::new(),
+        };
+    }
+
     let directives = build_github_sync_directives(event_type, payload);
     if directives.is_empty() {
         return GithubWebhookResult {
