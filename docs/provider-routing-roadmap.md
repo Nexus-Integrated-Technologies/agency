@@ -10,7 +10,10 @@ remain inspectable.
 ## Current Live Posture
 
 - Primary gateway backend: `azure-openai`
-- Azure deployment: `nanoclaw-gpt-4-1-mini`
+- Azure deployment: currently `nanoclaw-gpt-4-1-mini`; Foundry deployments such
+  as `DeepSeek-V3.1`, `DeepSeek-R1-0528`, Mistral, Grok, Llama, or Model Router
+  can be selected by changing the deployment/model env without bypassing the
+  gateway.
 - Azure fallback backend: `codex`
 - Codex usage-limit fallback: `azure-openai`, configurable with
   `NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND`
@@ -48,6 +51,20 @@ NANOCLAW_AZURE_OPENAI_FALLBACK_BACKEND=codex
 NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND=azure-openai
 ```
 
+Foundry `AIServices` resources are supported through either endpoint shape:
+
+```text
+# Deployment-scoped OpenAI-compatible route, including non-OpenAI Foundry deployments
+NANOCLAW_AZURE_OPENAI_ENDPOINT=https://<resource>.services.ai.azure.com
+NANOCLAW_AZURE_OPENAI_DEPLOYMENT=<deployment-name>
+NANOCLAW_AZURE_OPENAI_API_VERSION=2024-10-21
+
+# Direct Foundry Models route
+NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/models
+NANOCLAW_AZURE_AI_FOUNDRY_MODEL=<deployment-or-model-name>
+NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION=2024-05-01-preview
+```
+
 Per-run gateway hints can override provider routing without changing the
 container:
 
@@ -80,6 +97,41 @@ Supported Azure fallback values now include:
 - `disabled`
 
 Use `workers-ai` only when the Workers AI policy and spend brakes allow it.
+
+## Cost-Aware Model Tiers
+
+Use Azure Foundry as the primary biller, but do not use one model for every
+task:
+
+- Deterministic platform events: no model call.
+- Lightweight advisory, routine summaries, and low-risk planning:
+  `gpt-4.1-nano`, Phi-4 mini, Mistral Small, or a small DeepSeek distill
+  deployment.
+- Normal planning and operator analysis: `DeepSeek-V3.1`, `gpt-4.1-mini`, or
+  Model Router when its routing/cost behavior is acceptable.
+- Hard reasoning, remediation design, or multi-step debugging:
+  `DeepSeek-R1-0528`, `MAI-DS-R1`, Grok reasoning, or a current GPT reasoning
+  deployment.
+- Highest-risk code execution and contract-sensitive remediation:
+  reserve GPT Codex/frontier deployments for escalation or fallback, not as the
+  default heartbeat lane.
+
+For non-default Foundry deployments, set a rate card so Paperclip can estimate
+cost at the control-plane level:
+
+```json
+NANOCLAW_AZURE_AI_FOUNDRY_RATE_CARD_JSON={
+  "DeepSeek-V3.1": {
+    "input_usd_per_1m": 0.27,
+    "cached_input_usd_per_1m": 0.07,
+    "output_usd_per_1m": 1.10
+  }
+}
+```
+
+Use the actual Azure pricing shown for the deployed model/region. The gateway
+uses this only for estimates; Azure Cost Management remains the financial
+source of truth.
 
 ## Roadmap
 

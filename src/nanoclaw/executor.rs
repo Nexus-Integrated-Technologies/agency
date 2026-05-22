@@ -3185,6 +3185,10 @@ fn run_azure_openai_request(
         &[
             "AZURE_OPENAI_API_KEY",
             "NANOCLAW_AZURE_OPENAI_API_KEY",
+            "AZURE_AI_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_KEY",
+            "AZURE_FOUNDRY_API_KEY",
+            "NANOCLAW_AZURE_FOUNDRY_API_KEY",
             "AZURE_AI_API_KEY",
             "NANOCLAW_AZURE_AI_API_KEY",
         ],
@@ -3205,8 +3209,16 @@ fn run_azure_openai_request(
         &[
             "AZURE_OPENAI_ENDPOINT",
             "NANOCLAW_AZURE_OPENAI_ENDPOINT",
+            "AZURE_AI_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_ENDPOINT",
+            "AZURE_FOUNDRY_ENDPOINT",
+            "NANOCLAW_AZURE_FOUNDRY_ENDPOINT",
             "AZURE_OPENAI_BASE_URL",
             "NANOCLAW_AZURE_OPENAI_BASE_URL",
+            "AZURE_AI_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_AI_FOUNDRY_BASE_URL",
+            "AZURE_FOUNDRY_BASE_URL",
+            "NANOCLAW_AZURE_FOUNDRY_BASE_URL",
         ],
     )
     .context("Azure OpenAI backend requires AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_BASE_URL")?;
@@ -3215,10 +3227,20 @@ fn run_azure_openai_request(
         &[
             "AZURE_OPENAI_DEPLOYMENT",
             "NANOCLAW_AZURE_OPENAI_DEPLOYMENT",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT",
+            "AZURE_FOUNDRY_DEPLOYMENT",
+            "NANOCLAW_AZURE_FOUNDRY_DEPLOYMENT",
             "AZURE_OPENAI_MODEL",
             "NANOCLAW_AZURE_OPENAI_MODEL",
+            "AZURE_AI_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_AI_FOUNDRY_MODEL",
+            "AZURE_FOUNDRY_MODEL",
+            "NANOCLAW_AZURE_FOUNDRY_MODEL",
             "AZURE_OPENAI_DEPLOYMENT_NAME",
             "NANOCLAW_AZURE_OPENAI_DEPLOYMENT_NAME",
+            "AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
+            "NANOCLAW_AZURE_AI_FOUNDRY_DEPLOYMENT_NAME",
         ],
     )
     .context("Azure OpenAI backend requires AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_MODEL")?;
@@ -3227,6 +3249,10 @@ fn run_azure_openai_request(
         &[
             "AZURE_OPENAI_API_VERSION",
             "NANOCLAW_AZURE_OPENAI_API_VERSION",
+            "AZURE_AI_FOUNDRY_API_VERSION",
+            "NANOCLAW_AZURE_AI_FOUNDRY_API_VERSION",
+            "AZURE_FOUNDRY_API_VERSION",
+            "NANOCLAW_AZURE_FOUNDRY_API_VERSION",
         ],
     )
     .unwrap_or_else(|| "2024-10-21".to_string());
@@ -3329,9 +3355,13 @@ fn run_azure_openai_request(
     }
 
     let usage = parse_azure_openai_usage(&result);
-    let cost_usd = usage
-        .as_ref()
-        .and_then(|usage| estimate_azure_openai_cost_usd(&deployment, usage));
+    let cost_usd = usage.as_ref().and_then(|usage| {
+        estimate_azure_openai_cost_usd_with_config(
+            &deployment,
+            usage,
+            read_azure_openai_cost_config(),
+        )
+    });
     let capability_manifest = derive_capability_manifest(
         &request.request_plane,
         DeriveCapabilityManifestInput::default(),
@@ -3398,6 +3428,20 @@ fn build_azure_openai_chat_target(
     let path = parsed.path().trim_end_matches('/').to_string();
 
     if path.ends_with("/chat/completions") {
+        append_api_version_if_missing(&mut parsed, api_version);
+        return Ok(AzureOpenAIChatTarget {
+            url: parsed.to_string(),
+            include_model: true,
+        });
+    }
+
+    if path.ends_with("/models") || path.contains("/models/") {
+        let prefix = match path.find("/models") {
+            Some(index) => &path[..index + "/models".len()],
+            None => path.as_str(),
+        };
+        parsed.set_path(&format!("{prefix}/chat/completions"));
+        append_api_version_if_missing(&mut parsed, api_version);
         return Ok(AzureOpenAIChatTarget {
             url: parsed.to_string(),
             include_model: true,
@@ -3439,6 +3483,19 @@ fn build_azure_openai_chat_target(
         url: parsed.to_string(),
         include_model: false,
     })
+}
+
+fn append_api_version_if_missing(parsed: &mut reqwest::Url, api_version: &str) {
+    let api_version = api_version.trim();
+    if api_version.is_empty() {
+        return;
+    }
+    if parsed.query_pairs().any(|(key, _)| key == "api-version") {
+        return;
+    }
+    parsed
+        .query_pairs_mut()
+        .append_pair("api-version", api_version);
 }
 
 fn extract_azure_openai_text(result: &Value) -> Option<String> {
@@ -3490,11 +3547,12 @@ const DEFAULT_AZURE_OPENAI_GPT_4_1_MINI_RATES: AzureOpenAICostRates = AzureOpenA
     output_usd_per_1m: 1.76,
 };
 
-fn estimate_azure_openai_cost_usd(
+fn estimate_azure_openai_cost_usd_with_config(
     deployment_or_model: &str,
     usage: &ExecutionUsageSummary,
+    config: AzureOpenAICostConfig,
 ) -> Option<f64> {
-    let rates = resolve_azure_openai_cost_rates(deployment_or_model)?;
+    let rates = resolve_azure_openai_cost_rates_with_config(deployment_or_model, config)?;
     Some(estimate_azure_openai_cost_usd_with_rates(usage, rates))
 }
 
@@ -3521,22 +3579,44 @@ fn estimate_azure_openai_cost_usd_with_rates(
     round_cost_usd(cost)
 }
 
-fn resolve_azure_openai_cost_rates(deployment_or_model: &str) -> Option<AzureOpenAICostRates> {
-    resolve_azure_openai_cost_rates_with_overrides(
-        deployment_or_model,
-        read_azure_openai_cost_rate_overrides(),
-    )
-}
-
+#[cfg(test)]
 fn resolve_azure_openai_cost_rates_with_overrides(
     deployment_or_model: &str,
     override_rates: AzureOpenAICostRateOverrides,
 ) -> Option<AzureOpenAICostRates> {
+    resolve_azure_openai_cost_rates_with_config(
+        deployment_or_model,
+        AzureOpenAICostConfig {
+            overrides: override_rates,
+            rate_card: BTreeMap::new(),
+        },
+    )
+}
+
+fn resolve_azure_openai_cost_rates_with_config(
+    deployment_or_model: &str,
+    config: AzureOpenAICostConfig,
+) -> Option<AzureOpenAICostRates> {
+    let AzureOpenAICostConfig {
+        overrides: override_rates,
+        rate_card,
+    } = config;
     if override_rates.is_complete() {
         return override_rates.into_rates();
     }
 
     let normalized = normalize_azure_openai_rate_model_name(deployment_or_model);
+    if let Some(rates) = rate_card.get(&normalized).copied() {
+        return Some(override_rates.overlay(rates));
+    }
+    let compact_normalized = normalized.replace('.', "");
+    if let Some(rates) = rate_card
+        .iter()
+        .find_map(|(model, rates)| (model.replace('.', "") == compact_normalized).then_some(*rates))
+    {
+        return Some(override_rates.overlay(rates));
+    }
+
     if normalized.contains("gpt41mini")
         || normalized.contains("gpt4.1mini")
         || normalized.contains("gpt4-1mini")
@@ -3561,6 +3641,12 @@ struct AzureOpenAICostRateOverrides {
     input_usd_per_1m: Option<f64>,
     cached_input_usd_per_1m: Option<f64>,
     output_usd_per_1m: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AzureOpenAICostConfig {
+    overrides: AzureOpenAICostRateOverrides,
+    rate_card: BTreeMap<String, AzureOpenAICostRates>,
 }
 
 impl AzureOpenAICostRateOverrides {
@@ -3604,6 +3690,73 @@ fn read_azure_openai_cost_rate_overrides() -> AzureOpenAICostRateOverrides {
             "AZURE_OPENAI_OUTPUT_USD_PER_1M",
         ]),
     }
+}
+
+fn read_azure_openai_cost_config() -> AzureOpenAICostConfig {
+    AzureOpenAICostConfig {
+        overrides: read_azure_openai_cost_rate_overrides(),
+        rate_card: read_azure_openai_cost_rate_card(),
+    }
+}
+
+fn read_azure_openai_cost_rate_card() -> BTreeMap<String, AzureOpenAICostRates> {
+    let Some(raw) = [
+        "NANOCLAW_AZURE_OPENAI_RATE_CARD_JSON",
+        "AZURE_OPENAI_RATE_CARD_JSON",
+        "NANOCLAW_AZURE_AI_FOUNDRY_RATE_CARD_JSON",
+        "AZURE_AI_FOUNDRY_RATE_CARD_JSON",
+        "NANOCLAW_AZURE_FOUNDRY_RATE_CARD_JSON",
+        "AZURE_FOUNDRY_RATE_CARD_JSON",
+    ]
+    .iter()
+    .find_map(|key| non_empty_env(key))
+    else {
+        return BTreeMap::new();
+    };
+
+    parse_azure_openai_cost_rate_card(&raw)
+}
+
+fn parse_azure_openai_cost_rate_card(raw: &str) -> BTreeMap<String, AzureOpenAICostRates> {
+    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(raw) else {
+        return BTreeMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|(model, value)| {
+            parse_azure_openai_rate_card_entry(&value)
+                .map(|rates| (normalize_azure_openai_rate_model_name(&model), rates))
+        })
+        .collect()
+}
+
+fn parse_azure_openai_rate_card_entry(value: &Value) -> Option<AzureOpenAICostRates> {
+    let object = value.as_object()?;
+    let input_usd_per_1m = parse_json_f64_field(
+        object
+            .get("input_usd_per_1m")
+            .or_else(|| object.get("inputUsdPer1M"))
+            .or_else(|| object.get("input")),
+    )?;
+    let cached_input_usd_per_1m = parse_json_f64_field(
+        object
+            .get("cached_input_usd_per_1m")
+            .or_else(|| object.get("cachedInputUsdPer1M"))
+            .or_else(|| object.get("cached_input"))
+            .or_else(|| object.get("cachedInput")),
+    )
+    .unwrap_or(input_usd_per_1m);
+    let output_usd_per_1m = parse_json_f64_field(
+        object
+            .get("output_usd_per_1m")
+            .or_else(|| object.get("outputUsdPer1M"))
+            .or_else(|| object.get("output")),
+    )?;
+    Some(AzureOpenAICostRates {
+        input_usd_per_1m,
+        cached_input_usd_per_1m,
+        output_usd_per_1m,
+    })
 }
 
 fn parse_rate_env(keys: &[&str]) -> Option<f64> {
@@ -5326,21 +5479,24 @@ mod tests {
         build_worker_process_failure_response, build_worker_transport_failure_response,
         collect_git_evidence, connect_to_worker_socket, decode_worker_outcome_with_context,
         default_codex_sandbox_for_request, detect_paperclip_control_plane_blocker,
+        estimate_azure_openai_cost_usd_with_config,
         estimate_azure_openai_cost_usd_with_overrides, execute_worker_request,
         extract_azure_openai_text, is_codex_usage_limit_error,
         normalize_azure_openai_fallback_backend, normalize_azure_openai_rate_model_name,
         normalize_branch_name, normalize_github_repo_ref, parse_azure_openai_usage,
-        parse_codex_jsonl, parse_git_log_refs, parse_git_status_porcelain, read_json,
-        resolve_container_image, run_worker_command, run_worker_daemon_with_idle_timeout,
-        run_worker_from_paths, should_use_container_lane, should_use_remote_lane,
+        parse_azure_openai_cost_rate_card, parse_codex_jsonl, parse_git_log_refs,
+        parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
+        run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
+        should_use_remote_lane,
         validate_execution_response_evidence, wait_for_worker_socket, write_json,
-        AzureOpenAICostRateOverrides, BackendExecutionMetadata, BackendExecutionResult,
-        BuildExecutionEvidenceInput, ContainerExecutor, DigitalOceanDevEnvironment,
-        ExecutionArtifactRef, ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionLaneRouter,
-        ExecutionMetadata, ExecutionRequest, ExecutionResponse, ExecutionSession,
-        ExecutionUsageSummary, ExecutionVerificationRef, ExecutorBoundary, GithubCopilotTaskConfig,
-        InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor, RustSubprocessExecutor,
-        WorkerOutcome, WorkerRequest, WorkerResponse, EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        AzureOpenAICostConfig, AzureOpenAICostRateOverrides, BackendExecutionMetadata,
+        BackendExecutionResult, BuildExecutionEvidenceInput, ContainerExecutor,
+        DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
+        ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
+        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutionVerificationRef,
+        ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor,
+        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest,
+        WorkerResponse, EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
 
     #[test]
@@ -5651,6 +5807,38 @@ mod tests {
     }
 
     #[test]
+    fn builds_azure_foundry_models_chat_target() {
+        let target = build_azure_openai_chat_target(
+            "https://example.services.ai.azure.com/models",
+            "DeepSeek-V3.1",
+            "2024-05-01-preview",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
+    fn preserves_existing_azure_foundry_models_api_version() {
+        let target = build_azure_openai_chat_target(
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview",
+            "DeepSeek-V3.1",
+            "2024-10-21",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.url,
+            "https://example.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert!(target.include_model);
+    }
+
+    #[test]
     fn parses_azure_openai_text_and_usage() {
         let payload = serde_json::json!({
             "choices": [
@@ -5700,6 +5888,36 @@ mod tests {
                 AzureOpenAICostRateOverrides::default()
             ),
             Some(0.001287)
+        );
+    }
+
+    #[test]
+    fn estimates_azure_cost_from_foundry_rate_card() {
+        let usage = ExecutionUsageSummary {
+            input_tokens: 1_000,
+            cached_input_tokens: 100,
+            output_tokens: 500,
+        };
+        let rate_card = parse_azure_openai_cost_rate_card(
+            r#"{
+                "DeepSeek-V3.1": {
+                    "input_usd_per_1m": 0.27,
+                    "cached_input_usd_per_1m": 0.07,
+                    "output_usd_per_1m": 1.10
+                }
+            }"#,
+        );
+
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_config(
+                "deepseek-v3-1",
+                &usage,
+                AzureOpenAICostConfig {
+                    overrides: AzureOpenAICostRateOverrides::default(),
+                    rate_card,
+                }
+            ),
+            Some(0.0008)
         );
     }
 
