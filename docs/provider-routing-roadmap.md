@@ -137,6 +137,146 @@ Use the actual Azure pricing shown for the deployed model/region. The gateway
 uses this only for estimates; Azure Cost Management remains the financial
 source of truth.
 
+## Service01 Model Matrix
+
+This matrix is the intended service01 routing posture. It keeps inference
+cheap by default, escalates only from evidence, and keeps every provider call
+inside the OpenClaw/OMX/Nexus run contract.
+
+Matrix rules:
+
+- Prefer deterministic logic over inference when a rule, fingerprint, cache
+  hit, budget gate, queue state, or run-state transition is enough.
+- Every paid call must emit run id, agent, task kind, backend, provider,
+  biller, model/deployment, usage, estimated cost, and fallback reason when
+  present.
+- Azure Foundry is the primary biller for inference while credits are active.
+- Codex remains the backup for code-capable execution and local tool use.
+- ZAI may be used as an explicit role fallback through gateway hints, not as a
+  side channel around OpenClaw or OMX.
+- Workers AI is not part of automatic execution unless its own policy is
+  explicitly re-enabled.
+
+### Deployment Slots
+
+Create deployment names as stable slots. The deployment can point to a newer
+model later without changing Paperclip issue/routine policy.
+
+| Slot | Default candidate | Purpose | Cost posture |
+| --- | --- | --- | --- |
+| `service01-zero-call` | no model | Rules, dedupe, budget checks, cache hits, known-remediation matching | free |
+| `service01-foundry-tiny` | Phi-4 mini, Mistral Small, GPT-4.1 nano, or small DeepSeek distill | short summaries, labels, routing explanations, low-risk advisory | cheapest paid lane |
+| `service01-foundry-planner` | DeepSeek-V3.1 or DeepSeek-V3.2 after price smoke | normal planning, operator analysis, issue shaping, medium synthesis | default paid lane |
+| `service01-foundry-reasoner` | DeepSeek-R1-0528 or MAI-DS-R1 | hard reasoning, root-cause design, ambiguous remediation strategy | capped escalation |
+| `service01-foundry-coder` | current Codex/frontier coding deployment if available in Azure, otherwise Codex backend | contract-sensitive code reasoning before tool execution | escalation only |
+| `service01-foundry-reviewer` | planner or reasoner slot depending on risk | PR/rubric review, evidence checking, security-sensitive review | bounded by review cap |
+| `service01-foundry-vision` | GPT-4o-mini vision, Llama vision, or equivalent deployed vision model | screenshots, UI diffs, visual QA | explicit use only |
+| `service01-foundry-safety` | deterministic policy first, Llama Guard or Azure safety model only when needed | safety/classification guardrail | blocked from code completion |
+
+Do not point routine heartbeats, retry wakes, incident dedupe, or known
+remediation matching at a paid model. Those use `service01-zero-call`.
+
+### Agent Role Matrix
+
+| Role | Default lane | Primary model slot | Escalation slot | Execution policy |
+| --- | --- | --- | --- | --- |
+| CEO/default executive | OMX/OpenClaw, advisory unless issue requires action | `service01-foundry-planner` | `service01-foundry-reasoner` | Does not mutate repos by default; can assign, prioritize, and ask for evidence. |
+| CTO | OMX/OpenClaw code-capable | `service01-foundry-planner` | `service01-foundry-coder` then Codex backend | May execute code only through gateway/OMX and must return execution evidence. |
+| COO | OMX/OpenClaw operations | `service01-foundry-tiny` or planner | `service01-foundry-reasoner` | Backlog, queue, scheduling, and run cleanup; no repo mutation unless assigned. |
+| CFO | deterministic ledger first | `service01-foundry-tiny` | `service01-foundry-reasoner` | Cost reports, anomaly triage, budget gates; model calls require spend context. |
+| CMO/content | local content-engine path first | `service01-foundry-tiny` | planner | Copy/content strategy only; content-engine mechanics remain deterministic/local. |
+| QA/verifier | tests and artifacts first | `service01-foundry-tiny` | reviewer | Cannot mark code work complete from prose; needs structured verification. |
+| Security/compliance | scanner/policy first | reviewer | reasoner or frontier coding slot | Human/operator gate for high-impact remediation or secret-sensitive action. |
+| Researcher | browser/source evidence first | planner | reasoner | Must cite source/evidence; use model for synthesis, not unsupported facts. |
+| Unknown/new agent | deterministic no-op or tiny | `service01-foundry-tiny` | CTO handoff | No code mutation until role policy is explicit. |
+
+### Task Matrix
+
+| Task kind | First path | Paid model slot | Escalation condition | Completion evidence |
+| --- | --- | --- | --- | --- |
+| `heartbeat_timer` with no issue/context | deterministic no-op/advisory | none | never | run status only |
+| retry wake with no new context | deterministic retry guard | none | repeated failure threshold creates/updates issue | blocker or dedupe record |
+| platform incident with known fingerprint | remediation registry | none | repeat threshold or critical severity wakes CTO | incident issue/comment |
+| platform incident unknown | deterministic issue creation | tiny only for operator summary when enabled | critical or repeated unknown fingerprint | incident issue plus raw record |
+| budget/cost anomaly | ledger query and caps | tiny | unexplained anomaly or threshold breach | ledger rows and cap decision |
+| auth/secret failure | deterministic env/health checks | none initially | missing route after verified env path | blocker with missing key name redacted |
+| code bug/remediation | OpenClaw/OMX workspace execution | planner for plan, coder/Codex for implementation | tests fail, contract unclear, or high-risk code | changed files, commits, tests, artifacts |
+| PR review | diff/tests first | reviewer | security/high-risk or ambiguous evidence | findings and test refs |
+| docs/operator docs | repo context first | tiny or planner | architectural ambiguity | changed docs and source refs |
+| buyer/client copy | audience policy first | tiny or planner | high-value brand/positioning work | final copy only, no operator mechanics |
+| research/current facts | source retrieval first | planner | conflicting sources or high-stakes conclusion | cited sources |
+| content-engine render/intake | local manifest/QA first | none for mechanics | caption/summary generation only | manifest, sidecars, render QA |
+| UI visual QA | browser/screenshot first | vision slot | visual ambiguity after deterministic checks | screenshot/diff artifact |
+
+### Scale Matrix
+
+| Scale class | Examples | Allowed slot | Notes |
+| --- | --- | --- | --- |
+| Logic | dedupe, caps, known incident, run state, route health | `service01-zero-call` | default whenever deterministic state is enough |
+| Tiny | short summaries, label normalization, operator note rewrite | `service01-foundry-tiny` | cache aggressively, low max tokens |
+| Standard | planning, medium synthesis, issue decomposition | `service01-foundry-planner` | default paid model for useful work |
+| Heavy | hard debugging, multi-file remediation strategy, security reasoning | `service01-foundry-reasoner` | requires issue context and budget headroom |
+| Execution | shell/code mutation, tests, commits, PR work | OpenClaw/OMX plus coder/Codex fallback | model output alone cannot complete the issue |
+
+### Fallback Matrix
+
+| Failure or limit | Next step | Hard stop |
+| --- | --- | --- |
+| deterministic route succeeds | do not call a model | any model call is a bug |
+| tiny slot unavailable | planner slot if task is still worth paid inference | otherwise create blocker |
+| planner slot unavailable | reasoner only for critical/repeated/high-value work | otherwise Codex/OpenClaw remains idle |
+| reasoner slot unavailable | Codex or ZAI through gateway hints for execution-compatible tasks | no provider side channel |
+| Codex usage limit | `NANOCLAW_CODEX_USAGE_FALLBACK_BACKEND`, preferably Azure while credits are active | missing fallback credentials fail explicitly |
+| Azure key/quota failure | Codex backend for code-capable work, ZAI if configured for that role | Workers AI is not implicit fallback |
+| repeated provider timeout | create/update platform incident and pause duplicate starts | do not fan out new swarms |
+| budget cap reached | block paid inference and write cost blocker | no override without operator action |
+
+### Initial Config Shape
+
+The current gateway already supports per-run `paperclip.gateway` hints. The
+next config-backed step is to store this matrix as operator policy and compile
+it into those hints.
+
+```json
+{
+  "defaultBiller": "azure",
+  "defaultBackend": "azure-openai",
+  "codexUsageFallbackBackend": "azure-openai",
+  "workersAiAutomaticFallback": false,
+  "slots": {
+    "zero": { "mode": "deterministic" },
+    "tiny": { "backend": "azure-openai", "deployment": "service01-foundry-tiny" },
+    "planner": { "backend": "azure-openai", "deployment": "service01-foundry-planner" },
+    "reasoner": { "backend": "azure-openai", "deployment": "service01-foundry-reasoner" },
+    "coder": { "backend": "codex", "azureDeployment": "service01-foundry-coder" },
+    "reviewer": { "backend": "azure-openai", "deployment": "service01-foundry-reviewer" },
+    "vision": { "backend": "azure-openai", "deployment": "service01-foundry-vision" },
+    "safety": { "backend": "azure-openai", "deployment": "service01-foundry-safety" }
+  },
+  "roles": {
+    "CEO": { "defaultSlot": "planner", "maxSlot": "reasoner", "canMutateCode": false },
+    "CTO": { "defaultSlot": "planner", "maxSlot": "coder", "canMutateCode": true },
+    "COO": { "defaultSlot": "tiny", "maxSlot": "reasoner", "canMutateCode": false },
+    "CFO": { "defaultSlot": "tiny", "maxSlot": "reasoner", "canMutateCode": false },
+    "CMO": { "defaultSlot": "tiny", "maxSlot": "planner", "canMutateCode": false },
+    "QA": { "defaultSlot": "tiny", "maxSlot": "reviewer", "canMutateCode": false },
+    "Security": { "defaultSlot": "reviewer", "maxSlot": "reasoner", "canMutateCode": false },
+    "Researcher": { "defaultSlot": "planner", "maxSlot": "reasoner", "canMutateCode": false }
+  }
+}
+```
+
+### Budget Defaults
+
+- Company daily paid-inference cap: `$5` until the model mix is proven.
+- Agent daily cap: `$2` for non-CTO roles; CTO can use the company cap when a
+  critical remediation is active.
+- Contextless timers and retries: `$0`.
+- Unknown incidents: first occurrence creates/updates an issue without paid
+  inference unless severity is critical.
+- Any run estimated above the configured per-run cap must either downshift the
+  slot, request approval, or stop with a cost blocker.
+
 ## Roadmap
 
 1. Keep Azure as the primary paid inference path for gateway execution.
