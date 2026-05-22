@@ -3329,12 +3329,15 @@ fn run_azure_openai_request(
     }
 
     let usage = parse_azure_openai_usage(&result);
+    let cost_usd = usage
+        .as_ref()
+        .and_then(|usage| estimate_azure_openai_cost_usd(&deployment, usage));
     let capability_manifest = derive_capability_manifest(
         &request.request_plane,
         DeriveCapabilityManifestInput::default(),
     );
     let log_body = format!(
-        "invocation_id={}\nsession_id={}\nworkspace={}\nbackend=azure-openai\nprovider=azure_openai\nbiller=azure\nbilling_type=azure_credits\nmodel={}\nfallback_reason={:?}\nendpoint={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\nrequest_plane={}\nresponse=\n{}\n",
+        "invocation_id={}\nsession_id={}\nworkspace={}\nbackend=azure-openai\nprovider=azure_openai\nbiller=azure\nbilling_type=credits\nmodel={}\nfallback_reason={:?}\nendpoint={}\ninput_tokens={}\ncached_input_tokens={}\noutput_tokens={}\ncost_usd={}\nrequest_plane={}\nresponse=\n{}\n",
         request.invocation_id,
         request.session.id,
         workspace_root.display(),
@@ -3346,6 +3349,9 @@ fn run_azure_openai_request(
             .map(|value| value.cached_input_tokens)
             .unwrap_or(0),
         usage.as_ref().map(|value| value.output_tokens).unwrap_or(0),
+        cost_usd
+            .map(|value| format!("{value:.8}"))
+            .unwrap_or_else(|| "-".to_string()),
         request.request_plane.as_str(),
         text
     );
@@ -3357,10 +3363,10 @@ fn run_azure_openai_request(
             backend: WorkerBackend::AzureOpenAI,
             provider: Some("azure_openai".to_string()),
             biller: Some("azure".to_string()),
-            billing_type: Some("azure_credits".to_string()),
+            billing_type: Some("credits".to_string()),
             model: Some(deployment),
             usage,
-            cost_usd: None,
+            cost_usd,
             effective_capabilities: capability_manifest,
             project_environment_id: resolved_backend
                 .project_environment
@@ -3469,6 +3475,145 @@ fn parse_azure_openai_usage(result: &Value) -> Option<ExecutionUsageSummary> {
         .unwrap_or_default(),
     };
     (!summary.is_empty()).then_some(summary)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AzureOpenAICostRates {
+    input_usd_per_1m: f64,
+    cached_input_usd_per_1m: f64,
+    output_usd_per_1m: f64,
+}
+
+const DEFAULT_AZURE_OPENAI_GPT_4_1_MINI_RATES: AzureOpenAICostRates = AzureOpenAICostRates {
+    input_usd_per_1m: 0.44,
+    cached_input_usd_per_1m: 0.11,
+    output_usd_per_1m: 1.76,
+};
+
+fn estimate_azure_openai_cost_usd(
+    deployment_or_model: &str,
+    usage: &ExecutionUsageSummary,
+) -> Option<f64> {
+    let rates = resolve_azure_openai_cost_rates(deployment_or_model)?;
+    Some(estimate_azure_openai_cost_usd_with_rates(usage, rates))
+}
+
+#[cfg(test)]
+fn estimate_azure_openai_cost_usd_with_overrides(
+    deployment_or_model: &str,
+    usage: &ExecutionUsageSummary,
+    override_rates: AzureOpenAICostRateOverrides,
+) -> Option<f64> {
+    let rates =
+        resolve_azure_openai_cost_rates_with_overrides(deployment_or_model, override_rates)?;
+    Some(estimate_azure_openai_cost_usd_with_rates(usage, rates))
+}
+
+fn estimate_azure_openai_cost_usd_with_rates(
+    usage: &ExecutionUsageSummary,
+    rates: AzureOpenAICostRates,
+) -> f64 {
+    let uncached_input_tokens = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+    let cost = ((uncached_input_tokens as f64) * rates.input_usd_per_1m
+        + (usage.cached_input_tokens as f64) * rates.cached_input_usd_per_1m
+        + (usage.output_tokens as f64) * rates.output_usd_per_1m)
+        / 1_000_000.0;
+    round_cost_usd(cost)
+}
+
+fn resolve_azure_openai_cost_rates(deployment_or_model: &str) -> Option<AzureOpenAICostRates> {
+    resolve_azure_openai_cost_rates_with_overrides(
+        deployment_or_model,
+        read_azure_openai_cost_rate_overrides(),
+    )
+}
+
+fn resolve_azure_openai_cost_rates_with_overrides(
+    deployment_or_model: &str,
+    override_rates: AzureOpenAICostRateOverrides,
+) -> Option<AzureOpenAICostRates> {
+    if override_rates.is_complete() {
+        return override_rates.into_rates();
+    }
+
+    let normalized = normalize_azure_openai_rate_model_name(deployment_or_model);
+    if normalized.contains("gpt41mini")
+        || normalized.contains("gpt4.1mini")
+        || normalized.contains("gpt4-1mini")
+    {
+        return Some(override_rates.overlay(DEFAULT_AZURE_OPENAI_GPT_4_1_MINI_RATES));
+    }
+
+    None
+}
+
+fn normalize_azure_openai_rate_model_name(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric() || *value == '.')
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AzureOpenAICostRateOverrides {
+    input_usd_per_1m: Option<f64>,
+    cached_input_usd_per_1m: Option<f64>,
+    output_usd_per_1m: Option<f64>,
+}
+
+impl AzureOpenAICostRateOverrides {
+    fn is_complete(&self) -> bool {
+        self.input_usd_per_1m.is_some()
+            && self.cached_input_usd_per_1m.is_some()
+            && self.output_usd_per_1m.is_some()
+    }
+
+    fn into_rates(self) -> Option<AzureOpenAICostRates> {
+        Some(AzureOpenAICostRates {
+            input_usd_per_1m: self.input_usd_per_1m?,
+            cached_input_usd_per_1m: self.cached_input_usd_per_1m?,
+            output_usd_per_1m: self.output_usd_per_1m?,
+        })
+    }
+
+    fn overlay(self, defaults: AzureOpenAICostRates) -> AzureOpenAICostRates {
+        AzureOpenAICostRates {
+            input_usd_per_1m: self.input_usd_per_1m.unwrap_or(defaults.input_usd_per_1m),
+            cached_input_usd_per_1m: self
+                .cached_input_usd_per_1m
+                .unwrap_or(defaults.cached_input_usd_per_1m),
+            output_usd_per_1m: self.output_usd_per_1m.unwrap_or(defaults.output_usd_per_1m),
+        }
+    }
+}
+
+fn read_azure_openai_cost_rate_overrides() -> AzureOpenAICostRateOverrides {
+    AzureOpenAICostRateOverrides {
+        input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_AZURE_OPENAI_INPUT_USD_PER_1M",
+            "AZURE_OPENAI_INPUT_USD_PER_1M",
+        ]),
+        cached_input_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_AZURE_OPENAI_CACHED_INPUT_USD_PER_1M",
+            "AZURE_OPENAI_CACHED_INPUT_USD_PER_1M",
+        ]),
+        output_usd_per_1m: parse_rate_env(&[
+            "NANOCLAW_AZURE_OPENAI_OUTPUT_USD_PER_1M",
+            "AZURE_OPENAI_OUTPUT_USD_PER_1M",
+        ]),
+    }
+}
+
+fn parse_rate_env(keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| non_empty_env(key).and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn round_cost_usd(value: f64) -> f64 {
+    (value * 100_000_000.0).round() / 100_000_000.0
 }
 
 fn redact_azure_openai_url(url: &str) -> String {
@@ -5181,19 +5326,21 @@ mod tests {
         build_worker_process_failure_response, build_worker_transport_failure_response,
         collect_git_evidence, connect_to_worker_socket, decode_worker_outcome_with_context,
         default_codex_sandbox_for_request, detect_paperclip_control_plane_blocker,
-        execute_worker_request, extract_azure_openai_text, is_codex_usage_limit_error,
-        normalize_azure_openai_fallback_backend, normalize_branch_name, normalize_github_repo_ref,
-        parse_azure_openai_usage, parse_codex_jsonl, parse_git_log_refs,
-        parse_git_status_porcelain, read_json, resolve_container_image, run_worker_command,
-        run_worker_daemon_with_idle_timeout, run_worker_from_paths, should_use_container_lane,
-        should_use_remote_lane, validate_execution_response_evidence, wait_for_worker_socket,
-        write_json, BackendExecutionMetadata, BackendExecutionResult, BuildExecutionEvidenceInput,
-        ContainerExecutor, DigitalOceanDevEnvironment, ExecutionArtifactRef, ExecutionEvidenceMode,
-        ExecutionEvidenceStatus, ExecutionLaneRouter, ExecutionMetadata, ExecutionRequest,
-        ExecutionResponse, ExecutionSession, ExecutionUsageSummary, ExecutionVerificationRef,
-        ExecutorBoundary, GithubCopilotTaskConfig, InProcessEchoExecutor, OmxExecutor,
-        RemoteWorkerExecutor, RustSubprocessExecutor, WorkerOutcome, WorkerRequest, WorkerResponse,
-        EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        estimate_azure_openai_cost_usd_with_overrides, execute_worker_request,
+        extract_azure_openai_text, is_codex_usage_limit_error,
+        normalize_azure_openai_fallback_backend, normalize_azure_openai_rate_model_name,
+        normalize_branch_name, normalize_github_repo_ref, parse_azure_openai_usage,
+        parse_codex_jsonl, parse_git_log_refs, parse_git_status_porcelain, read_json,
+        resolve_container_image, run_worker_command, run_worker_daemon_with_idle_timeout,
+        run_worker_from_paths, should_use_container_lane, should_use_remote_lane,
+        validate_execution_response_evidence, wait_for_worker_socket, write_json,
+        AzureOpenAICostRateOverrides, BackendExecutionMetadata, BackendExecutionResult,
+        BuildExecutionEvidenceInput, ContainerExecutor, DigitalOceanDevEnvironment,
+        ExecutionArtifactRef, ExecutionEvidenceMode, ExecutionEvidenceStatus, ExecutionLaneRouter,
+        ExecutionMetadata, ExecutionRequest, ExecutionResponse, ExecutionSession,
+        ExecutionUsageSummary, ExecutionVerificationRef, ExecutorBoundary, GithubCopilotTaskConfig,
+        InProcessEchoExecutor, OmxExecutor, RemoteWorkerExecutor, RustSubprocessExecutor,
+        WorkerOutcome, WorkerRequest, WorkerResponse, EXECUTION_EVIDENCE_SCHEMA_VERSION,
     };
 
     #[test]
@@ -5527,6 +5674,62 @@ mod tests {
                 cached_input_tokens: 25,
                 output_tokens: 50,
             })
+        );
+    }
+
+    #[test]
+    fn estimates_azure_openai_cost_for_gpt_4_1_mini_usage() {
+        let usage = ExecutionUsageSummary {
+            input_tokens: 1_000,
+            cached_input_tokens: 100,
+            output_tokens: 500,
+        };
+
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_overrides(
+                "nanoclaw-gpt-4-1-mini",
+                &usage,
+                AzureOpenAICostRateOverrides::default()
+            ),
+            Some(0.001287)
+        );
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_overrides(
+                "gpt-4.1-mini-2025-04-14",
+                &usage,
+                AzureOpenAICostRateOverrides::default()
+            ),
+            Some(0.001287)
+        );
+    }
+
+    #[test]
+    fn skips_azure_openai_cost_estimate_for_unknown_model_without_overrides() {
+        let usage = ExecutionUsageSummary {
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 500,
+        };
+
+        assert_eq!(
+            estimate_azure_openai_cost_usd_with_overrides(
+                "custom-enterprise-deployment",
+                &usage,
+                AzureOpenAICostRateOverrides::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn normalizes_azure_openai_rate_model_names() {
+        assert_eq!(
+            normalize_azure_openai_rate_model_name(" NanoClaw GPT-4.1 Mini "),
+            "nanoclawgpt4.1mini"
+        );
+        assert_eq!(
+            normalize_azure_openai_rate_model_name("gpt-4-1-mini-2025-04-14"),
+            "gpt41mini20250414"
         );
     }
 
