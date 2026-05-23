@@ -353,6 +353,9 @@ pub fn start_openclaw_gateway_server(config: NanoclawConfig) -> Result<()> {
                     let state = state.clone();
                     thread::spawn(move || {
                         if let Err(error) = handle_connection(stream, state) {
+                            if is_benign_websocket_handshake_error(&error) {
+                                return;
+                            }
                             eprintln!("openclaw gateway connection failed: {error:#}");
                         }
                     });
@@ -363,6 +366,16 @@ pub fn start_openclaw_gateway_server(config: NanoclawConfig) -> Result<()> {
     });
 
     Ok(())
+}
+
+fn is_benign_websocket_handshake_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("failed to accept websocket")
+        && (message.contains("handshake not finished")
+            || message.contains("missing, duplicated or incorrect header")
+            || message.contains("httpparse")
+            || message.contains("early eof")
+            || message.contains("connection reset"))
 }
 
 fn handle_connection(mut stream: TcpStream, state: GatewayServerState) -> Result<()> {
@@ -3488,6 +3501,21 @@ fn slug(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_handshake_noise_is_benign_for_logging() {
+        let error = anyhow::anyhow!("WebSocket protocol error: Handshake not finished")
+            .context("failed to accept websocket");
+
+        assert!(is_benign_websocket_handshake_error(&error));
+    }
+
+    #[test]
+    fn non_handshake_gateway_errors_are_not_suppressed() {
+        let error = anyhow::anyhow!("failed to read gateway websocket frame: IO error");
+
+        assert!(!is_benign_websocket_handshake_error(&error));
+    }
 
     #[test]
     fn paperclip_runtime_env_filters_to_allowed_paperclip_keys() {
