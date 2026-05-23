@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tungstenite::{accept, Message, WebSocket};
+use tungstenite::{accept, error::ProtocolError, Message, WebSocket};
 use uuid::Uuid;
 
 use crate::foundation::{
@@ -386,6 +386,21 @@ fn is_transient_websocket_read_error(error: &tungstenite::Error) -> bool {
     )
 }
 
+fn is_websocket_disconnect_read_error(error: &tungstenite::Error) -> bool {
+    match error {
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => true,
+        tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        tungstenite::Error::Io(io_error) => matches!(
+            io_error.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
 fn handle_connection(mut stream: TcpStream, state: GatewayServerState) -> Result<()> {
     if is_plain_http_request(&stream)? {
         return handle_http_request(&mut stream, &state);
@@ -411,8 +426,7 @@ fn handle_connection(mut stream: TcpStream, state: GatewayServerState) -> Result
     loop {
         let message = match socket.read() {
             Ok(message) => message,
-            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
-            Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
+            Err(error) if is_websocket_disconnect_read_error(&error) => return Ok(()),
             Err(error) if is_transient_websocket_read_error(&error) => {
                 thread::sleep(Duration::from_millis(25));
                 continue;
@@ -761,8 +775,7 @@ fn drain_gateway_wait_control_frames(socket: &mut WebSocket<TcpStream>) -> Resul
             Ok(Message::Close(_)) => return Ok(false),
             Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => {}
             Ok(_) => {}
-            Err(tungstenite::Error::ConnectionClosed) => return Ok(false),
-            Err(tungstenite::Error::AlreadyClosed) => return Ok(false),
+            Err(error) if is_websocket_disconnect_read_error(&error) => return Ok(false),
             Err(tungstenite::Error::Io(error))
                 if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
             {
@@ -3541,6 +3554,27 @@ mod tests {
         let error = tungstenite::Error::Io(std::io::Error::from(ErrorKind::ConnectionRefused));
 
         assert!(!is_transient_websocket_read_error(&error));
+    }
+
+    #[test]
+    fn websocket_reset_without_closing_handshake_is_disconnect() {
+        let error = tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake);
+
+        assert!(is_websocket_disconnect_read_error(&error));
+    }
+
+    #[test]
+    fn websocket_connection_reset_io_is_disconnect() {
+        let error = tungstenite::Error::Io(std::io::Error::from(ErrorKind::ConnectionReset));
+
+        assert!(is_websocket_disconnect_read_error(&error));
+    }
+
+    #[test]
+    fn websocket_unexpected_protocol_error_is_not_disconnect() {
+        let error = tungstenite::Error::Protocol(ProtocolError::FragmentedControlFrame);
+
+        assert!(!is_websocket_disconnect_read_error(&error));
     }
 
     #[test]
