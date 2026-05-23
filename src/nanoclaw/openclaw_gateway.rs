@@ -157,6 +157,22 @@ struct GatewayPaperclipWorkspace {
     branch_name: Option<String>,
     worktree_path: Option<String>,
     agent_home: Option<String>,
+    realization: Option<GatewayPaperclipWorkspaceRealization>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GatewayPaperclipWorkspaceRealization {
+    local: Option<GatewayPaperclipWorkspaceRealizationLocation>,
+    rebuild: Option<GatewayPaperclipWorkspaceRealizationLocation>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GatewayPaperclipWorkspaceRealizationLocation {
+    repo_url: Option<String>,
+    repo_ref: Option<String>,
+    branch_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -812,6 +828,7 @@ fn execute_gateway_run(
     let session_id = format!("gateway-{}", slug(run_id));
     let model_route = derive_gateway_model_route(params, prompt);
     let backend_override = select_gateway_worker_backend(
+        params,
         forced_gateway_worker_backend_from_env(),
         gateway_backend_override(params),
         Some(model_route.backend.clone()),
@@ -1774,6 +1791,7 @@ fn default_gateway_worker_backend_from_env() -> Option<WorkerBackend> {
 }
 
 fn select_gateway_worker_backend(
+    params: &GatewayAgentParams,
     forced: Option<WorkerBackend>,
     hinted: Option<WorkerBackend>,
     routed: Option<WorkerBackend>,
@@ -1782,7 +1800,27 @@ fn select_gateway_worker_backend(
     if matches!(routed.as_ref(), Some(WorkerBackend::Summary)) {
         return routed;
     }
-    hinted.or(routed).or(forced).or(default)
+
+    let selected = hinted
+        .clone()
+        .or_else(|| routed.clone())
+        .or_else(|| forced.clone())
+        .or_else(|| default.clone());
+    if !matches!(selected.as_ref(), Some(WorkerBackend::GithubCopilot))
+        || gateway_has_github_copilot_repo(params)
+    {
+        return selected;
+    }
+
+    // GitHub Copilot cloud agents require a GitHub repository. A Paperclip
+    // fallback agent-home run can be valid work, but it is not a repo-scoped
+    // run, so use the next safe backend instead of surfacing a late executor
+    // failure as a successful gateway run.
+    routed
+        .filter(|backend| !matches!(backend, WorkerBackend::GithubCopilot))
+        .or_else(|| forced.filter(|backend| !matches!(backend, WorkerBackend::GithubCopilot)))
+        .or_else(|| default.filter(|backend| !matches!(backend, WorkerBackend::GithubCopilot)))
+        .or(Some(WorkerBackend::AzureOpenAI))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2055,6 +2093,10 @@ fn gateway_has_repo_context(params: &GatewayAgentParams) -> bool {
                     .or_else(|| non_empty(workspace.branch_name.as_deref()))
             })
             .is_some()
+}
+
+fn gateway_has_github_copilot_repo(params: &GatewayAgentParams) -> bool {
+    gateway_github_copilot_repo(params).is_some()
 }
 
 fn is_contextless_zero_call(params: &GatewayAgentParams) -> bool {
@@ -2339,9 +2381,15 @@ fn gateway_runtime_env(
 fn gateway_github_copilot_repo(params: &GatewayAgentParams) -> Option<&str> {
     let paperclip = params.paperclip.as_ref()?;
     paperclip
-        .workspace
+        .gateway
         .as_ref()
-        .and_then(|workspace| non_empty(workspace.repo_url.as_deref()))
+        .and_then(|gateway| non_empty(gateway.github_copilot_repo.as_deref()))
+        .or_else(|| {
+            paperclip
+                .workspace
+                .as_ref()
+                .and_then(gateway_workspace_repo_url)
+        })
         .or_else(|| {
             paperclip
                 .workspaces
@@ -2354,11 +2402,14 @@ fn gateway_github_copilot_repo(params: &GatewayAgentParams) -> Option<&str> {
 fn gateway_github_copilot_base(params: &GatewayAgentParams) -> Option<&str> {
     let paperclip = params.paperclip.as_ref()?;
     paperclip
-        .workspace
+        .gateway
         .as_ref()
-        .and_then(|workspace| {
-            non_empty(workspace.branch_name.as_deref())
-                .or_else(|| non_empty(workspace.repo_ref.as_deref()))
+        .and_then(|gateway| non_empty(gateway.github_copilot_base.as_deref()))
+        .or_else(|| {
+            paperclip
+                .workspace
+                .as_ref()
+                .and_then(gateway_workspace_base_ref)
         })
         .or_else(|| {
             paperclip
@@ -2366,6 +2417,49 @@ fn gateway_github_copilot_base(params: &GatewayAgentParams) -> Option<&str> {
                 .as_ref()?
                 .iter()
                 .find_map(|workspace| non_empty(workspace.repo_ref.as_deref()))
+        })
+}
+
+fn gateway_workspace_repo_url(workspace: &GatewayPaperclipWorkspace) -> Option<&str> {
+    non_empty(workspace.repo_url.as_deref())
+        .or_else(|| {
+            workspace
+                .realization
+                .as_ref()
+                .and_then(|realization| realization.local.as_ref())
+                .and_then(|local| non_empty(local.repo_url.as_deref()))
+        })
+        .or_else(|| {
+            workspace
+                .realization
+                .as_ref()
+                .and_then(|realization| realization.rebuild.as_ref())
+                .and_then(|rebuild| non_empty(rebuild.repo_url.as_deref()))
+        })
+}
+
+fn gateway_workspace_base_ref(workspace: &GatewayPaperclipWorkspace) -> Option<&str> {
+    non_empty(workspace.branch_name.as_deref())
+        .or_else(|| non_empty(workspace.repo_ref.as_deref()))
+        .or_else(|| {
+            workspace
+                .realization
+                .as_ref()
+                .and_then(|realization| realization.local.as_ref())
+                .and_then(|local| {
+                    non_empty(local.branch_name.as_deref())
+                        .or_else(|| non_empty(local.repo_ref.as_deref()))
+                })
+        })
+        .or_else(|| {
+            workspace
+                .realization
+                .as_ref()
+                .and_then(|realization| realization.rebuild.as_ref())
+                .and_then(|rebuild| {
+                    non_empty(rebuild.branch_name.as_deref())
+                        .or_else(|| non_empty(rebuild.repo_ref.as_deref()))
+                })
         })
 }
 
@@ -2866,12 +2960,11 @@ fn classify_gateway_execution_status(
     execution_status: Option<&str>,
     omx_team_status: &Value,
 ) -> GatewayRunStatus {
-    if !matches!(lane, ExecutionLane::Omx) {
-        return GatewayRunStatus::Ok;
-    }
-
     if is_failure_status(execution_status) {
         return GatewayRunStatus::Error;
+    }
+    if !matches!(lane, ExecutionLane::Omx) {
+        return GatewayRunStatus::Ok;
     }
     if let Some(team_status) = classify_omx_team_status(omx_team_status) {
         return team_status;
@@ -2888,7 +2981,7 @@ fn classify_gateway_execution_status(
 fn is_failure_status(status: Option<&str>) -> bool {
     matches!(
         normalize_status(status).as_deref(),
-        Some("failed" | "error" | "stopped" | "cancelled" | "canceled")
+        Some("failed" | "error" | "stopped" | "cancelled" | "canceled" | "timed_out" | "timeout")
     )
 }
 
@@ -3737,7 +3830,9 @@ mod tests {
 
     #[test]
     fn gateway_policy_route_wins_over_forced_default_backend() {
+        let params = GatewayAgentParams::default();
         let selected = select_gateway_worker_backend(
+            &params,
             Some(WorkerBackend::AzureOpenAI),
             None,
             Some(WorkerBackend::Codex),
@@ -3749,7 +3844,9 @@ mod tests {
 
     #[test]
     fn explicit_gateway_hint_wins_over_policy_route() {
+        let params = GatewayAgentParams::default();
         let selected = select_gateway_worker_backend(
+            &params,
             Some(WorkerBackend::AzureOpenAI),
             Some(WorkerBackend::Zai),
             Some(WorkerBackend::Codex),
@@ -3761,7 +3858,9 @@ mod tests {
 
     #[test]
     fn zero_call_route_overrides_all_paid_backends() {
+        let params = GatewayAgentParams::default();
         let selected = select_gateway_worker_backend(
+            &params,
             Some(WorkerBackend::AzureOpenAI),
             Some(WorkerBackend::Codex),
             Some(WorkerBackend::Summary),
@@ -3769,6 +3868,30 @@ mod tests {
         );
 
         assert_eq!(selected, Some(WorkerBackend::Summary));
+    }
+
+    #[test]
+    fn host_gateway_failed_evidence_marks_run_error() {
+        assert_eq!(
+            classify_gateway_execution_status(&ExecutionLane::Host, Some("failed"), &Value::Null),
+            GatewayRunStatus::Error
+        );
+        assert_eq!(
+            classify_gateway_execution_status(
+                &ExecutionLane::Host,
+                Some("timed_out"),
+                &Value::Null
+            ),
+            GatewayRunStatus::Error
+        );
+    }
+
+    #[test]
+    fn host_gateway_missing_status_still_marks_completed_response_ok() {
+        assert_eq!(
+            classify_gateway_execution_status(&ExecutionLane::Host, None, &Value::Null),
+            GatewayRunStatus::Ok
+        );
     }
 
     #[test]
@@ -3972,6 +4095,78 @@ mod tests {
             env.get("NANOCLAW_GITHUB_COPILOT_CUSTOM_AGENT")
                 .map(String::as_str),
             Some("cto")
+        );
+    }
+
+    #[test]
+    fn github_copilot_hint_without_repo_falls_back_to_safe_backend() {
+        let params = GatewayAgentParams {
+            paperclip: Some(GatewayPaperclipPayload {
+                workspace: Some(GatewayPaperclipWorkspace {
+                    cwd: Some("/var/data/nexus/instances/default/workspaces/agent".to_string()),
+                    source: Some("agent_home".to_string()),
+                    ..Default::default()
+                }),
+                gateway: Some(GatewayHints {
+                    worker_backend: Some("github-copilot".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let selected = select_gateway_worker_backend(
+            &params,
+            None,
+            gateway_backend_override(&params),
+            Some(WorkerBackend::AzureOpenAI),
+            Some(WorkerBackend::Codex),
+        );
+        let env = gateway_runtime_env(&params, selected.as_ref(), None);
+
+        assert_eq!(selected, Some(WorkerBackend::AzureOpenAI));
+        assert!(!env.contains_key("NANOCLAW_GITHUB_COPILOT_REPO"));
+    }
+
+    #[test]
+    fn github_copilot_repo_can_come_from_workspace_realization() {
+        let params: GatewayAgentParams = serde_json::from_value(serde_json::json!({
+            "paperclip": {
+                "workspace": {
+                    "cwd": "/var/data/nexus/instances/default/projects/example/_default",
+                    "source": "project_primary",
+                    "realization": {
+                        "local": {
+                            "repoUrl": "https://github.com/Nexus-Integrated-Technologies/agency",
+                            "branchName": "buddha/openclaw-gateway-runtime-auth-ci"
+                        }
+                    }
+                },
+                "gateway": {
+                    "workerBackend": "github-copilot"
+                }
+            }
+        }))
+        .unwrap();
+
+        let selected = select_gateway_worker_backend(
+            &params,
+            None,
+            gateway_backend_override(&params),
+            Some(WorkerBackend::AzureOpenAI),
+            Some(WorkerBackend::Codex),
+        );
+        let env = gateway_runtime_env(&params, selected.as_ref(), None);
+
+        assert_eq!(selected, Some(WorkerBackend::GithubCopilot));
+        assert_eq!(
+            env.get("NANOCLAW_GITHUB_COPILOT_REPO").map(String::as_str),
+            Some("https://github.com/Nexus-Integrated-Technologies/agency")
+        );
+        assert_eq!(
+            env.get("NANOCLAW_GITHUB_COPILOT_BASE").map(String::as_str),
+            Some("buddha/openclaw-gateway-runtime-auth-ci")
         );
     }
 
