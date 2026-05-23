@@ -378,6 +378,14 @@ fn is_benign_websocket_handshake_error(error: &anyhow::Error) -> bool {
             || message.contains("connection reset"))
 }
 
+fn is_transient_websocket_read_error(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::Io(io_error)
+            if matches!(io_error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    )
+}
+
 fn handle_connection(mut stream: TcpStream, state: GatewayServerState) -> Result<()> {
     if is_plain_http_request(&stream)? {
         return handle_http_request(&mut stream, &state);
@@ -405,6 +413,10 @@ fn handle_connection(mut stream: TcpStream, state: GatewayServerState) -> Result
             Ok(message) => message,
             Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
             Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
+            Err(error) if is_transient_websocket_read_error(&error) => {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
             Err(error) => return Err(error).context("failed to read gateway websocket frame"),
         };
 
@@ -3515,6 +3527,20 @@ mod tests {
         let error = anyhow::anyhow!("failed to read gateway websocket frame: IO error");
 
         assert!(!is_benign_websocket_handshake_error(&error));
+    }
+
+    #[test]
+    fn websocket_would_block_read_is_transient() {
+        let error = tungstenite::Error::Io(std::io::Error::from(ErrorKind::WouldBlock));
+
+        assert!(is_transient_websocket_read_error(&error));
+    }
+
+    #[test]
+    fn websocket_connection_refused_read_is_not_transient() {
+        let error = tungstenite::Error::Io(std::io::Error::from(ErrorKind::ConnectionRefused));
+
+        assert!(!is_transient_websocket_read_error(&error));
     }
 
     #[test]
