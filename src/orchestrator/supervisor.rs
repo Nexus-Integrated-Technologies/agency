@@ -487,7 +487,12 @@ impl Supervisor {
             full_context.push_str(&ctx);
         }
         
-        info!("Routing decision: {:?}", routing_decision.candidate_agents);
+        info!(
+            "Routing decision: candidates={:?}, confidence={:.2}, reason={}",
+            routing_decision.candidate_agents,
+            routing_decision.confidence,
+            routing_decision.reason
+        );
 
         // SOTA: Optimal Information Selection (Bennouna et al., 2025)
         // Identify directions of uncertainty that matter for the decision (plan) 
@@ -674,7 +679,14 @@ impl Supervisor {
         publication.rationale = Some(DesignRationaleRecord::new(
             "Supervisor", 
             "Routed", 
-            format!("Selected candidate {} based on Pareto logic", final_winner_idx)
+            format!(
+                "Route reason='{}' (confidence {:.2}); candidates={:?}; selected winner index {} ({}) via Pareto logic",
+                final_routing.reason,
+                final_routing.confidence,
+                final_routing.candidate_agents,
+                final_winner_idx,
+                final_performer
+            )
         ));
 
         // Only add to memory if it's NOT a pending approval
@@ -694,7 +706,15 @@ impl Supervisor {
             answer: final_res.answer,
             success: final_res.success,
             plan: None,
-            reflections: vec![format!("Classified as {:?}", routing_decision.scale.class)],
+            reflections: vec![
+                format!("Classified as {:?}", routing_decision.scale.class),
+                format!(
+                    "Routing rationale: {} (confidence {:.2})",
+                    routing_decision.reason,
+                    routing_decision.confidence
+                ),
+                format!("Selected performer: {}", final_performer),
+            ],
             publication: Some(publication),
             pending_approval: final_res.pending_approval,
             has_followup: !self.followup_queue.lock().await.is_empty(),
