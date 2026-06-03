@@ -174,6 +174,11 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    async fn insert_tool_arc(&self, name: String, tool: Arc<dyn Tool>) {
+        let mut tools = self.tools.write().await;
+        tools.insert(name, tool);
+    }
+
     /// Create a new empty registry
     pub fn new(custom_dir: impl Into<PathBuf>, standard_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -188,14 +193,14 @@ impl ToolRegistry {
     #[allow(dead_code)]
     pub async fn register<T: Tool + 'static + Default>(&self) {
         let tool = T::default();
-        let mut tools = self.tools.write().await;
-        tools.insert(tool.name().to_string(), Arc::new(tool));
+        let name = tool.name();
+        self.insert_tool_arc(name, Arc::new(tool)).await;
     }
 
     /// Register a tool instance
     pub async fn register_instance<T: Tool + 'static>(&self, tool: T) {
-        let mut tools = self.tools.write().await;
-        tools.insert(tool.name().to_string(), Arc::new(tool));
+        let name = tool.name();
+        self.insert_tool_arc(name, Arc::new(tool)).await;
     }
 
     /// Load all dynamic tools from a directory
@@ -205,21 +210,30 @@ impl ToolRegistry {
             return Ok(0);
         }
 
-        let mut count = 0;
+        let mut loaded_tools: Vec<(String, Arc<dyn Tool>)> = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 match DynamicTool::from_file(&path) {
                     Ok(tool) => {
-                        tracing::info!("Loaded dynamic tool: {}", tool.name());
-                        let mut tools = self.tools.write().await;
-                        tools.insert(tool.name().to_string(), Arc::new(tool));
-                        count += 1;
+                        let name = tool.name();
+                        tracing::info!("Loaded dynamic tool: {}", name);
+                        loaded_tools.push((name, Arc::new(tool)));
                     }
                     Err(e) => tracing::warn!("Failed to load dynamic tool at {:?}: {}", path, e),
                 }
             }
+        }
+
+        if loaded_tools.is_empty() {
+            return Ok(0);
+        }
+
+        let count = loaded_tools.len();
+        let mut tools = self.tools.write().await;
+        for (name, tool) in loaded_tools {
+            tools.insert(name, tool);
         }
         Ok(count)
     }
@@ -227,12 +241,20 @@ impl ToolRegistry {
     /// Register all tools from an MCP server
     pub async fn register_mcp_server(&self, server: Arc<McpServer>) -> Result<usize> {
         let tools = server.list_tools().await?;
-        let mut count = 0;
+        let mut proxies = Vec::with_capacity(tools.len());
         for tool_def in tools {
             let proxy = Arc::new(McpProxyTool::new(server.clone(), tool_def));
-            let mut tools = self.tools.write().await;
-            tools.insert(proxy.name(), proxy);
-            count += 1;
+            proxies.push((proxy.name(), proxy as Arc<dyn Tool>));
+        }
+
+        if proxies.is_empty() {
+            return Ok(0);
+        }
+
+        let count = proxies.len();
+        let mut registered_tools = self.tools.write().await;
+        for (name, proxy) in proxies {
+            registered_tools.insert(name, proxy);
         }
         Ok(count)
     }

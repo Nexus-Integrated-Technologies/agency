@@ -1,22 +1,47 @@
 use axum::{
     extract::State,
-    routing::{post, get},
+    routing::{get, post},
     Json, Router,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::Embedding;
-use std::path::PathBuf;
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokenizers::Tokenizer;
-use tracing::{info, error, debug};
-use serde::Deserialize;
-use std::env;
+use tracing::{debug, error, info};
 
 // Reuse the model logic from the library
 use crate::models::t3_candle::T3Candle;
+
+const DEFAULT_ARTIFACT_SUBDIR: &str = "artifacts/chatterbox";
+const DEFAULT_DEVICE: &str = "cpu";
+const MODEL_POOL_SIZE: usize = 2;
+const SAMPLE_RATE_HZ: u32 = 24_000;
+const NATURAL_GAP_SAMPLES: usize = 1_200;
+const MIN_SPEECH_TOKENS: usize = 24;
+const DECODER_PAD_TOKEN: i64 = 4_299;
+const START_TOKEN: i64 = 6_561;
+const STOP_TOKEN: i64 = 6_562;
+
+fn resolve_artifact_dir() -> PathBuf {
+    env::var("AGENCY_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ARTIFACT_SUBDIR))
+}
+
+fn resolve_t3_device() -> Device {
+    let requested = env::var("AGENCY_DEVICE").unwrap_or_else(|_| DEFAULT_DEVICE.to_string());
+    match requested.to_ascii_lowercase().as_str() {
+        "metal" => Device::new_metal(0).unwrap_or(Device::Cpu),
+        "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
+        _ => Device::Cpu,
+    }
+}
 
 struct ModelPool {
     receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<T3Candle>>>,
@@ -35,9 +60,9 @@ impl ModelPool {
         }
     }
 
-    async fn checkout(&self) -> T3Candle {
+    async fn checkout(&self) -> Result<T3Candle> {
         let mut rx = self.receiver.lock().await;
-        rx.recv().await.expect("Model pool exhausted")
+        rx.recv().await.context("Model pool exhausted")
     }
 
     fn checkin(&self, model: T3Candle) {
@@ -59,16 +84,8 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     pub fn new(sink: Arc<rodio::Sink>) -> Result<Self> {
-        let artifact_path = env::var("AGENCY_ARTIFACT_DIR")
-            .unwrap_or_else(|_| "/Users/javoerokour/Desktop/BUDDHA/CODE/agency/rust_agency/artifacts/chatterbox".to_string());
-        let artifact_dir = PathBuf::from(artifact_path);
-        
-        let device_str = env::var("AGENCY_DEVICE").unwrap_or_else(|_| "cpu".to_string());
-        let device = match device_str.to_lowercase().as_str() {
-            "metal" => Device::new_metal(0).unwrap_or(Device::Cpu),
-            "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
-            _ => Device::Cpu,
-        };
+        let artifact_dir = resolve_artifact_dir();
+        let device = resolve_t3_device();
 
         let decoder_device = Device::Cpu;
         info!("AudioEngine: Loading Engine (T3: {:?}, Decoder: {:?})", device, decoder_device);
@@ -87,7 +104,7 @@ impl AudioEngine {
         }
 
         let mut models = Vec::new();
-        for i in 0..2 { // Reduced pool size for integrated mode
+        for i in 0..MODEL_POOL_SIZE {
             debug!("AudioEngine: Initializing model instance {}...", i);
             models.push(T3Candle::load_from_map(&t3_weights, &config, &device)?);
         }
@@ -107,8 +124,8 @@ impl AudioEngine {
             tokenizer,
             model_pool,
             speech_emb,
-            start_token: 6561,
-            stop_token: 6562,
+            start_token: START_TOKEN,
+            stop_token: STOP_TOKEN,
             device,
             decoder_device,
             sink,
@@ -139,30 +156,48 @@ impl AudioEngine {
             let tokenizer = self.tokenizer.clone();
 
             tokio::spawn(async move {
-                let mut model = pool.checkout().await;
+                let mut model = match pool.checkout().await {
+                    Ok(model) => model,
+                    Err(e) => {
+                        error!("AudioEngine: Failed to checkout model for chunk {}: {}", idx, e);
+                        let _ = audio_tx.send((idx, Vec::new()));
+                        return;
+                    }
+                };
                 let start_time = std::time::Instant::now();
                 
                 let result = tokio::task::spawn_blocking(move || {
-                    let tokens = T3Candle::generate_tokens_internal_static(
-                        &mut model, &tokenizer, &sentence, &speech_emb, 
-                        &device, start_token, stop_token
-                    )?;
-                    
-                    let audio = Self::decode_audio_native_static(&decoder_model, &tokens, &decoder_device)?;
-                    Ok::<(Vec<f32>, T3Candle), anyhow::Error>((audio, model))
+                    let inference_result = (|| -> Result<Vec<f32>> {
+                        let tokens = T3Candle::generate_tokens_internal_static(
+                            &mut model,
+                            &tokenizer,
+                            &sentence,
+                            &speech_emb,
+                            &device,
+                            start_token,
+                            stop_token,
+                        )?;
+
+                        Self::decode_audio_native_static(&decoder_model, &tokens, &decoder_device)
+                    })();
+                    (inference_result, model)
                 }).await;
 
                 match result {
-                    Ok(Ok((audio, model))) => {
+                    Ok((Ok(audio), model)) => {
                         let _ = audio_tx.send((idx, audio));
                         debug!("AudioEngine: Chunk {} done in {}ms", idx, start_time.elapsed().as_millis());
                         pool.checkin(model);
                     }
-                    Ok(Err(e)) => {
+                    Ok((Err(e), model)) => {
                         error!("AudioEngine: Inference error on chunk {}: {}", idx, e);
                         let _ = audio_tx.send((idx, Vec::new()));
+                        pool.checkin(model);
                     }
-                    Err(e) => error!("AudioEngine: Task join error: {}", e),
+                    Err(e) => {
+                        error!("AudioEngine: Task join error on chunk {}: {}", idx, e);
+                        let _ = audio_tx.send((idx, Vec::new()));
+                    }
                 }
             });
         }
@@ -178,9 +213,9 @@ impl AudioEngine {
                 
                 while let Some(audio) = pending.remove(&next_to_play) {
                     if !audio.is_empty() {
-                        let source = rodio::buffer::SamplesBuffer::new(1, 24000, audio);
+                        let source = rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE_HZ, audio);
                         sink.append(source);
-                        let gap = rodio::buffer::SamplesBuffer::new(1, 24000, vec![0.0f32; 1200]); // 0.05s natural gap
+                        let gap = rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE_HZ, vec![0.0f32; NATURAL_GAP_SAMPLES]);
                         sink.append(gap);
                     }
                     next_to_play += 1;
@@ -198,12 +233,16 @@ impl AudioEngine {
     ) -> Result<Vec<f32>> {
         let mut speech_tokens: Vec<i64> = tokens.iter() 
             .cloned() 
-            .filter(|&t| t < 6561)
+            .filter(|&t| t < START_TOKEN)
             .collect();
 
         if speech_tokens.is_empty() { return Ok(Vec::new()); }
-        while speech_tokens.len() < 24 { speech_tokens.push(4299); }
-        for _ in 0..3 { speech_tokens.push(4299); }
+        while speech_tokens.len() < MIN_SPEECH_TOKENS {
+            speech_tokens.push(DECODER_PAD_TOKEN);
+        }
+        for _ in 0..3 {
+            speech_tokens.push(DECODER_PAD_TOKEN);
+        }
         
         let total_len = speech_tokens.len();
         let tokens_t = Tensor::from_vec(speech_tokens, (1, total_len), &Device::Cpu)?;
@@ -232,7 +271,7 @@ pub async fn run_speaker_server() -> Result<()> {
     
     // Silence Carrier
     let carrier_sink = rodio::Sink::try_new(&stream_handle)?;
-    let silence = rodio::source::Zero::<f32>::new(1, 24000);
+    let silence = rodio::source::Zero::<f32>::new(1, SAMPLE_RATE_HZ);
     carrier_sink.append(silence);
     carrier_sink.set_volume(0.0);
     carrier_sink.play();
